@@ -30,8 +30,8 @@ JPlan is a modern daily planning interface designed to help users manage their s
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/your-username/your-repo-name.git
-cd your-repo-name
+git clone https://github.com/liwei-0405/JPlan.git
+cd JPlan
 ```
 
 ### 2. Frontend Setup
@@ -107,4 +107,4 @@ This project is for educational purposes (Final Year Project).
 
 ---
 
-Developed by [Your Name]
+Developed by Teh Li Wei (liwei-0405) Nickname: Levi
