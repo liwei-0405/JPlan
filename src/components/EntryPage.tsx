@@ -76,8 +76,16 @@ export function EntryPage({
 
           {/* Selected Date's Plan Preview */}
           <div>
-            <button
+            <div
               onClick={hasSelectedPlan ? () => selectedSchedule && onViewSchedule(selectedSchedule) : () => onStartPlanning(selectedDate)}
+              role="button"
+              tabIndex={0}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  hasSelectedPlan ? selectedSchedule && onViewSchedule(selectedSchedule) : onStartPlanning(selectedDate);
+                }
+              }}
               className="bg-card rounded-2xl border border-border p-6 shadow-sm h-full flex flex-col w-full text-left hover:shadow-md hover:border-primary/30 transition-all cursor-pointer group"
             >
               <div className="flex items-center gap-2 mb-4">
@@ -174,7 +182,7 @@ export function EntryPage({
                   </>
                 )}
               </div>
-            </button>
+            </div>
           </div>
         </div>
 

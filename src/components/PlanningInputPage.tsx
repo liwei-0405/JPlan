@@ -20,6 +20,8 @@ import {
 } from "lucide-react";
 import type { DailySchedule, ActivityBlock } from "../App";
 import { EventEditModal } from "./EventEditModal";
+import { useAuth } from "../context/AuthContext";
+
 
 type PlanningInputPageProps = {
   onScheduleGenerated: (schedule: DailySchedule) => void;
@@ -38,6 +40,7 @@ export function PlanningInputPage({
   initialSchedule,
   onUpdateSchedule,
 }: PlanningInputPageProps) {
+  const { user } = useAuth();
   const isoDateStr = selectedDate.getFullYear() + "-" +
     String(selectedDate.getMonth() + 1).padStart(2, '0') + "-" +
     String(selectedDate.getDate()).padStart(2, '0');
@@ -224,7 +227,8 @@ export function PlanningInputPage({
         body: JSON.stringify({
           message: userMessage,
           history: currentHistory, // send full history for context
-          current_schedule: previewSchedule // send current schedule if any
+          current_schedule: previewSchedule, // send current schedule if any
+          user_id: user?.id
         }),
       });
 

@@ -1,10 +1,15 @@
 import { useState, useEffect } from "react";
+import { Routes, Route, Navigate, useNavigate, useLocation } from "react-router-dom";
 import { EntryPage } from "./components/EntryPage";
 import { PlanningInputPage } from "./components/PlanningInputPage";
 import { ScheduleViewPage } from "./components/ScheduleViewPage";
 import { ExplanationPanel } from "./components/ExplanationPanel";
 import { HistoryPage } from "./components/HistoryPage";
 import { PreferencesPage } from "./components/PreferencesPage";
+import { LoginPage } from "./components/auth/LoginPage";
+import { SignupPage } from "./components/auth/SignupPage";
+import { AdminSignupPage } from "./components/auth/AdminSignupPage";
+import { useAuth } from "./context/AuthContext";
 import { getAllPlans, savePlan as savePlanToDb } from "./services/planService";
 
 export type Page =
@@ -39,21 +44,38 @@ const formatToISODate = (date: Date) => {
   return `${yyyy}-${mm}-${dd}`;
 };
 
+const ProtectedRoute: React.FC<{ children: React.ReactNode; adminOnly?: boolean }> = ({ children, adminOnly = false }) => {
+  const { user, loading, isAdmin } = useAuth();
+  const location = useLocation();
+
+  if (loading) {
+    return <div className="flex h-screen items-center justify-center">Loading...</div>;
+  }
+
+  if (!user) {
+    return <Navigate to="/login" state={{ from: location }} replace />;
+  }
+
+  if (adminOnly && !isAdmin) {
+    return <Navigate to="/" replace />;
+  }
+
+  return <>{children}</>;
+};
+
 export default function App() {
-  const [currentPage, setCurrentPage] = useState<Page>("entry");
-  const [previousPage, setPreviousPage] = useState<Page>("entry");
+  const { user, loading } = useAuth();
+  const navigate = useNavigate();
   const [currentSchedule, setCurrentSchedule] = useState<DailySchedule | null>(null);
   const [planningSchedule, setPlanningSchedule] = useState<DailySchedule | null>(null);
   const [scheduleHistory, setScheduleHistory] = useState<DailySchedule[]>([]);
   const [planningDate, setPlanningDate] = useState<Date>(new Date());
   const [isLoadingPlans, setIsLoadingPlans] = useState(true);
 
-  const navigateTo = (page: Page) => {
-    setCurrentPage(page);
-  };
-
-  // Load all plans from Supabase on mount
+  // Load all plans from Supabase on mount/user change
   useEffect(() => {
+    if (!user) return;
+
     const loadPlans = async () => {
       setIsLoadingPlans(true);
       try {
@@ -67,7 +89,31 @@ export default function App() {
     };
 
     loadPlans();
+  }, [user]);
+
+  // Catch OAuth errors in URL
+  useEffect(() => {
+    const hash = window.location.hash;
+    if (hash && hash.includes('error=')) {
+      const params = new URLSearchParams(hash.substring(1));
+      const error = params.get('error');
+      const errorDescription = params.get('error_description');
+      if (errorDescription) {
+        // We use a small timeout to ensure Toaster is mounted
+        setTimeout(() => {
+           console.error("OAuth Error:", errorDescription);
+           // Toast the error so the user can easily see it
+           import('sonner').then(({ toast }) => {
+               toast.error(`Auth Error: ${errorDescription.replace(/\+/g, ' ')}`, { duration: 10000 });
+           });
+        }, 500);
+      }
+      
+      // Clear the hash so we don't keep showing the error on refresh
+      window.history.replaceState(null, '', window.location.pathname + window.location.search);
+    }
   }, []);
+
 
   const saveSchedule = async (schedule: DailySchedule) => {
     setCurrentSchedule(schedule);
@@ -76,7 +122,6 @@ export default function App() {
     const result = await savePlanToDb(schedule);
     if (!result.success) {
       console.error('Failed to save plan to database:', result.error);
-      // Still update local state even if database save fails
     }
 
     // Add to history if not already there
@@ -98,110 +143,146 @@ export default function App() {
 
   const todaySchedule = getTodaySchedule();
 
+  if (loading) {
+    return <div className="flex h-screen items-center justify-center">Loading session...</div>;
+  }
+
   return (
     <div className="min-h-screen bg-background">
-      {currentPage === "entry" && (
-        <EntryPage
-          onStartPlanning={(date: Date) => {
-            setPlanningDate(date);
-            setPlanningSchedule(null); // Reset planning state
-            setPreviousPage("entry");
-            navigateTo("planning");
-          }}
-          onViewSchedule={(schedule: DailySchedule) => {
-            setCurrentSchedule(schedule);
-            navigateTo("schedule");
-          }}
-          onReplanToday={() => {
-            if (todaySchedule) {
-              setPlanningSchedule(todaySchedule);
-              setPlanningDate(new Date());
-              setPreviousPage("entry");
-              navigateTo("planning");
-            }
-          }}
-          onSettingsClick={() => navigateTo("preferences")}
-          todaySchedule={todaySchedule}
-          scheduleHistory={scheduleHistory}
-        />
-      )}
+      <Routes>
+        <Route path="/login" element={<LoginPage />} />
+        <Route path="/signup" element={<SignupPage />} />
+        <Route path="/admin/signup" element={<AdminSignupPage />} />
 
-      {currentPage === "planning" && (
-        <PlanningInputPage
-          // add selected date to planning input page
-          selectedDate={planningDate}
-          initialSchedule={planningSchedule}
-          onUpdateSchedule={setPlanningSchedule}
-          onScheduleGenerated={(schedule) => {
-            saveSchedule(schedule);
-            navigateTo("entry");
-          }}
-          onBack={() => navigateTo(previousPage)}
-          onViewExplanation={(schedule) => {
-            setCurrentSchedule(schedule);
-            setPreviousPage("planning");
-            navigateTo("explanation");
-          }}
+        <Route
+          path="/"
+          element={
+            <ProtectedRoute>
+              <EntryPage
+                onStartPlanning={(date: Date) => {
+                  setPlanningDate(date);
+                  setPlanningSchedule(null);
+                  navigate("/planning");
+                }}
+                onViewSchedule={(schedule: DailySchedule) => {
+                  setCurrentSchedule(schedule);
+                  navigate("/schedule");
+                }}
+                onReplanToday={() => {
+                  if (todaySchedule) {
+                    setPlanningSchedule(todaySchedule);
+                    setPlanningDate(new Date());
+                    navigate("/planning");
+                  }
+                }}
+                onSettingsClick={() => navigate("/preferences")}
+                todaySchedule={todaySchedule}
+                scheduleHistory={scheduleHistory}
+              />
+            </ProtectedRoute>
+          }
         />
-      )}
 
-      {currentPage === "schedule" && currentSchedule && (
-        <ScheduleViewPage
-          schedule={currentSchedule}
-          onModify={() => {
-            setPlanningSchedule(currentSchedule);
-            setPlanningDate(new Date(currentSchedule.date));
-            setPreviousPage("schedule");
-            navigateTo("planning");
-          }}
-          onViewExplanation={() => {
-            setPreviousPage("schedule");
-            navigateTo("explanation");
-          }}
-          onSave={() => {
-            saveSchedule(currentSchedule);
-            navigateTo("entry");
-          }}
-          onBack={() => navigateTo("entry")}
-          onViewHistory={() => navigateTo("history")}
-          onViewPreferences={() => navigateTo("preferences")}
-          onUpdateSchedule={(updatedSchedule) => {
-            setCurrentSchedule(updatedSchedule);
-            saveSchedule(updatedSchedule);
-          }}
+        <Route
+          path="/planning"
+          element={
+            <ProtectedRoute>
+              <PlanningInputPage
+                selectedDate={planningDate}
+                initialSchedule={planningSchedule}
+                onUpdateSchedule={setPlanningSchedule}
+                onScheduleGenerated={(schedule) => {
+                  saveSchedule(schedule);
+                  navigate("/");
+                }}
+                onBack={() => navigate(-1)}
+                onViewExplanation={(schedule) => {
+                  setCurrentSchedule(schedule);
+                  navigate("/explanation");
+                }}
+              />
+            </ProtectedRoute>
+          }
         />
-      )}
 
-      {currentPage === "explanation" && currentSchedule && (
-        <ExplanationPanel
-          schedule={currentSchedule}
-          onBack={() => navigateTo(previousPage)}
+        <Route
+          path="/schedule"
+          element={
+            <ProtectedRoute>
+              {currentSchedule ? (
+                <ScheduleViewPage
+                  schedule={currentSchedule}
+                  onModify={() => {
+                    setPlanningSchedule(currentSchedule);
+                    setPlanningDate(new Date(currentSchedule.date));
+                    navigate("/planning");
+                  }}
+                  onViewExplanation={() => {
+                    navigate("/explanation");
+                  }}
+                  onSave={() => {
+                    saveSchedule(currentSchedule);
+                    navigate("/");
+                  }}
+                  onBack={() => navigate("/")}
+                  onViewHistory={() => navigate("/history")}
+                  onViewPreferences={() => navigate("/preferences")}
+                  onUpdateSchedule={(updatedSchedule) => {
+                    setCurrentSchedule(updatedSchedule);
+                    saveSchedule(updatedSchedule);
+                  }}
+                />
+              ) : (
+                <Navigate to="/" replace />
+              )}
+            </ProtectedRoute>
+          }
         />
-      )}
 
-      {currentPage === "history" && (
-        <HistoryPage
-          schedules={scheduleHistory}
-          onSelectSchedule={(schedule) => {
-            setCurrentSchedule(schedule);
-            navigateTo("schedule");
-          }}
-          onBack={() => navigateTo("entry")}
+        <Route
+          path="/explanation"
+          element={
+            <ProtectedRoute>
+              {currentSchedule ? (
+                <ExplanationPanel
+                  schedule={currentSchedule}
+                  onBack={() => navigate(-1)}
+                />
+              ) : (
+                <Navigate to="/" replace />
+              )}
+            </ProtectedRoute>
+          }
         />
-      )}
 
-      {currentPage === "preferences" && (
-        <PreferencesPage
-          onBack={() => {
-            // Go back to entry page if coming from entry, otherwise to schedule
-            if (currentSchedule) {
-              navigateTo("schedule");
-            } else {
-              navigateTo("entry");
-            }
-          }}
+        <Route
+          path="/history"
+          element={
+            <ProtectedRoute>
+              <HistoryPage
+                schedules={scheduleHistory}
+                onSelectSchedule={(schedule) => {
+                  setCurrentSchedule(schedule);
+                  navigate("/schedule");
+                }}
+                onBack={() => navigate("/")}
+              />
+            </ProtectedRoute>
+          }
         />
-      )}
+
+        <Route
+          path="/preferences"
+          element={
+            <ProtectedRoute>
+              <PreferencesPage onBack={() => navigate(-1)} />
+            </ProtectedRoute>
+          }
+        />
+
+        {/* Catch-all redirect */}
+        <Route path="*" element={<Navigate to="/" replace />} />
+      </Routes>
     </div>
   );
 }

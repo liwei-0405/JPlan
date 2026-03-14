@@ -12,9 +12,9 @@ JPlan is a modern daily planning interface designed to help users manage their s
 ## 🛠️ Tech Stack
 
 - **Frontend**: React, Vite, Tailwind CSS, Lucide React, Radix UI.
-- **Backend**: FastAPI, Pydantic, Uvicorn.
-- **Database/Auth**: Supabase.
-- **AI**: Google Generative AI (Gemini).
+- **Backend**: FastAPI, Pydantic, Uvicorn, Python.
+- **Database/Auth**: Supabase (PostgreSQL).
+- **AI**: Google GenAI SDK (Gemini).
 
 ---
 
@@ -40,12 +40,18 @@ cd JPlan
 # Install dependencies
 npm install
 
-# Setup environment variables
+# Setup frontend environment variables
 cp .env.example .env
-# Edit .env and add your Supabase and Gemini API keys
+# Edit .env and fill in the "Frontend - Vite" section
 ```
 
-### 3. Backend Setup
+### 3. Database Setup (Supabase)
+
+Before running the app, go to your **Supabase Dashboard**:
+1. Run the contents of `supabase_setup.sql` in the **SQL Editor**.
+2. Go to **Authentication** -> **Providers** -> **Email** and disable **Confirm email**.
+
+### 4. Backend Setup
 
 ```bash
 cd backend
@@ -62,9 +68,9 @@ source venv/bin/activate
 # Install dependencies
 pip install -r requirements.txt
 
-# Setup environment variables
+# Setup backend environment variables
 cp ../.env.example .env
-# Ensure the backend .env also has the necessary keys
+# Edit .env and fill in the "Backend" & "Google AI" sections
 ```
 
 ---
@@ -77,9 +83,9 @@ Make sure your virtual environment is activated:
 
 ```bash
 cd backend
-python main.py
+uvicorn main:app --reload
 ```
-The backend will typically run on `http://localhost:8000`.
+The backend typically runs on `http://localhost:8000`.
 
 ### Start the Frontend
 
@@ -99,7 +105,7 @@ The frontend will typically run on `http://localhost:3000`.
 
 - **Private Repository**: If you are using this for FYP, it is recommended to keep your repository **Private** until you are ready to reveal it.
 - **Rotation**: If you ever accidentally commit a secret, rotate (change) your API keys immediately.
-- **RLS**: Ensure Supabase Row Level Security (RLS) is enabled and properly configured for your tables.
+- **RLS**: Ensure Supabase Row Level Security (RLS) is enabled for data protection.
 
 ## 📄 License
 

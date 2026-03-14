@@ -4,7 +4,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
-import google.generativeai as genai
+from google import genai
 from typing import List, Dict, Any
 import database
 
@@ -12,9 +12,7 @@ import database
 load_dotenv()
 
 # Gemini API
-genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
-
-model = genai.GenerativeModel('gemini-2.5-flash')
+client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
 
 app = FastAPI()
 
@@ -36,6 +34,7 @@ class ChatRequest(BaseModel):
     message: str
     history: list[dict] = [] 
     current_schedule: dict | None = None
+    user_id: str | None = None
 
 class ChatResponse(BaseModel):
     reply: str
@@ -44,10 +43,7 @@ class ChatResponse(BaseModel):
 class PlanRequest(BaseModel):
     date: str
     activities: List[Dict[str, Any]]
-
-class PlanResponse(BaseModel):
-    date: str
-    activities: List[Dict[str, Any]]
+    user_id: str
 
 SYSTEM_PROMPT = """
 You are a daily scheduling assistant for an app called JPlan. 
@@ -89,12 +85,11 @@ async def read_root():
 
 @app.post("/chat")
 async def chat_with_llm(request: ChatRequest):
-    print(f"Received message: {request.message}")
+    print(f"Received message: {request.message} from user: {request.user_id}")
     
     try:
-
         context = ""
-        if request.current_schedule: # If there's an existing schedule, include it in the context
+        if request.current_schedule:
             context = f"\nCURRENT_SCHEDULE: {json.dumps(request.current_schedule)}"
 
         full_prompt = f"{SYSTEM_PROMPT}\n{context}\n\nRespond with a valid JSON object only."
@@ -104,24 +99,19 @@ async def chat_with_llm(request: ChatRequest):
             full_prompt += f"{role}: {msg['message']}\n"
             
         full_prompt += f"User: {request.message}\nAssistant: "
-        print(f"Calling Gemini API with message: {full_prompt}")
         
-        response = model.generate_content(
-            full_prompt,
-            generation_config={"response_mime_type": "application/json"}
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=full_prompt,
+            config={"response_mime_type": "application/json"}
         )
         
-        # print raw response for debugging
         raw_text = response.text
-        print(f"Gemini raw response: {raw_text}")
         
-        # stronger JSON extraction
         try:
-            # try to cleanly extract JSON block
             clean_text = raw_text.replace('```json', '').replace('```', '').strip()
             result = json.loads(clean_text)
         except json.JSONDecodeError:
-            # find first and last braces to extract JSON
             start = raw_text.find('{')
             end = raw_text.rfind('}') + 1
             if start != -1 and end != 0:
@@ -129,18 +119,18 @@ async def chat_with_llm(request: ChatRequest):
             else:
                 raise ValueError("No JSON found in response")
         
-        # If AI generated a schedule, save it to database
+        # If AI generated a schedule and we have a user_id, save it
         schedule_data = result.get("schedule_data")
-        if schedule_data and schedule_data.get("date") and schedule_data.get("activities"):
+        if schedule_data and schedule_data.get("date") and schedule_data.get("activities") and request.user_id:
             try:
-                saved_plan = database.save_plan(
+                database.save_plan(
                     date=schedule_data["date"],
-                    activities=schedule_data["activities"]
+                    activities=schedule_data["activities"],
+                    user_id=request.user_id
                 )
-                print(f"Auto-saved plan to database for date: {schedule_data['date']}")
+                print(f"Auto-saved plan for user: {request.user_id}")
             except Exception as db_error:
                 print(f"Failed to auto-save plan: {db_error}")
-                # Continue even if save fails
         
         return ChatResponse(
             reply=result.get("reply", "I've created a plan for you based on your request."),
@@ -149,7 +139,6 @@ async def chat_with_llm(request: ChatRequest):
         
     except Exception as e:
         import traceback
-        print(f"Error occurred: {e}")
         traceback.print_exc() 
         return ChatResponse(
             reply=f"Sorry, I encountered an error: {str(e)}",
@@ -157,30 +146,24 @@ async def chat_with_llm(request: ChatRequest):
         )
 
 
-# ============================================
-# Plan Management API Endpoints
-# ============================================
-
 @app.get("/api/plans")
-async def get_all_plans():
-    """Get all saved plans"""
+async def get_all_plans(user_id: str):
+    """Get all saved plans for a user"""
     try:
-        plans = database.get_all_plans()
+        plans = database.get_all_plans(user_id)
         return plans
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/plans/{date}")
-async def get_plan_by_date(date: str):
-    """Get plan for a specific date (YYYY-MM-DD)"""
+async def get_plan_by_date(date: str, user_id: str):
+    """Get plan for a specific date and user"""
     try:
-        plan = database.get_plan_by_date(date)
+        plan = database.get_plan_by_date(date, user_id)
         if plan is None:
-            raise HTTPException(status_code=404, detail=f"No plan found for date {date}")
+            raise HTTPException(status_code=404, detail=f"No plan found")
         return plan
-    except HTTPException:
-        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -189,9 +172,12 @@ async def get_plan_by_date(date: str):
 async def save_plan_endpoint(plan: PlanRequest):
     """Save or update a plan"""
     try:
+        # NOTE: Here is where you would call Google Maps API and run your algorithms
+        # before saving to the database.
         saved_plan = database.save_plan(
             date=plan.date,
-            activities=plan.activities
+            activities=plan.activities,
+            user_id=plan.user_id
         )
         return saved_plan
     except Exception as e:
@@ -199,10 +185,12 @@ async def save_plan_endpoint(plan: PlanRequest):
 
 
 @app.delete("/api/plans/{date}")
-async def delete_plan_endpoint(date: str):
-    """Delete a plan for a specific date"""
+async def delete_plan_endpoint(date: str, user_id: str):
+    """Delete a plan for a specific date and user"""
     try:
-        success = database.delete_plan(date)
-        return {"success": success, "message": f"Plan for {date} deleted successfully"}
+        success = database.delete_plan(date, user_id)
+        return {"success": success}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+

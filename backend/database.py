@@ -19,95 +19,69 @@ else:
     supabase: Client = create_client(supabase_url, supabase_key)
 
 
-def get_all_plans() -> List[Dict[str, Any]]:
+def get_all_plans(user_id: str) -> List[Dict[str, Any]]:
     """
-    Fetch all saved plans from the database
-    Returns a list of plan objects sorted by date (descending)
+    Fetch all saved plans for a specific user from the database
     """
     if not supabase:
-        raise Exception("Supabase client not initialized. Check your environment variables.")
+        raise Exception("Supabase client not initialized.")
     
     try:
         response = supabase.table('daily_plans')\
             .select('*')\
+            .eq('user_id', user_id)\
             .order('date', desc=True)\
             .execute()
         
-        # Convert to frontend format
-        plans = []
-        for plan in response.data:
-            plans.append({
-                'date': plan['date'],
-                'activities': plan['activities']
-            })
-        
-        return plans
+        return [{'date': p['date'], 'activities': p['activities']} for p in response.data]
     except Exception as e:
-        print(f"Error fetching all plans: {e}")
+        print(f"Error fetching plans: {e}")
         raise
 
 
-def get_plan_by_date(date: str) -> Optional[Dict[str, Any]]:
+def get_plan_by_date(date: str, user_id: str) -> Optional[Dict[str, Any]]:
     """
-    Fetch a plan for a specific date
-    
-    Args:
-        date: Date string in YYYY-MM-DD format
-    
-    Returns:
-        Plan object or None if not found
+    Fetch a plan for a specific date and user
     """
     if not supabase:
-        raise Exception("Supabase client not initialized. Check your environment variables.")
+        raise Exception("Supabase client not initialized.")
     
     try:
         response = supabase.table('daily_plans')\
             .select('*')\
             .eq('date', date)\
+            .eq('user_id', user_id)\
             .execute()
         
         if not response.data:
             return None
         
         plan = response.data[0]
-        return {
-            'date': plan['date'],
-            'activities': plan['activities']
-        }
+        return {'date': plan['date'], 'activities': plan['activities']}
     except Exception as e:
-        print(f"Error fetching plan for date {date}: {e}")
+        print(f"Error fetching plan: {e}")
         raise
 
 
-def save_plan(date: str, activities: List[Dict[str, Any]]) -> Dict[str, Any]:
+def save_plan(date: str, activities: List[Dict[str, Any]], user_id: str) -> Dict[str, Any]:
     """
-    Save or update a plan in the database
-    
-    Args:
-        date: Date string in YYYY-MM-DD format
-        activities: List of activity objects
-    
-    Returns:
-        Saved plan object
+    Save or update a plan in the database for a specific user
     """
     if not supabase:
-        raise Exception("Supabase client not initialized. Check your environment variables.")
+        raise Exception("Supabase client not initialized.")
     
     try:
-        # Use upsert to insert or update
         response = supabase.table('daily_plans')\
             .upsert({
+                'user_id': user_id,
                 'date': date,
                 'activities': activities
-            }, on_conflict='date')\
+            }, on_conflict='user_id, date')\
             .execute()
         
         if response.data:
             plan = response.data[0]
-            return {
-                'date': plan['date'],
-                'activities': plan['activities']
-            }
+            return {'date': plan['date'], 'activities': plan['activities']}
         else:
             raise Exception("Failed to save plan")
     except Exception as e:
@@ -115,26 +89,21 @@ def save_plan(date: str, activities: List[Dict[str, Any]]) -> Dict[str, Any]:
         raise
 
 
-def delete_plan(date: str) -> bool:
+def delete_plan(date: str, user_id: str) -> bool:
     """
-    Delete a plan for a specific date
-    
-    Args:
-        date: Date string in YYYY-MM-DD format
-    
-    Returns:
-        True if successful
+    Delete a plan for a specific date and user
     """
     if not supabase:
-        raise Exception("Supabase client not initialized. Check your environment variables.")
+        raise Exception("Supabase client not initialized.")
     
     try:
         supabase.table('daily_plans')\
             .delete()\
             .eq('date', date)\
+            .eq('user_id', user_id)\
             .execute()
         
         return True
     except Exception as e:
-        print(f"Error deleting plan for date {date}: {e}")
+        print(f"Error deleting plan: {e}")
         raise
