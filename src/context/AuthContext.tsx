@@ -19,6 +19,7 @@ interface AuthContextType {
   profile: Profile | null;
   loading: boolean;
   isAdmin: boolean;
+  isGoogleLinked: boolean;
   signOut: () => Promise<void>;
 }
 
@@ -66,6 +67,19 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             console.log("[AuthContext] Profile synced from DB");
             setProfile(data as Profile);
           }
+
+          // NEW: Capture Google Refresh Token for background calendar sync
+          // Supabase provides this ONLY when offline access is requested and granted
+          if (session.provider_refresh_token) {
+            console.log("[AuthContext] Found Google Refresh Token, updating profile...");
+            await supabase
+              .from('profiles')
+              .update({ 
+                google_refresh_token: session.provider_refresh_token,
+                calendar_sync_enabled: true 
+              })
+              .eq('id', session.user.id);
+          }
         } catch (err) {
           console.error('[AuthContext] Background sync failed:', err);
         }
@@ -98,6 +112,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   };
 
   const isAdmin = profile?.role === 'admin';
+  const isGoogleLinked = user?.app_metadata?.providers?.includes('google') || 
+                        user?.identities?.some(id => id.provider === 'google') ||
+                        false;
 
   const value = {
     session,
@@ -105,6 +122,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     profile,
     loading,
     isAdmin,
+    isGoogleLinked,
     signOut,
   };
 

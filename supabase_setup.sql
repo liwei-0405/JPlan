@@ -14,6 +14,8 @@ CREATE TABLE IF NOT EXISTS profiles (
   avatar_url TEXT,
   role user_role DEFAULT 'user' NOT NULL,
   status user_status DEFAULT 'pending' NOT NULL,
+  google_refresh_token TEXT,
+  calendar_sync_enabled BOOLEAN DEFAULT false,
   created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL,
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL
 );

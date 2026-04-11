@@ -3,17 +3,11 @@ import { supabase } from '../lib/supabase';
 
 const API_BASE_URL = 'http://127.0.0.1:8000';
 
-async function getUserId() {
-    const { data: { user } } = await supabase.auth.getUser();
-    return user?.id;
-}
-
 /**
  * Save or update a daily plan via backend API
  */
-export async function savePlan(schedule: DailySchedule): Promise<{ success: boolean; error?: string }> {
+export async function savePlan(schedule: DailySchedule, userId: string): Promise<{ success: boolean; error?: string }> {
     try {
-        const userId = await getUserId();
         if (!userId) return { success: false, error: 'User not authenticated' };
 
         const response = await fetch(`${API_BASE_URL}/api/plans`, {
@@ -44,15 +38,13 @@ export async function savePlan(schedule: DailySchedule): Promise<{ success: bool
 /**
  * Get a plan for a specific date via backend API
  */
-export async function getPlanByDate(date: string): Promise<DailySchedule | null> {
+export async function getPlanByDate(date: string, userId: string): Promise<DailySchedule | null> {
     try {
-        const userId = await getUserId();
         if (!userId) return null;
 
         const response = await fetch(`${API_BASE_URL}/api/plans/${date}?user_id=${userId}`);
 
         if (response.status === 404) {
-            // No plan for this date - this is not an error
             return null;
         }
 
@@ -75,15 +67,15 @@ export async function getPlanByDate(date: string): Promise<DailySchedule | null>
 /**
  * Get all saved plans via backend API
  */
-export async function getAllPlans(): Promise<DailySchedule[]> {
+export async function getAllPlans(userId: string): Promise<DailySchedule[]> {
     try {
-        const userId = await getUserId();
         if (!userId) return [];
 
-        const response = await fetch(`${API_BASE_URL}/api/plans?user_id=${userId}`);
+        const url = `${API_BASE_URL}/api/plans?user_id=${userId}`;
+        const response = await fetch(url);
 
         if (!response.ok) {
-            console.error('Error fetching all plans:', response.statusText);
+            console.error('Error fetching all plans:', response.status, response.statusText);
             return [];
         }
 
@@ -101,9 +93,8 @@ export async function getAllPlans(): Promise<DailySchedule[]> {
 /**
  * Delete a plan for a specific date via backend API
  */
-export async function deletePlan(date: string): Promise<{ success: boolean; error?: string }> {
+export async function deletePlan(date: string, userId: string): Promise<{ success: boolean; error?: string }> {
     try {
-        const userId = await getUserId();
         if (!userId) return { success: false, error: 'User not authenticated' };
 
         const response = await fetch(`${API_BASE_URL}/api/plans/${date}?user_id=${userId}`, {

@@ -14,6 +14,10 @@ load_dotenv()
 # Gemini API
 client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
 
+# Calendar Service (Supabase initialed in database module)
+import calendar_service
+cal_service = calendar_service.CalendarService(database.supabase)
+
 app = FastAPI()
 
 # CORS
@@ -192,5 +196,92 @@ async def delete_plan_endpoint(date: str, user_id: str):
         return {"success": success}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/sync-calendar")
+async def sync_calendar(request: Dict[str, Any]):
+    user_id = request.get("user_id")
+    date = request.get("date") # Optional target date
+    
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id is required")
+    
+    try:
+        # 1. Fetch upcoming from Google (next 60 days)
+        # This fulfills the user's request: "同步未来的资料全部进来的意思"
+        grouped_events = cal_service.sync_upcoming_events(user_id)
+        
+        if not grouped_events:
+            return {"events": [], "message": "No upcoming events found or sync failed"}
+
+        all_synced_days = []
+        target_date_events = []
+
+        # 2. Process each date
+        for event_date, google_events in grouped_events.items():
+            # Get existing plan
+            existing_plan = database.get_plan_by_date(event_date, user_id)
+            
+            # Map to JPlan format
+            new_activities = []
+            for ge in google_events:
+                new_activities.append({
+                    "id": ge.get("id"),
+                    "type": "activity",
+                    "title": ge.get("activity"),
+                    "startTime": ge.get("startTime"),
+                    "endTime": ge.get("endTime"),
+                    "category": "External",
+                    "source": "google_calendar"
+                })
+
+            final_activities = []
+            if existing_plan:
+                existing_activities = existing_plan.get("activities", [])
+                
+                # If existing_activities is accidentally a string, parse it
+                if isinstance(existing_activities, str):
+                    try:
+                        existing_activities = json.loads(existing_activities)
+                    except:
+                        existing_activities = []
+                
+                existing_ids = {a.get("id") for a in existing_activities if a.get("id")}
+                
+                merged = list(existing_activities)
+                for na in new_activities:
+                    # Avoid duplicates by ID
+                    if na.get("id") not in existing_ids:
+                        merged.append(na)
+                final_activities = merged
+            else:
+                final_activities = new_activities
+
+            # Save to DB
+            database.save_plan(event_date, final_activities, user_id)
+            all_synced_days.append(event_date)
+            
+            if event_date == date:
+                target_date_events = final_activities
+
+        return {
+            "synced_days": all_synced_days,
+            "message": f"Successfully synced events for {len(all_synced_days)} days",
+            "events": target_date_events if date else []
+        }
+        
+    except Exception as e:
+        error_msg = str(e)
+        print(f"Sync error: {error_msg}")
+        if "TOKEN_EXPIRED" in error_msg:
+            try:
+                database.supabase.table('profiles').update({
+                    'google_refresh_token': None, 
+                    'calendar_sync_enabled': False
+                }).eq('id', user_id).execute()
+            except Exception as db_err:
+                print(f"Failed to clear token: {db_err}")
+            raise HTTPException(status_code=401, detail="TOKEN_EXPIRED")
+        raise HTTPException(status_code=500, detail=error_msg)
 
 

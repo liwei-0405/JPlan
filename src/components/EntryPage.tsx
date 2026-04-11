@@ -12,6 +12,7 @@ type EntryPageProps = {
   onSettingsClick: () => void;
   todaySchedule: DailySchedule | null;
   scheduleHistory: DailySchedule[];
+  onSyncComplete?: () => void;
 };
 
 export function EntryPage({
@@ -20,7 +21,8 @@ export function EntryPage({
   onReplanToday,
   onSettingsClick,
   todaySchedule,
-  scheduleHistory
+  scheduleHistory,
+  onSyncComplete
 }: EntryPageProps) {
   const [selectedDate, setSelectedDate] = useState<Date>(new Date());
 
@@ -50,7 +52,11 @@ export function EntryPage({
 
   return (
     <div className="min-h-screen bg-background">
-      <TopNav onSettingsClick={onSettingsClick} />
+      <TopNav 
+        onSettingsClick={onSettingsClick} 
+        onSyncComplete={onSyncComplete} 
+        syncDate={selectedDateStr}
+      />
 
       <div className="max-w-6xl mx-auto px-6 py-8">
         {/* Header */}
@@ -77,22 +83,30 @@ export function EntryPage({
           {/* Selected Date's Plan Preview */}
           <div>
             <div
-              onClick={hasSelectedPlan ? () => selectedSchedule && onViewSchedule(selectedSchedule) : () => onStartPlanning(selectedDate)}
-              role="button"
-              tabIndex={0}
+              onClick={
+                hasSelectedPlan 
+                  ? () => selectedSchedule && onViewSchedule(selectedSchedule) 
+                  : (!isPastDate ? () => onStartPlanning(selectedDate) : undefined)
+              }
+              role={hasSelectedPlan || !isPastDate ? "button" : undefined}
+              tabIndex={hasSelectedPlan || !isPastDate ? 0 : undefined}
               onKeyDown={(e) => {
-                if (e.key === 'Enter' || e.key === ' ') {
+                if ((e.key === 'Enter' || e.key === ' ') && (hasSelectedPlan || !isPastDate)) {
                   e.preventDefault();
                   hasSelectedPlan ? selectedSchedule && onViewSchedule(selectedSchedule) : onStartPlanning(selectedDate);
                 }
               }}
-              className="bg-card rounded-2xl border border-border p-6 shadow-sm h-full flex flex-col w-full text-left hover:shadow-md hover:border-primary/30 transition-all cursor-pointer group"
+              className={`bg-card rounded-2xl border border-border p-6 shadow-sm h-full flex flex-col w-full text-left transition-all ${
+                hasSelectedPlan || !isPastDate 
+                  ? "hover:shadow-md hover:border-primary/30 cursor-pointer group" 
+                  : "cursor-default"
+              }`}
             >
               <div className="flex items-center gap-2 mb-4">
                 <CalendarIcon className="h-5 w-5 text-primary" />
                 <h3>{isToday ? "Today's Plan" : `Plan for ${selectedDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`}</h3>
-                <div className="ml-auto opacity-0 group-hover:opacity-100 transition-opacity text-xs text-muted-foreground">
-                  Click to {hasSelectedPlan ? 'view' : 'plan'}
+                <div className={`ml-auto opacity-0 ${hasSelectedPlan || !isPastDate ? "group-hover:opacity-100" : ""} transition-opacity text-xs text-muted-foreground`}>
+                  {hasSelectedPlan ? 'Click to view' : (!isPastDate ? 'Click to plan' : '')}
                 </div>
               </div>
 
@@ -140,7 +154,7 @@ export function EntryPage({
                       No schedule for {isToday ? 'today' : 'this date'}.
                     </p>
                     <p className="text-sm text-muted-foreground">
-                      Start planning to organize your day!
+                      {isPastDate ? "This date is in the past." : "Start planning to organize your day!"}
                     </p>
                   </div>
                 </div>

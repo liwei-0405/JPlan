@@ -45,11 +45,26 @@ cp .env.example .env
 # Edit .env and fill in the "Frontend - Vite" section
 ```
 
-### 3. Database Setup (Supabase)
+### 3. Database & Auth Setup (Supabase)
 
 Before running the app, go to your **Supabase Dashboard**:
-1. Run the contents of `supabase_setup.sql` in the **SQL Editor**.
+1. Run the contents of `supabase_setup.sql` in the **SQL Editor**. 
 2. Go to **Authentication** -> **Providers** -> **Email** and disable **Confirm email**.
+3. **Google Auth & Calendar Setup**:
+   - Go to **Authentication** -> **Providers** -> **Google**.
+   - Enable Google provider.
+   - Enter your **Client ID** and **Client Secret** (from Google Cloud Console).
+   - In **Additional Scopes**, add: `https://www.googleapis.com/auth/calendar.readonly`.
+   - (Optional but recommended) Enable **Skip nonce check**.
+
+### 3.1 Google Cloud Console Setup
+
+1. Enable **Google Calendar API**.
+2. Configure **OAuth consent screen**:
+   - Add `.../auth/calendar.readonly` to **Scopes**.
+   - Add your test email address to **Test users** (important while in Testing mode).
+3. Create **OAuth 2.0 Client ID** (Web application type).
+   - Add Supabase Redirect URI to **Authorized redirect URIs**.
 
 ### 4. Backend Setup
 

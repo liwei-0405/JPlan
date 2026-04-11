@@ -2,21 +2,48 @@
 Database layer for Supabase operations
 """
 import os
+import json
 from typing import List, Optional, Dict, Any
 from supabase import create_client, Client
 from dotenv import load_dotenv
 
-load_dotenv()
+# Robust .env loading
+env_path = os.path.join(os.path.dirname(__file__), '.env')
+if not os.path.exists(env_path):
+    env_path = os.path.join(os.path.dirname(__file__), '..', '.env')
+
+load_dotenv(env_path)
 
 # Initialize Supabase client
 supabase_url = os.getenv("SUPABASE_URL")
-supabase_key = os.getenv("SUPABASE_KEY")
+if supabase_url: supabase_url = supabase_url.strip('"').strip("'")
+
+supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY")
+if supabase_key: supabase_key = supabase_key.strip('"').strip("'")
+
+supabase: Optional[Client] = None
 
 if not supabase_url or not supabase_key:
-    print("Warning: Supabase credentials not found in environment variables")
-    supabase: Optional[Client] = None
+    print(f"[ERROR] Supabase credentials missing! URL: {'Found' if supabase_url else 'Missing'}, Key: {'Found' if supabase_key else 'Missing'}")
 else:
-    supabase: Client = create_client(supabase_url, supabase_key)
+    try:
+        supabase = create_client(supabase_url, supabase_key)
+    except Exception as e:
+        print(f"[ERROR] Failed to initialize Supabase client: {e}")
+
+def _parse_activities(activities: Any) -> List[Dict[str, Any]]:
+    """Helper to ensure activities is always a list of dicts"""
+    if activities is None:
+        return []
+    if isinstance(activities, list):
+        return activities
+    if isinstance(activities, str):
+        try:
+            parsed = json.loads(activities)
+            return parsed if isinstance(parsed, list) else []
+        except:
+            return []
+    return []
 
 
 def get_all_plans(user_id: str) -> List[Dict[str, Any]]:
@@ -33,7 +60,8 @@ def get_all_plans(user_id: str) -> List[Dict[str, Any]]:
             .order('date', desc=True)\
             .execute()
         
-        return [{'date': p['date'], 'activities': p['activities']} for p in response.data]
+        results = [{'date': p['date'], 'activities': _parse_activities(p['activities'])} for p in response.data]
+        return results
     except Exception as e:
         print(f"Error fetching plans: {e}")
         raise
@@ -57,7 +85,7 @@ def get_plan_by_date(date: str, user_id: str) -> Optional[Dict[str, Any]]:
             return None
         
         plan = response.data[0]
-        return {'date': plan['date'], 'activities': plan['activities']}
+        return {'date': plan['date'], 'activities': _parse_activities(plan.get('activities'))}
     except Exception as e:
         print(f"Error fetching plan: {e}")
         raise
@@ -81,7 +109,7 @@ def save_plan(date: str, activities: List[Dict[str, Any]], user_id: str) -> Dict
         
         if response.data:
             plan = response.data[0]
-            return {'date': plan['date'], 'activities': plan['activities']}
+            return {'date': plan['date'], 'activities': _parse_activities(plan.get('activities'))}
         else:
             raise Exception("Failed to save plan")
     except Exception as e:

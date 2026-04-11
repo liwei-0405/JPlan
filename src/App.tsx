@@ -79,7 +79,7 @@ export default function App() {
     const loadPlans = async () => {
       setIsLoadingPlans(true);
       try {
-        const plans = await getAllPlans();
+        const plans = await getAllPlans(user.id);
         setScheduleHistory(plans);
       } catch (error) {
         console.error('Failed to load plans:', error);
@@ -99,27 +99,24 @@ export default function App() {
       const error = params.get('error');
       const errorDescription = params.get('error_description');
       if (errorDescription) {
-        // We use a small timeout to ensure Toaster is mounted
         setTimeout(() => {
            console.error("OAuth Error:", errorDescription);
-           // Toast the error so the user can easily see it
            import('sonner').then(({ toast }) => {
                toast.error(`Auth Error: ${errorDescription.replace(/\+/g, ' ')}`, { duration: 10000 });
            });
         }, 500);
       }
-      
-      // Clear the hash so we don't keep showing the error on refresh
       window.history.replaceState(null, '', window.location.pathname + window.location.search);
     }
   }, []);
 
 
   const saveSchedule = async (schedule: DailySchedule) => {
+    if (!user) return;
     setCurrentSchedule(schedule);
 
     // Save to Supabase
-    const result = await savePlanToDb(schedule);
+    const result = await savePlanToDb(schedule, user.id);
     if (!result.success) {
       console.error('Failed to save plan to database:', result.error);
     }
@@ -135,7 +132,6 @@ export default function App() {
     }
   };
 
-  // Get today's schedule
   const getTodaySchedule = (): DailySchedule | null => {
     const todayStr = formatToISODate(new Date());
     return scheduleHistory.find(s => s.date === todayStr) || null;
@@ -159,6 +155,18 @@ export default function App() {
           element={
             <ProtectedRoute>
               <EntryPage
+                onSyncComplete={async () => {
+                   if (!user) return;
+                   setIsLoadingPlans(true);
+                   try {
+                     const plans = await getAllPlans(user.id);
+                     setScheduleHistory(plans);
+                   } catch (error) {
+                     console.error('Failed to load plans after sync:', error);
+                   } finally {
+                     setIsLoadingPlans(false);
+                   }
+                }}
                 onStartPlanning={(date: Date) => {
                   setPlanningDate(date);
                   setPlanningSchedule(null);
@@ -280,7 +288,6 @@ export default function App() {
           }
         />
 
-        {/* Catch-all redirect */}
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
     </div>
