@@ -113,3 +113,35 @@ export async function deletePlan(date: string, userId: string): Promise<{ succes
         return { success: false, error: 'Failed to connect to backend' };
     }
 }
+
+/**
+ * Export a daily schedule to Google Calendar via backend API
+ */
+export async function exportPlanToGoogle(date: string, userId: string): Promise<{ success: boolean; exportedCount?: number; error?: string }> {
+    try {
+        if (!userId) return { success: false, error: 'User not authenticated' };
+
+        const response = await fetch(`${API_BASE_URL}/api/export-calendar`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                user_id: userId,
+                date: date
+            }),
+        });
+
+        if (!response.ok) {
+            const errorData = await response.json().catch(() => ({ detail: 'Unknown error' }));
+            console.error('Error exporting plan:', errorData);
+            return { success: false, error: errorData.detail || 'Failed to export plan' };
+        }
+
+        const data = await response.json();
+        return { success: true, exportedCount: data.exported_count };
+    } catch (err) {
+        console.error('Exception exporting plan:', err);
+        return { success: false, error: 'Failed to connect to backend' };
+    }
+}

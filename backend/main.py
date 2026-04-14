@@ -49,6 +49,10 @@ class PlanRequest(BaseModel):
     activities: List[Dict[str, Any]]
     user_id: str
 
+class ExportRequest(BaseModel):
+    user_id: str
+    date: str
+
 SYSTEM_PROMPT = """
 You are a daily scheduling assistant for an app called JPlan. 
 Your goal is to parse user requests into a structured daily schedule.
@@ -282,6 +286,40 @@ async def sync_calendar(request: Dict[str, Any]):
             except Exception as db_err:
                 print(f"Failed to clear token: {db_err}")
             raise HTTPException(status_code=401, detail="TOKEN_EXPIRED")
+        raise HTTPException(status_code=500, detail=error_msg)
+
+
+@app.post("/api/export-calendar")
+async def export_calendar(request: ExportRequest):
+    if not request.user_id or not request.date:
+        raise HTTPException(status_code=400, detail="user_id and date are required")
+    
+    try:
+        # Get existing plan
+        plan = database.get_plan_by_date(request.date, request.user_id)
+        if not plan or not plan.get("activities"):
+            raise HTTPException(status_code=404, detail="No activities found for this date")
+            
+        count = cal_service.export_schedule_to_google(request.user_id, request.date, plan.get("activities"))
+            
+        return {"message": "Success", "exported_count": count}
+    except Exception as e:
+        error_msg = str(e)
+        print(f"Export error: {error_msg}")
+        if "TOKEN_EXPIRED" in error_msg:
+            try:
+                database.supabase.table('profiles').update({
+                    'google_refresh_token': None, 
+                    'calendar_sync_enabled': False
+                }).eq('id', request.user_id).execute()
+            except Exception as db_err:
+                print(f"Failed to clear token: {db_err}")
+            raise HTTPException(status_code=401, detail="TOKEN_EXPIRED")
+        
+        if "403" in error_msg or "insufficientPermissions" in error_msg:
+            # Re-auth needed for correct scopes
+            raise HTTPException(status_code=401, detail="TOKEN_EXPIRED")
+            
         raise HTTPException(status_code=500, detail=error_msg)
 
 

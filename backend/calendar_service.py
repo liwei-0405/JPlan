@@ -1,5 +1,6 @@
 import os
 import requests
+import json
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta
 from supabase import Client
@@ -257,3 +258,127 @@ class CalendarService:
                 raise e
             print(f"Bulk sync failed for user {user_id}: {e}")
             return {}
+
+    def export_schedule_to_google(self, user_id: str, date_str: str, activities: List[Dict[str, Any]]) -> int:
+        """
+        Push JPlan activities to Google Calendar
+        """
+        try:
+            # 1. Get refresh token
+            res = self.supabase.table("profiles").select("google_refresh_token").eq("id", user_id).execute()
+            if not res.data or len(res.data) == 0:
+                print(f"[ERROR] No profile found for user {user_id}")
+                return False
+            
+            refresh_token = res.data[0].get("google_refresh_token")
+            if not refresh_token:
+                return False
+
+            # 2. Get access token
+            try:
+                access_token = self.refresh_access_token(refresh_token)
+                if not access_token:
+                    raise Exception("TOKEN_EXPIRED")
+            except Exception as e:
+                if str(e) == "TOKEN_EXPIRED":
+                    raise e
+                return False
+
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json"
+            }
+            
+            def parse_time_to_dt(t_str, d_str):
+                if not t_str or t_str == "All Day":
+                    return None
+                try:
+                    # Input: "09:00 AM", "2026-04-15"
+                    return datetime.strptime(f"{d_str} {t_str}", "%Y-%m-%d %I:%M %p")
+                except Exception as parse_err:
+                    print(f"[ERROR] Time parse error for '{t_str}': {parse_err}")
+                    return None
+
+            # 3. Cleanup existing JPlan events in Google for this date
+            print(f"[DEBUG] Cleaning up previous JPlan events for {date_str}...")
+            # Use a slightly wider range to be sure (target date +/- 12 hours)
+            target_date_dt = datetime.fromisoformat(date_str)
+            clean_min = (target_date_dt - timedelta(hours=14)).isoformat() + "Z"
+            clean_max = (target_date_dt + timedelta(hours=38)).isoformat() + "Z"
+            
+            existing_google_events = self.get_calendar_events(access_token, clean_min, clean_max)
+            deleted_count = 0
+            for gev in existing_google_events:
+                # Check if it falls on the target date (comparing only the YYYY-MM-DD part)
+                start_obj = gev.get("start", {})
+                start_raw = start_obj.get("dateTime") or start_obj.get("date", "")
+                
+                if start_raw.startswith(date_str):
+                    try:
+                        del_url = f"https://www.googleapis.com/calendar/v3/calendars/primary/events/{gev.get('id')}"
+                        del_resp = requests.delete(del_url, headers=headers)
+                        del_resp.raise_for_status()
+                        deleted_count += 1
+                        print(f"[DEBUG] Deleted existing event to prepare for full sync: {gev.get('summary')}")
+                    except Exception as del_err:
+                        print(f"[ERROR] Failed to delete event {gev.get('id')}: {del_err}")
+            
+            print(f"[DEBUG] Total Cleanup finished. Deleted {deleted_count} events.")
+
+            # 4. Push each activity
+            exported_count = 0
+            print(f"[DEBUG] Starting Master Export for user {user_id} on {date_str}. Total activities: {len(activities)}")
+            for act in activities:
+                print(f"[DEBUG] Processing activity: '{act.get('title')}' (source: {act.get('source')}, type: {act.get('type')})")
+                
+                # Push EVERYTHING to ensure Google matches JPlan exactly
+                
+                # Only export 'activity' types
+                if act.get("type") != "activity":
+                    print(f"[DEBUG] Skipping '{act.get('title')}' because type is {act.get('type')}")
+                    continue
+
+                start_dt = parse_time_to_dt(act.get("startTime"), date_str)
+                end_dt = parse_time_to_dt(act.get("endTime"), date_str)
+                
+                if not start_dt or not end_dt:
+                    print(f"[DEBUG] Skipping '{act.get('title')}' because time parsing failed")
+                    continue
+
+                # FIX: Handle cases where end time is physically before start time (e.g. crossing midnight)
+                if end_dt <= start_dt:
+                    print(f"[DEBUG] End time {end_dt} is before start {start_dt}. Assuming next day.")
+                    end_dt += timedelta(days=1)
+
+                start_payload = {"dateTime": start_dt.strftime("%Y-%m-%dT%H:%M:%S") + "+08:00"}
+                end_payload = {"dateTime": end_dt.strftime("%Y-%m-%dT%H:%M:%S") + "+08:00"}
+
+                event = {
+                    "summary": act.get("title", "JPlan Activity"),
+                    "location": act.get("location", ""),
+                    "description": "Created via JPlan",
+                    "start": start_payload,
+                    "end": end_payload,
+                    "reminders": {"useDefault": True}
+                }
+                
+                print(f"[DEBUG] Sending event payload to Google: {json.dumps(event)}")
+
+                url = "https://www.googleapis.com/calendar/v3/calendars/primary/events"
+                resp = requests.post(url, headers=headers, json=event)
+                
+                if resp.status_code == 403:
+                    print(f"[ERROR] 403 Forbidden - likely missing scopes: {resp.text}")
+                    raise Exception("insufficientPermissions")
+                
+                resp.raise_for_status()
+                exported_count += 1
+
+            print(f"[DEBUG] Successfully exported {exported_count} activities to Google.")
+            return exported_count
+
+        except Exception as e:
+            if "TOKEN_EXPIRED" in str(e) or "insufficientPermissions" in str(e):
+                raise e
+            print(f"Export failed for user {user_id}: {e}")
+            return 0
