@@ -5,6 +5,7 @@ import { Button } from "./ui/button";
 import { Textarea } from "./ui/textarea";
 import { Input } from "./ui/input";
 import { Label } from "./ui/label";
+import { Switch } from "./ui/switch";
 import {
   ArrowLeft,
   Plus,
@@ -60,6 +61,7 @@ export function PlanningInputPage({
     date: isoDateStr,
     activities: []
   });
+  const [allowClash, setAllowClash] = useState<boolean>(Boolean(initialSchedule?.allow_clash));
 
   // Auto-load data on mount/refresh if missing
   useEffect(() => {
@@ -69,6 +71,7 @@ export function PlanningInputPage({
           const data = await getPlanByDate(isoDateStr, user.id);
           if (data) {
             setPreviewSchedule(data as DailySchedule);
+            setAllowClash(Boolean((data as DailySchedule).allow_clash));
           }
         } catch (err) {
           console.error("Failed to auto-load schedule:", err);
@@ -86,9 +89,13 @@ export function PlanningInputPage({
   // Sync state with parent whenever it changes
   useEffect(() => {
     if (previewSchedule) {
-      onUpdateSchedule(previewSchedule);
+      onUpdateSchedule({
+        ...previewSchedule,
+        allow_clash: allowClash,
+        planning_mode: allowClash ? "clash_allowed" : "feasibility_first",
+      });
     }
-  }, [previewSchedule, onUpdateSchedule]);
+  }, [previewSchedule, onUpdateSchedule, allowClash]);
 
   const [editingEvent, setEditingEvent] = useState<ActivityBlock | null>(null);
   const [showExitConfirmation, setShowExitConfirmation] = useState(false);
@@ -320,7 +327,8 @@ export function PlanningInputPage({
           message: userMessage,
           history: currentHistory, // send full history for context
           current_schedule: previewSchedule, // send current schedule if any
-          user_id: user?.id
+          user_id: user?.id,
+          allow_clash: allowClash,
         }),
       });
 
@@ -337,7 +345,10 @@ export function PlanningInputPage({
       }]);
 
       if (data.schedule_data) {
-        setPreviewSchedule(data.schedule_data as DailySchedule);
+        setPreviewSchedule({
+          ...(data.schedule_data as DailySchedule),
+          allow_clash: allowClash,
+        });
       }
     } catch (error) {
       setConversationHistory(prev => [...prev, {
@@ -432,6 +443,24 @@ export function PlanningInputPage({
               >
                 <Settings2 size={16} /> Manual Mode
               </Button>
+            </div>
+
+            <div className="flex items-center justify-between rounded-2xl border border-border bg-card px-4 py-3 shadow-sm">
+              <div>
+                <p className="text-sm font-medium">Allow conflicting schedules</p>
+                <p className="text-xs text-muted-foreground">
+                  {allowClash ? "On: keep user-requested overlaps and mark them clearly." : "Off: only feasible schedules will be committed."}
+                </p>
+              </div>
+              <div className="flex items-center gap-3">
+                <span className="text-xs text-muted-foreground">Allow clash</span>
+                <Switch
+                  checked={allowClash}
+                  onCheckedChange={setAllowClash}
+                  disabled={isProcessing}
+                  aria-label="Allow conflicting schedules"
+                />
+              </div>
             </div>
 
             {/* Dynamic Content Area */}
@@ -593,7 +622,11 @@ export function PlanningInputPage({
             {/* Save Button */}
             <Button
               onClick={() => {
-                const finalSchedule = previewSchedule || { date: isoDateStr, activities: [] };
+                const finalSchedule = {
+                  ...(previewSchedule || { date: isoDateStr, activities: [] }),
+                  allow_clash: allowClash,
+                  planning_mode: allowClash ? "clash_allowed" : "feasibility_first",
+                };
                 onScheduleGenerated(finalSchedule);
               }}
               className="w-full rounded-xl py-6 text-lg font-semibold shadow-lg hover:shadow-xl transition-all"

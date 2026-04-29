@@ -24,6 +24,7 @@ export type Page =
 
 export type ActivityBlock = {
   id: string;
+  stable_activity_id?: string;
   type?: "activity" | "travel" | "buffer" | "transition" | "idle";
   block_type?: "activity" | "transition" | "buffer" | "idle";
   title: string;
@@ -41,10 +42,12 @@ export type ActivityBlock = {
   trace?: string[];
   source?: string;
   isConflict?: boolean;
+  is_conflicting?: boolean;
+  conflict_ids?: string[];
   conflictWith?: string[];
   conflictReason?: string;
-  conflictPriority?: "low" | "medium" | "high";
-  conflictSeverity?: "low" | "medium" | "high";
+  conflictPriority?: "low" | "medium" | "high" | "critical" | string;
+  conflictSeverity?: "low" | "medium" | "high" | "critical" | string;
 };
 
 export type DailySchedule = {
@@ -52,9 +55,28 @@ export type DailySchedule = {
   date: string;
   version: number;
   schema_version?: number;
+  status?: "ok" | "partial" | "conflict" | "infeasible" | string;
+  planning_mode?: "feasibility_first" | "clash_allowed" | string;
+  allow_clash?: boolean;
   activities: ActivityBlock[];
   schedule_blocks?: ActivityBlock[];
   explanations?: string[];
+  conflicts?: Array<{
+    conflict_id: string;
+    type: string;
+    activities: string[];
+    activity_ids: string[];
+    start: string;
+    end: string;
+    severity: "low" | "medium" | "high" | "critical" | string;
+    priority_label: string;
+    user_forced: boolean;
+    explanation: string;
+    suggested_resolution?: string[];
+  }>;
+  conflict?: Record<string, unknown> | null;
+  unmet_items?: Array<Record<string, unknown>>;
+  validation_issues?: string[];
   unscheduled_activities?: Array<{
     title: string;
     reason: string;

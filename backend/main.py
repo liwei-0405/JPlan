@@ -34,23 +34,46 @@ app.add_middleware(
 
 class ScheduleItem(BaseModel):
     id: Optional[str] = None
+    stable_activity_id: Optional[str] = None
     type: Optional[str] = "activity"
+    entity_type: Optional[str] = None
+    activity_type: Optional[str] = None
     block_type: Optional[str] = None # V3 support
     title: str
+    normalized_title: Optional[str] = None
     startTime: Optional[str] = None  # Frontend compat
     endTime: Optional[str] = None    # Frontend compat
     start: Optional[str] = None      # Backend V3 compat
     end: Optional[str] = None        # Backend V3 compat
     location: Optional[str] = None
+    location_normalized: Optional[str] = None
     duration: Optional[str] = None
     duration_minutes: Optional[int] = None
     priority: Optional[str] = "medium"
     isMandatory: Optional[bool] = True
+    timing_mode: Optional[str] = None
+    fixed_start: Optional[int] = None
+    fixed_end: Optional[int] = None
+    earliest_start: Optional[int] = None
+    latest_end: Optional[int] = None
+    preferred_start: Optional[int] = None
+    anchor_relation: Optional[Dict[str, Any]] = None
+    sequence_index: Optional[int] = None
+    status: Optional[str] = "active"
+    source_turn: Optional[int] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    scheduled_start: Optional[int] = None
+    scheduled_end: Optional[int] = None
+    prep_buffer: Optional[int] = None
+    aliases: Optional[List[str]] = []
     notes: Optional[str] = None
     explanation: Optional[str] = None
     trace: Optional[List[str]] = []
     source: Optional[str] = None
     isConflict: Optional[bool] = False
+    is_conflicting: Optional[bool] = False
+    conflict_ids: Optional[List[str]] = []
     conflictWith: Optional[List[str]] = []
     conflictReason: Optional[str] = None
     conflictPriority: Optional[str] = None
@@ -66,11 +89,19 @@ class ScheduleEnvelope(BaseModel):
     scheduleId: Optional[str] = None
     date: str
     version: Optional[int] = 1
-    schema_version: Optional[int] = 3
+    schema_version: Optional[int] = 4
+    status: Optional[str] = "ok"
+    planning_mode: Optional[str] = "feasibility_first"
+    allow_clash: Optional[bool] = False
+    preferences: Optional[Dict[str, Any]] = {}
     activities: List[ScheduleItem]
     schedule_blocks: Optional[List[ScheduleItem]] = [] # Explicit timeline
     explanations: List[str] = []
     unscheduled_activities: List[UnscheduledActivity] = []
+    conflict: Optional[Dict[str, Any]] = None
+    conflicts: Optional[List[Dict[str, Any]]] = []
+    unmet_items: Optional[List[Dict[str, Any]]] = []
+    validation_issues: Optional[List[str]] = []
 
 class SchedulePatchOperation(BaseModel):
     op: str # add, update, remove, move, replace, update_priority
@@ -103,6 +134,7 @@ class ChatRequest(BaseModel):
     history: list[dict] = [] 
     current_schedule: Optional[ScheduleEnvelope] = None
     user_id: str | None = None
+    allow_clash: bool = False
 
 class ChatResponse(BaseModel):
     reply: str
@@ -114,11 +146,19 @@ class ChatResponse(BaseModel):
 class PlanRequest(BaseModel):
     date: str
     activities: List[ScheduleItem]
+    schedule_blocks: Optional[List[ScheduleItem]] = []
     explanations: List[str] = []
     unscheduled_activities: List[UnscheduledActivity] = []
     user_id: str
     version: int = 1
     scheduleId: Optional[str] = None
+    status: Optional[str] = "ok"
+    conflict: Optional[Dict[str, Any]] = None
+    planning_mode: Optional[str] = "feasibility_first"
+    allow_clash: bool = False
+    conflicts: Optional[List[Dict[str, Any]]] = []
+    unmet_items: Optional[List[Dict[str, Any]]] = []
+    validation_issues: Optional[List[str]] = []
 
 class ExportRequest(BaseModel):
     user_id: str
@@ -154,6 +194,12 @@ def summarize_envelope(envelope: ScheduleEnvelope | dict | None) -> dict:
         "unscheduled_count": len(unscheduled),
     }
 
+def extract_shift_target_date(operations: List[Dict[str, Any]]) -> Optional[str]:
+    for operation in operations or []:
+        if str(operation.get("op") or "").strip().lower() == "shift_plan_date":
+            return operation.get("to_date")
+    return None
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat_with_llm(request: ChatRequest):
     debug_log(f"Received chat | user={request.user_id} | message={request.message!r}")
@@ -161,6 +207,10 @@ async def chat_with_llm(request: ChatRequest):
     try:
         # Full envelope for internal processing
         current_envelope = request.current_schedule.model_dump() if request.current_schedule else None
+        if current_envelope is not None:
+            current_envelope["allow_clash"] = bool(request.allow_clash)
+            current_envelope.setdefault("preferences", {})
+            current_envelope["preferences"]["allow_clash"] = bool(request.allow_clash)
 
         # Optimization: Create a lightweight context for the LLM
         lightweight_schedule = None
@@ -177,7 +227,8 @@ async def chat_with_llm(request: ChatRequest):
             lightweight_schedule = {
                 "date": request.current_schedule.date,
                 "activities": clean_activities,
-                "version": request.current_schedule.version
+                "version": request.current_schedule.version,
+                "allow_clash": bool(request.allow_clash),
             }
 
         # Fetch saved locations for the user to provide context to LLM
@@ -189,6 +240,8 @@ async def chat_with_llm(request: ChatRequest):
             current_schedule=lightweight_schedule,
             saved_locations=saved_locations
         )
+        parsed.setdefault("preferences", {})
+        parsed["preferences"]["allow_clash"] = bool(request.allow_clash)
         
         intent = parsed.get("intent", "chat")
         reply = parsed.get("reply", "I've processed your request.")
@@ -202,12 +255,18 @@ async def chat_with_llm(request: ChatRequest):
                 if not ops and parsed.get("activities"):
                     for act in parsed.get("activities"):
                         ops.append({**act, "op": "add"})
+
+                target_date_envelope = None
+                shift_target_date = extract_shift_target_date(ops)
+                if request.user_id and shift_target_date and shift_target_date != request.current_schedule.date:
+                    target_date_envelope = database.get_plan_by_date(shift_target_date, request.user_id)
                 
                 patch_result = scheduling_engine.apply_operations(
                     envelope=current_envelope,
                     operations=ops,
                     base_version=request.current_schedule.version,
-                    new_date=parsed.get("date")
+                    new_date=parsed.get("date"),
+                    target_date_envelope=target_date_envelope,
                 )
                 
                 final_reply = reply
@@ -216,14 +275,14 @@ async def chat_with_llm(request: ChatRequest):
 
                 return ChatResponse(
                     reply=final_reply,
-                    patch=SchedulePatchResponse(
-                        scheduleId=patch_result["envelope"].get("scheduleId") or "temp-id",
-                        version=patch_result["version"],
-                        applied=True,
-                        updatedActivities=patch_result["updatedActivities"],
-                        deletedItemIds=patch_result["deletedItemIds"],
-                        explanation=final_reply
-                    ),
+                patch=SchedulePatchResponse(
+                    scheduleId=patch_result["envelope"].get("scheduleId") or "temp-id",
+                    version=patch_result["version"],
+                    applied=bool(patch_result.get("applied", True)),
+                    updatedActivities=patch_result["updatedActivities"],
+                    deletedItemIds=patch_result["deletedItemIds"],
+                    explanation=final_reply
+                ),
                     schedule_data=patch_result["envelope"],
                     transcription=parsed.get("transcription")
                 )
@@ -269,27 +328,41 @@ async def apply_operations_endpoint(scheduleId: str, request: SchedulePatchReque
             raise HTTPException(status_code=404, detail="Schedule not found")
         
         ops = [op.model_dump() for op in request.operations]
+        target_date_envelope = None
+        shift_target_date = extract_shift_target_date(ops)
+        if shift_target_date and shift_target_date != current_plan.get("date"):
+            target_date_envelope = database.get_plan_by_date(shift_target_date, request.user_id)
         result = scheduling_engine.apply_operations(
             envelope=current_plan,
             operations=ops,
-            base_version=request.baseVersion
+            base_version=request.baseVersion,
+            target_date_envelope=target_date_envelope,
         )
         
         updated_envelope = result["envelope"]
         database.save_plan(
             date=updated_envelope["date"],
             activities=updated_envelope["activities"],
+            schedule_blocks=updated_envelope.get("schedule_blocks"),
             user_id=request.user_id,
             explanations=updated_envelope["explanations"],
             unscheduled_activities=updated_envelope["unscheduled_activities"],
             version=updated_envelope["version"],
-            schedule_id=updated_envelope["scheduleId"]
+            schedule_id=updated_envelope["scheduleId"],
+            preferences=updated_envelope.get("preferences"),
+            status=updated_envelope.get("status", "ok"),
+            conflict=updated_envelope.get("conflict"),
+            planning_mode=updated_envelope.get("planning_mode", "feasibility_first"),
+            allow_clash=bool(updated_envelope.get("allow_clash", False)),
+            conflicts=updated_envelope.get("conflicts"),
+            unmet_items=updated_envelope.get("unmet_items"),
+            validation_issues=updated_envelope.get("validation_issues"),
         )
         
         return SchedulePatchResponse(
             scheduleId=scheduleId,
             version=updated_envelope["version"],
-            applied=True,
+            applied=bool(result.get("applied", True)),
             updatedActivities=result["updatedActivities"],
             deletedItemIds=result["deletedItemIds"]
         )
@@ -342,11 +415,23 @@ async def save_plan_endpoint(plan: PlanRequest):
         saved_plan = database.save_plan(
             date=plan.date,
             activities=[act.model_dump() for act in plan.activities],
+            schedule_blocks=[act.model_dump() for act in (plan.schedule_blocks or [])],
             user_id=plan.user_id,
             explanations=plan.explanations,
             unscheduled_activities=[act.model_dump() for act in plan.unscheduled_activities],
             version=plan.version,
-            schedule_id=plan.scheduleId
+            schedule_id=plan.scheduleId,
+            preferences={
+                "allow_clash": bool(plan.allow_clash),
+                "planning_mode": plan.planning_mode,
+            },
+            status=plan.status or "ok",
+            conflict=plan.conflict,
+            planning_mode=plan.planning_mode,
+            allow_clash=bool(plan.allow_clash),
+            conflicts=plan.conflicts,
+            unmet_items=plan.unmet_items,
+            validation_issues=plan.validation_issues,
         )
         return ScheduleEnvelope(**saved_plan)
     except Exception as e:

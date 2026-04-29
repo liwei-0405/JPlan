@@ -39,7 +39,8 @@ export async function chatWithLLM(
     message: string, 
     userId: string | undefined, 
     currentSchedule: DailySchedule | null,
-    history: any[] = []
+    history: any[] = [],
+    allowClash: boolean = false,
 ): Promise<ChatResponse> {
     try {
         const response = await fetch(`${API_BASE_URL}/chat`, {
@@ -49,7 +50,8 @@ export async function chatWithLLM(
                 message,
                 user_id: userId,
                 current_schedule: currentSchedule,
-                history
+                history,
+                allow_clash: allowClash,
             }),
         });
 
@@ -112,9 +114,17 @@ export async function savePlan(schedule: DailySchedule, userId: string): Promise
                 date: schedule.date,
                 version: schedule.version,
                 activities: schedule.activities,
+                schedule_blocks: schedule.schedule_blocks || [],
                 explanations: schedule.explanations || [],
                 unscheduled_activities: schedule.unscheduled_activities || [],
-                user_id: userId
+                user_id: userId,
+                status: schedule.status || "ok",
+                planning_mode: schedule.planning_mode || "feasibility_first",
+                allow_clash: Boolean(schedule.allow_clash),
+                conflicts: schedule.conflicts || [],
+                conflict: schedule.conflict || null,
+                unmet_items: schedule.unmet_items || [],
+                validation_issues: schedule.validation_issues || [],
             }),
         });
 

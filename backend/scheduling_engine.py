@@ -3,6 +3,7 @@ import re
 from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 # Constants for the Rich Scheduling Model
@@ -32,13 +33,25 @@ PRIORITY_WEIGHT = {
     "high": 3,
 }
 
+PLANNING_MODE_FEASIBILITY = "feasibility_first"
+PLANNING_MODE_CLASH = "clash_allowed"
+
+CONFLICT_SEVERITY_RULES = {
+    "fixed-vs-fixed": "critical",
+    "fixed-vs-mandatory": "high",
+    "fixed-vs-optional": "medium",
+    "optional-vs-optional": "low",
+    "travel-risk": "medium",
+    "user-forced": "high",
+}
+
 PARSER_PROMPT = """
 You are the parsing layer for JPlan. Convert user requests into structured operations.
 Return ONLY ONE JSON object with: intent, reply, transcription, date, operations, conflict_analysis.
 
 OPERATIONS SCHEMA:
 { 
-  "op": "add|remove|move|update|replace", 
+  "op": "add|remove|move|update|replace|shift_plan_date", 
   "title": "str", 
   "timing_mode": "fixed|relative|flexible",
   "fixed_start": "HH:MM (only if user said exact time)",
@@ -98,6 +111,7 @@ STRICT RULES:
 3. Use 24H format for all times.
 4. DURATIONS: Use reasonable defaults if not mentioned (e.g. Lunch = 60).
 5. If intent is "chat", leave operations empty.
+6. If the user wants to move the whole plan to another date, use op="shift_plan_date" with from_date, to_date, and scope="all_active_activities".
 """
 
 
@@ -294,26 +308,80 @@ class SchedulingEngine:
         current_schedule: Optional[Dict[str, Any]],
         latest_request: str,
     ) -> Dict[str, Any]:
-        """[PART 7] Final API Response construction."""
-        # This replaces the old logic
-        date = parsed.get("date") or self._local_today_iso()
-        all_activities = self._get_base_activities(current_schedule)
-        
-        # After any optimization or construction, we materialize the blocks
-        blocks = self._materialize_blocks(all_activities, DEFAULT_DAY_START, 0)
-        
-        return {
-            "date": date,
-            "status": "ok", # Future: partial/infeasible
-            "reply": parsed.get("reply"),
-            "transcription": parsed.get("transcription"),
-            "intent": parsed.get("intent"),
-            "activities": all_activities,
-            "schedule_blocks": blocks,
+        reply = self._resolve_user_reply(parsed, latest_request)
+        transcription = parsed.get("transcription") or latest_request
+        intent = parsed.get("intent", "schedule")
+
+        if intent == "chat" and not parsed.get("operations") and not parsed.get("activities"):
+            return {
+                "reply": reply,
+                "transcription": transcription,
+                "schedule_data": None,
+            }
+
+        schedule_date = self._resolve_schedule_date(parsed, current_schedule, latest_request)
+        base_version = int((current_schedule or {}).get("version") or 0)
+        source_turn = base_version + 1
+        preferences = deepcopy(parsed.get("preferences") or (current_schedule or {}).get("preferences") or {})
+        allow_clash = self._resolve_allow_clash(preferences, current_schedule)
+        planning_mode = self._planning_mode(allow_clash)
+        preferences["allow_clash"] = allow_clash
+        preferences["planning_mode"] = planning_mode
+
+        canonical_activities = self._load_canonical_activities(current_schedule)
+        existing_active = [item for item in canonical_activities if item.get("status") == "active"]
+        requested_operations = list(parsed.get("operations") or [])
+        if not requested_operations:
+            requested_operations = [{**activity, "op": "add"} for activity in (parsed.get("activities") or [])]
+
+        for raw_op in requested_operations:
+            operation = self._normalize_operation(raw_op)
+            if operation["op"] != "add":
+                continue
+            anchor = operation.get("anchor_relation")
+            if anchor:
+                resolved_anchor = self._resolve_anchor_relation(anchor, existing_active + canonical_activities)
+                if resolved_anchor:
+                    operation["anchor_relation"] = resolved_anchor
+                    if not operation.get("location"):
+                        anchor_activity = self._find_activity_by_stable_id(existing_active + canonical_activities, resolved_anchor.get("target_activity_id"))
+                        if anchor_activity and not operation.get("location"):
+                            operation["location"] = anchor_activity.get("location")
+            canonical_activities.append(
+                self._canonicalize_activity(
+                    operation,
+                    source_turn=source_turn,
+                    default_source="initial_request",
+                )
+            )
+
+        active_set = [item for item in canonical_activities if item.get("status") == "active"]
+        planned_result = self._plan_schedule(schedule_date, active_set, preferences)
+        conflicts = self._build_conflicts(planned_result["activities"], set())
+        status = "partial" if conflicts else "ok"
+
+        schedule_data = {
+            "schema_version": 4,
+            "scheduleId": (current_schedule or {}).get("scheduleId"),
+            "date": schedule_date,
+            "status": status,
+            "planning_mode": planning_mode,
+            "allow_clash": allow_clash,
+            "version": max(1, source_turn),
+            "preferences": preferences,
+            "activities": [self._format_activity(item) for item in planned_result["activities"]],
+            "schedule_blocks": planned_result["schedule_blocks"],
+            "unscheduled_activities": [self._format_activity(item) for item in planned_result.get("unscheduled_activities", [])],
+            "explanations": self._merge_explanations(parsed.get("explanations", []), planned_result.get("explanations", [])),
+            "conflicts": conflicts,
             "unmet_items": [],
             "validation_issues": [],
-            "explanations": parsed.get("explanations", []),
-            "version": (current_schedule.get("version", 1) if current_schedule else 1) + 1
+        }
+
+        return {
+            "reply": reply,
+            "transcription": transcription,
+            "schedule_data": schedule_data,
         }
 
     def resolve_target_date(
@@ -498,6 +566,7 @@ class SchedulingEngine:
         parsed.setdefault("preferences", {})
         parsed["_reply_source"] = "llm"
         parsed["_llm_reply"] = raw_llm_reply
+        parsed = self._normalize_plan_level_operations(parsed, latest_request, current_schedule)
         self._debug_json("LLM parsed request", parsed)
         self._debug(
             f"Parsed request | intent={parsed.get('intent')} | parsed_date={parsed.get('date')} | activities={len(parsed.get('activities', []))} | operations={len(parsed.get('operations', []))}"
@@ -576,6 +645,73 @@ class SchedulingEngine:
             "_failure_message": failure_message,
             "_raw_response_text": raw_response_text,
         }
+
+    def _request_implies_whole_plan_shift(
+        self,
+        latest_request: str,
+        current_schedule: Optional[Dict[str, Any]],
+        parsed: Dict[str, Any],
+    ) -> bool:
+        if not current_schedule or not parsed.get("date"):
+            return False
+
+        request_text = clean_title(latest_request)
+        current_date = (current_schedule or {}).get("date")
+        parsed_date = parsed.get("date")
+        if not current_date or not parsed_date or parsed_date == current_date:
+            return False
+
+        whole_plan_patterns = [
+            r"\bmove (this|the|these)? ?(plan|schedule|day)\b",
+            r"\bshift (this|the|whole|entire)? ?(plan|schedule|day)\b",
+            r"\bmove everything\b",
+            r"\bmove all\b",
+            r"\bwhole plan\b",
+            r"\bentire plan\b",
+            r"\bwrong date\b",
+            r"\bi said wrong about the date\b",
+            r"\bnot .* make it\b",
+        ]
+
+        if any(re.search(pattern, request_text) for pattern in whole_plan_patterns):
+            return True
+
+        for operation in parsed.get("operations") or []:
+            op = clean_title(operation.get("op") or "")
+            title = clean_title(operation.get("title") or operation.get("target_title") or "")
+            if op == "shift_plan_date":
+                return True
+            if op == "move" and title in {"all activities", "whole plan", "entire plan", "whole schedule"}:
+                return True
+
+        return False
+
+    def _normalize_plan_level_operations(
+        self,
+        parsed: Dict[str, Any],
+        latest_request: str,
+        current_schedule: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        normalized = deepcopy(parsed)
+        if not self._request_implies_whole_plan_shift(latest_request, current_schedule, normalized):
+            return normalized
+
+        from_date = (current_schedule or {}).get("date")
+        to_date = normalized.get("date")
+        if not from_date or not to_date:
+            return normalized
+
+        normalized["intent"] = "edit"
+        normalized["activities"] = []
+        normalized["operations"] = [{
+            "op": "shift_plan_date",
+            "from_date": from_date,
+            "to_date": to_date,
+            "scope": "all_active_activities",
+            "notes": f"Shift the whole active plan from {from_date} to {to_date}.",
+        }]
+        self._debug(f"[STATE] Normalized whole-plan shift request from {from_date} to {to_date}")
+        return normalized
 
     def _materialize_blocks(
         self, 
@@ -665,6 +801,7 @@ class SchedulingEngine:
             blocks.append({
                 "block_type": "activity",
                 "id": act.get("id"),
+                "stable_activity_id": act.get("stable_activity_id") or act.get("id"),
                 "title": act["title"],
                 "start": format_clock(start_min),
                 "end": format_clock(end_min),
@@ -674,6 +811,8 @@ class SchedulingEngine:
                 "location": current_loc,
                 "notes": act.get("notes"),
                 "is_conflict": act.get("is_conflict", False),
+                "is_conflicting": act.get("is_conflict", False),
+                "conflict_ids": list(act.get("conflict_ids") or []),
                 "reason": "Scheduled activity"
             })
             
@@ -887,6 +1026,8 @@ class SchedulingEngine:
             if not isinstance(operation, dict):
                 continue
             op = clean_title(operation.get("op") or "")
+            if op == "shift_plan_date":
+                continue
             target = self._find_existing_schedule_activity(
                 current_schedule,
                 operation.get("target_id"),
@@ -1167,7 +1308,9 @@ class SchedulingEngine:
             mode = item.get("timing_mode") or item.get("timingMode") or TimingMode.UNSPECIFIED
             
             if mode == TimingMode.FIXED:
-                fs = item.get("fixed_start") or item.get("fixedStart")
+                fs = item.get("fixed_start")
+                if fs is None:
+                    fs = item.get("fixedStart")
                 if fs is not None:
                     dur = int(item.get("duration_minutes") or item.get("durationMinutes") or 60)
                     item["scheduled_start"] = fs
@@ -1209,41 +1352,64 @@ class SchedulingEngine:
         
         for item in relative:
             anchor = item.get("anchor_relation")
-            if not anchor or anchor.get("kind") != "after":
+            if not anchor:
                 flexible.append(item)
                 continue
-            
+
+            target_id = anchor.get("target_activity_id")
             target_title = anchor.get("target_title")
-            anchor_item = next((a for a in timeline if clean_title(a["title"]) == clean_title(target_title)), None)
-            
+            anchor_item = next(
+                (
+                    activity for activity in timeline
+                    if (
+                        target_id and activity.get("stable_activity_id") == target_id
+                    ) or (
+                        target_title and clean_title(activity["title"]) == clean_title(target_title)
+                    )
+                ),
+                None,
+            )
+
             if not anchor_item:
                 flexible.append(item)
                 continue
-            
-            # [PART C] Implicit Windowing: find the next scheduled activity to bound search
-            search_start = anchor_item["scheduled_end"]
-            search_end = day_end
-            
-            # Find the nearest activity in the future to constrain the window
-            successors = [a for a in timeline if a["scheduled_start"] >= search_start]
-            if successors:
-                search_end = min(a["scheduled_start"] for a in successors)
-            
-            print(f"[JPLAN][MODULE_C] [PLACING_RELATIVE] '{item['title']}' after '{target_title}' (Search: {format_clock(search_start)} -> {format_clock(search_end)})")
-            
-            inserted, reason = self._insert_best_position(
-                item, timeline, search_start, search_end, min_travel,
-                prefer_earliest=True # PART B: Penalty for delay
-            )
+
+            relation_kind = clean_title(anchor.get("kind") or "after")
+            if relation_kind == "before":
+                search_end = anchor_item["scheduled_start"]
+                predecessors = [a for a in timeline if a["scheduled_end"] <= search_end and a.get("id") != anchor_item.get("id")]
+                search_start = max([day_start] + [a["scheduled_end"] for a in predecessors])
+                print(f"[JPLAN][MODULE_C] [PLACING_RELATIVE] '{item['title']}' before '{target_title}' (Search: {format_clock(search_start)} -> {format_clock(search_end)})")
+                inserted, reason = self._insert_best_position(
+                    item, timeline, search_start, search_end, min_travel,
+                    prefer_latest=True
+                )
+            else:
+                search_start = anchor_item["scheduled_end"]
+                search_end = day_end
+
+                successors = [a for a in timeline if a["scheduled_start"] >= search_start]
+                if successors:
+                    search_end = min(a["scheduled_start"] for a in successors)
+
+                print(f"[JPLAN][MODULE_C] [PLACING_RELATIVE] '{item['title']}' after '{target_title}' (Search: {format_clock(search_start)} -> {format_clock(search_end)})")
+                inserted, reason = self._insert_best_position(
+                    item, timeline, search_start, search_end, min_travel,
+                    prefer_earliest=True
+                )
             
             if inserted:
                 timeline = inserted
                 item["trace"].append(f"Placed near anchor '{target_title}' to respect sequence.")
             else:
-                # If it doesn't fit in the window, it's a conflict
                 print(f"[JPLAN][MODULE_C] [REJECT_REL] '{item['title']}' - No feasible slot in narrative window.")
-                timeline.append(self._create_conflict_item(item, timeline, reason or "No space in narrative window."))
-                timeline.sort(key=lambda x: x["scheduled_start"])
+                conflict_timeline = self._insert_as_conflict(
+                    item,
+                    timeline,
+                    search_start if relation_kind == "before" else search_start,
+                    reason or "No space in narrative window.",
+                )
+                timeline = conflict_timeline or timeline
 
         # 3. Place FLEXIBLE items
         flexible.sort(key=self._calculate_activity_base_score, reverse=True)
@@ -1254,8 +1420,8 @@ class SchedulingEngine:
                 timeline = inserted
             else:
                 if item.get("is_mandatory"):
-                    timeline.append(self._create_conflict_item(item, timeline, reason))
-                    timeline.sort(key=lambda x: x["scheduled_start"])
+                    conflict_timeline = self._insert_as_conflict(item, timeline, day_start, reason)
+                    timeline = conflict_timeline or timeline
                 else:
                     unscheduled.append(item)
         
@@ -1401,18 +1567,8 @@ class SchedulingEngine:
             return False, f"Outside day boundary ({format_clock(day_start)}-{format_clock(day_end)})"
 
         for existing in timeline:
-            # We need to know if there's a transition required
-            transition_after = self._transition_minutes(existing, item, min_travel)
-            transition_before = self._transition_minutes(item, existing, min_travel)
-            
-            # THE FIX: We use strict inequality for the actual content overlap, 
-            # but we MUST respect the transition buffer.
-            # If transition is 0, then 'end <= existing_start' is perfectly fine.
-            if not (
-                end + transition_before <= existing["scheduled_start"]
-                or start >= existing["scheduled_end"] + transition_after
-            ):
-                return False, f"Clashes with '{existing['title']}' (requires {transition_after if start >= existing['scheduled_end'] else transition_before}m buffer)"
+            if start < existing["scheduled_end"] and end > existing["scheduled_start"]:
+                return False, f"Clashes with '{existing['title']}'"
         
         return True, ""
 
@@ -1436,7 +1592,8 @@ class SchedulingEngine:
         day_start: int,
         day_end: int,
         min_travel: Optional[int],
-        prefer_earliest: bool = False
+        prefer_earliest: bool = False,
+        prefer_latest: bool = False,
     ) -> Tuple[Optional[List[Dict[str, Any]]], str]:
         """Finds the optimal time slot for an activity within a range, applying narrative-aware scoring."""
         best_timeline = None
@@ -1477,6 +1634,8 @@ class SchedulingEngine:
                 delay_penalty = delay_minutes * 2.0 # Strong penalty for delay
             
             total_score = base_score - delay_penalty
+            if prefer_latest:
+                total_score += candidate_start
             
             if total_score > best_score:
                 best_score = total_score
@@ -1635,146 +1794,844 @@ class SchedulingEngine:
             "trace": trace + [f"Mode={timing_mode}, Seq={op.get('sequence_index')}"]
         }
 
+    def _now_iso(self) -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    def _new_stable_activity_id(self) -> str:
+        return f"act-{uuid4().hex[:12]}"
+
+    def _is_activity_entry(self, item: Any) -> bool:
+        if not isinstance(item, dict):
+            return False
+        if item.get("block_type"):
+            return False
+        item_type = str(item.get("type") or "").strip().lower()
+        return item_type not in {"buffer", "travel", "transition", "idle"}
+
+    def _coerce_minutes(self, *values: Any) -> Optional[int]:
+        for value in values:
+            if value is None or value == "":
+                continue
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, (int, float)):
+                return int(value)
+            parsed = parse_clock(value)
+            if parsed is not None:
+                return parsed
+            text = str(value).strip()
+            if text.isdigit():
+                return int(text)
+        return None
+
+    def _infer_timing_mode(
+        self,
+        raw: Dict[str, Any],
+        fixed_start: Optional[int],
+        fixed_end: Optional[int],
+        earliest_start: Optional[int],
+        latest_end: Optional[int],
+        preferred_start: Optional[int],
+        anchor_relation: Optional[Dict[str, Any]],
+    ) -> str:
+        mode = clean_title(raw.get("timing_mode") or raw.get("timingMode") or "")
+        if mode == "flexible":
+            mode = TimingMode.UNSPECIFIED
+        if mode in {
+            TimingMode.FIXED,
+            TimingMode.RELATIVE,
+            TimingMode.PREFERRED,
+            TimingMode.WINDOW,
+            TimingMode.UNSPECIFIED,
+        }:
+            return mode
+        if fixed_start is not None or fixed_end is not None:
+            return TimingMode.FIXED
+        if anchor_relation:
+            return TimingMode.RELATIVE
+        if preferred_start is not None:
+            return TimingMode.PREFERRED
+        if earliest_start is not None or latest_end is not None:
+            return TimingMode.WINDOW
+        return TimingMode.UNSPECIFIED
+
+    def _generate_aliases(self, title: str) -> List[str]:
+        normalized = clean_title(title)
+        if not normalized:
+            return []
+        aliases = {normalized}
+        tokens = [token for token in re.split(r"[^a-z0-9]+", normalized) if token]
+        stop_words = {"the", "my", "a", "an", "quick"}
+        filtered = [token for token in tokens if token not in stop_words]
+        if filtered:
+            aliases.add(" ".join(filtered))
+            for token in filtered:
+                aliases.add(token)
+            if len(filtered) >= 2:
+                aliases.add(" ".join(filtered[-2:]))
+        return sorted(alias for alias in aliases if alias)
+
+    def _canonicalize_activity(
+        self,
+        raw: Dict[str, Any],
+        source_turn: Optional[int] = None,
+        default_source: str = "planner",
+    ) -> Dict[str, Any]:
+        now_iso = self._now_iso()
+        title = str(raw.get("title") or raw.get("target_title") or "Untitled Activity").strip() or "Untitled Activity"
+        stable_activity_id = (
+            raw.get("stable_activity_id")
+            or raw.get("stableActivityId")
+            or raw.get("canonical_id")
+            or raw.get("id")
+            or self._new_stable_activity_id()
+        )
+        normalized_title = raw.get("normalized_title") or clean_title(title)
+        duration_minutes = parse_duration_minutes(
+            raw.get("duration_minutes")
+            or raw.get("durationMinutes")
+            or raw.get("duration")
+        )
+        fixed_start = self._coerce_minutes(
+            raw.get("fixed_start"),
+            raw.get("fixedStart"),
+            raw.get("scheduled_start"),
+            raw.get("startTime"),
+        )
+        fixed_end = self._coerce_minutes(
+            raw.get("fixed_end"),
+            raw.get("fixedEnd"),
+            raw.get("scheduled_end"),
+            raw.get("endTime"),
+        )
+        if fixed_start is not None and fixed_end is None:
+            fixed_end = fixed_start + duration_minutes
+        if fixed_end is not None and fixed_start is None:
+            fixed_start = fixed_end - duration_minutes
+        if fixed_start is not None and fixed_end is not None and fixed_end <= fixed_start:
+            fixed_end += 24 * 60
+
+        earliest_start = self._coerce_minutes(raw.get("earliest_start"), raw.get("earliestStart"))
+        latest_end = self._coerce_minutes(raw.get("latest_end"), raw.get("latestEnd"))
+        preferred_start = self._coerce_minutes(raw.get("preferred_start"), raw.get("preferredStart"))
+        anchor_relation = deepcopy(raw.get("anchor_relation"))
+
+        timing_mode = self._infer_timing_mode(
+            raw,
+            fixed_start,
+            fixed_end,
+            earliest_start,
+            latest_end,
+            preferred_start,
+            anchor_relation,
+        )
+
+        if timing_mode == TimingMode.FIXED and fixed_start is not None:
+            earliest_start = fixed_start
+            latest_end = fixed_end
+
+        scheduled_start = self._coerce_minutes(raw.get("scheduled_start"), raw.get("startTime"))
+        scheduled_end = self._coerce_minutes(raw.get("scheduled_end"), raw.get("endTime"))
+        if scheduled_start is None and timing_mode == TimingMode.FIXED:
+            scheduled_start = fixed_start
+        if scheduled_end is None and timing_mode == TimingMode.FIXED and fixed_end is not None:
+            scheduled_end = fixed_end
+        if scheduled_start is not None and scheduled_end is None:
+            scheduled_end = scheduled_start + duration_minutes
+
+        location = raw.get("location")
+        if location is not None:
+            location = str(location).strip() or None
+        location_normalized = raw.get("location_normalized") or _normalize_location(location)
+
+        is_mandatory = bool(
+            raw.get("is_mandatory")
+            if raw.get("is_mandatory") is not None
+            else raw.get("isMandatory", True)
+        )
+
+        trace = list(raw.get("trace") or [])
+        if raw.get("notes") and raw.get("notes") not in trace:
+            trace.append(raw.get("notes"))
+
+        return {
+            "id": stable_activity_id,
+            "stable_activity_id": stable_activity_id,
+            "entity_type": "activity",
+            "type": raw.get("type") or "activity",
+            "activity_type": raw.get("activity_type") or ("mandatory" if is_mandatory else "optional"),
+            "title": title,
+            "normalized_title": normalized_title,
+            "aliases": list(raw.get("aliases") or self._generate_aliases(title)),
+            "timing_mode": timing_mode,
+            "fixed_start": fixed_start,
+            "fixed_end": fixed_end,
+            "earliest_start": earliest_start,
+            "latest_end": latest_end,
+            "preferred_start": preferred_start,
+            "anchor_relation": anchor_relation,
+            "sequence_index": raw.get("sequence_index"),
+            "duration_minutes": duration_minutes,
+            "priority": str(raw.get("priority") or "medium").lower(),
+            "location": location,
+            "location_normalized": location_normalized,
+            "status": raw.get("status") or "active",
+            "source_turn": raw.get("source_turn") if raw.get("source_turn") is not None else (source_turn or 0),
+            "created_at": raw.get("created_at") or now_iso,
+            "updated_at": raw.get("updated_at") or now_iso,
+            "notes": raw.get("notes"),
+            "source": raw.get("source") or default_source,
+            "trace": trace,
+            "is_mandatory": is_mandatory,
+            "scheduled_start": scheduled_start,
+            "scheduled_end": scheduled_end,
+            "prep_buffer": raw.get("prep_buffer", DEFAULT_PREP_BUFFER),
+            "is_conflict": bool(raw.get("is_conflict") or raw.get("isConflict", False)),
+            "is_conflicting": bool(raw.get("is_conflict") or raw.get("isConflict", False)),
+            "conflict_ids": list(raw.get("conflict_ids") or []),
+            "conflict_with": list(raw.get("conflict_with") or raw.get("conflictWith") or []),
+            "conflict_reason": raw.get("conflict_reason") or raw.get("conflictReason"),
+            "conflict_priority": raw.get("conflict_priority") or raw.get("conflictPriority"),
+            "conflict_severity": raw.get("conflict_severity") or raw.get("conflictSeverity"),
+        }
+
+    def _load_canonical_activities(self, envelope: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        canonical: List[Dict[str, Any]] = []
+        excluded = 0
+        for raw in list((envelope or {}).get("activities") or (envelope or {}).get("items") or []):
+            if not self._is_activity_entry(raw):
+                excluded += 1
+                continue
+            canonical.append(self._canonicalize_activity(raw))
+
+        active_count = sum(1 for item in canonical if item.get("status") == "active")
+        inactive_count = len(canonical) - active_count
+        self._debug(f"[STATE] Loaded active activities: {active_count}")
+        if inactive_count:
+            self._debug(f"[STATE] Excluded superseded/deleted activities from construction: {inactive_count}")
+        if excluded:
+            self._debug(f"[STATE] Ignored derived schedule blocks during reload: {excluded}")
+        return canonical
+
+    def _resolve_allow_clash(self, preferences: Optional[Dict[str, Any]], envelope: Optional[Dict[str, Any]] = None) -> bool:
+        if preferences and "allow_clash" in preferences:
+            return bool(preferences.get("allow_clash"))
+        if envelope and "allow_clash" in envelope:
+            return bool(envelope.get("allow_clash"))
+        return bool(((envelope or {}).get("preferences") or {}).get("allow_clash", False))
+
+    def _planning_mode(self, allow_clash: bool) -> str:
+        return PLANNING_MODE_CLASH if allow_clash else PLANNING_MODE_FEASIBILITY
+
+    def _conflict_priority_label(
+        self,
+        left: Dict[str, Any],
+        right: Dict[str, Any],
+        user_forced: bool,
+    ) -> str:
+        left_fixed = left.get("timing_mode") == TimingMode.FIXED
+        right_fixed = right.get("timing_mode") == TimingMode.FIXED
+        left_mandatory = bool(left.get("is_mandatory", True))
+        right_mandatory = bool(right.get("is_mandatory", True))
+        if user_forced:
+            return "user-forced"
+        if left_fixed and right_fixed:
+            return "fixed-vs-fixed"
+        if left_fixed or right_fixed:
+            if left_mandatory and right_mandatory:
+                return "fixed-vs-mandatory"
+            return "fixed-vs-optional"
+        if not left_mandatory and not right_mandatory:
+            return "optional-vs-optional"
+        return "fixed-vs-mandatory"
+
+    def _conflict_severity_for_pair(
+        self,
+        left: Dict[str, Any],
+        right: Dict[str, Any],
+        user_forced: bool,
+    ) -> str:
+        label = self._conflict_priority_label(left, right, user_forced)
+        return CONFLICT_SEVERITY_RULES.get(label, "medium")
+
+    def _conflict_suggestions(
+        self,
+        left: Dict[str, Any],
+        right: Dict[str, Any],
+    ) -> List[str]:
+        suggestions: List[str] = []
+        fixed_candidate = right if right.get("timing_mode") == TimingMode.FIXED else left
+        moving_candidate = left if fixed_candidate is right else right
+        next_start = fixed_candidate.get("scheduled_end")
+        if next_start is not None:
+            suggestions.append(f"Move {moving_candidate.get('title')} to {format_clock(next_start + 5)}")
+        existing_fixed = self._coerce_minutes(moving_candidate.get("fixed_start"))
+        if existing_fixed is not None:
+            suggestions.append(f"Keep {moving_candidate.get('title')} at {format_clock(existing_fixed)}")
+        suggestions.append(f"Shift {fixed_candidate.get('title')} if allowed")
+        return suggestions
+
+    def _build_conflicts(
+        self,
+        timeline: List[Dict[str, Any]],
+        user_forced_ids: Optional[set[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        conflicts: List[Dict[str, Any]] = []
+        seen_pairs: set[Tuple[str, str]] = set()
+        forced_ids = user_forced_ids or set()
+
+        for index, left in enumerate(timeline):
+            if not self._is_activity_entry(left):
+                continue
+            left_start = left.get("scheduled_start")
+            left_end = left.get("scheduled_end")
+            if left_start is None or left_end is None:
+                continue
+            for right in timeline[index + 1:]:
+                if not self._is_activity_entry(right):
+                    continue
+                right_start = right.get("scheduled_start")
+                right_end = right.get("scheduled_end")
+                if right_start is None or right_end is None:
+                    continue
+                overlap_start = max(left_start, right_start)
+                overlap_end = min(left_end, right_end)
+                if overlap_start >= overlap_end:
+                    continue
+
+                left_id = left.get("stable_activity_id") or left.get("id")
+                right_id = right.get("stable_activity_id") or right.get("id")
+                pair_key = tuple(sorted([str(left_id), str(right_id)]))
+                if pair_key in seen_pairs:
+                    continue
+                seen_pairs.add(pair_key)
+
+                user_forced = left_id in forced_ids or right_id in forced_ids
+                priority_label = self._conflict_priority_label(left, right, user_forced)
+                severity = self._conflict_severity_for_pair(left, right, user_forced)
+                conflict_id = f"conf-{uuid4().hex[:10]}"
+                explanation = (
+                    f"{left.get('title')} overlaps with {right.get('title')} from "
+                    f"{format_clock(overlap_start)} to {format_clock(overlap_end)}."
+                )
+                conflict = {
+                    "conflict_id": conflict_id,
+                    "type": "time_overlap",
+                    "activities": [left.get("title"), right.get("title")],
+                    "activity_ids": [left_id, right_id],
+                    "start": format_clock(overlap_start),
+                    "end": format_clock(overlap_end),
+                    "severity": severity,
+                    "priority_label": priority_label,
+                    "user_forced": user_forced,
+                    "explanation": explanation,
+                    "suggested_resolution": self._conflict_suggestions(left, right),
+                }
+                conflicts.append(conflict)
+                for activity in (left, right):
+                    activity["is_conflict"] = True
+                    activity["is_conflicting"] = True
+                    activity.setdefault("conflict_ids", [])
+                    if conflict_id not in activity["conflict_ids"]:
+                        activity["conflict_ids"].append(conflict_id)
+        return conflicts
+
+    def _merge_target_date_context(
+        self,
+        shifted_activities: List[Dict[str, Any]],
+        target_date_envelope: Optional[Dict[str, Any]],
+        source_date: Optional[str],
+    ) -> List[Dict[str, Any]]:
+        target_context = self._load_canonical_activities(target_date_envelope)
+        existing_active = [item for item in target_context if item.get("status") == "active"]
+        self._debug(f"[STATE] Loaded active activities for {target_date_envelope.get('date') if target_date_envelope else '(none)'}: {len(existing_active)}")
+
+        incoming_ids = {item.get("stable_activity_id") for item in shifted_activities}
+        merged = list(shifted_activities)
+        for activity in existing_active:
+            if activity.get("stable_activity_id") in incoming_ids:
+                continue
+            merged.append(activity)
+        if source_date:
+            self._debug(f"[STATE] Applying bulk date shift from {source_date} to {target_date_envelope.get('date') if target_date_envelope else source_date}")
+            self._debug(f"[STATE] Shifted {len(shifted_activities)} active activities to target date")
+        return merged
+
+    def _normalize_operation(self, raw: Dict[str, Any]) -> Dict[str, Any]:
+        op = clean_title(raw.get("op") or "add") or "add"
+        normalized = deepcopy(raw)
+        normalized["op"] = op
+        normalized["fixed_start"] = raw.get("fixed_start") or raw.get("startTime")
+        normalized["fixed_end"] = raw.get("fixed_end") or raw.get("endTime")
+        normalized["target_id"] = raw.get("target_id") or raw.get("stable_activity_id") or raw.get("id")
+        normalized["target_title"] = raw.get("target_title") or raw.get("target") or raw.get("title")
+        if raw.get("duration_minutes") is None and raw.get("duration") is not None:
+            normalized["duration_minutes"] = parse_duration_minutes(raw.get("duration"))
+        if normalized.get("anchor_relation") and not normalized.get("timing_mode"):
+            normalized["timing_mode"] = TimingMode.RELATIVE
+        if normalized.get("fixed_start") is not None and not normalized.get("timing_mode"):
+            normalized["timing_mode"] = TimingMode.FIXED
+        return normalized
+
+    def _find_activity_by_stable_id(
+        self,
+        activities: List[Dict[str, Any]],
+        stable_activity_id: Optional[str],
+    ) -> Optional[Dict[str, Any]]:
+        if not stable_activity_id:
+            return None
+        for activity in activities:
+            if activity.get("stable_activity_id") == stable_activity_id:
+                return activity
+        return None
+
+    def _token_overlap_score(self, left: str, right: str) -> int:
+        left_tokens = {token for token in left.split() if token}
+        right_tokens = {token for token in right.split() if token}
+        if not left_tokens or not right_tokens:
+            return 0
+        return len(left_tokens & right_tokens)
+
+    def _resolve_activity_reference(
+        self,
+        reference: Any,
+        activities: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        normalized_reference = clean_title(str(reference or ""))
+        if not normalized_reference:
+            self._debug("[STATE] Target resolution failed because the reference was empty")
+            return {"status": "missing", "reason": "empty_reference"}
+
+        active_activities = [item for item in activities if item.get("status") == "active"]
+        scored: List[Tuple[int, int, int, Dict[str, Any]]] = []
+        for index, activity in enumerate(active_activities):
+            score = 0
+            if str(reference) == activity.get("stable_activity_id") or str(reference) == activity.get("id"):
+                score = 200
+            elif normalized_reference == activity.get("normalized_title"):
+                score = 150
+            elif normalized_reference == clean_title(activity.get("title", "")):
+                score = 145
+            elif normalized_reference in set(activity.get("aliases") or []):
+                score = 130
+            else:
+                overlap = self._token_overlap_score(normalized_reference, activity.get("normalized_title") or "")
+                if overlap:
+                    score = max(score, 90 + overlap * 10)
+                if normalized_reference in (activity.get("normalized_title") or "") or (activity.get("normalized_title") or "") in normalized_reference:
+                    score = max(score, 80)
+
+            if score <= 0:
+                continue
+
+            recency_rank = len(active_activities) - index
+            scheduled_rank = int(activity.get("scheduled_start") or activity.get("fixed_start") or -1)
+            scored.append((score, recency_rank, scheduled_rank, activity))
+
+        if not scored:
+            self._debug(f"[STATE] Target resolution failed for '{reference}'")
+            return {"status": "not_found", "reason": "no_match", "reference": str(reference)}
+
+        scored.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+        best_score, _, _, best_activity = scored[0]
+        tied = [entry for entry in scored if entry[0] == best_score]
+        if len(tied) > 1:
+            titles = sorted({entry[3].get("title") for entry in tied})
+            self._debug(f"[STATE] Target resolution ambiguous for '{reference}': {titles}")
+            return {
+                "status": "ambiguous",
+                "reference": str(reference),
+                "candidates": titles,
+            }
+
+        self._debug(f"[STATE] Resolved target '{reference}' -> activity_id={best_activity.get('stable_activity_id')}")
+        return {"status": "resolved", "activity": best_activity}
+
+    def _resolve_anchor_relation(
+        self,
+        anchor_relation: Optional[Dict[str, Any]],
+        activities: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        if not anchor_relation:
+            return None
+        target_reference = (
+            anchor_relation.get("target_activity_id")
+            or anchor_relation.get("target_id")
+            or anchor_relation.get("target_title")
+        )
+        if not target_reference:
+            return deepcopy(anchor_relation)
+        resolved = self._resolve_activity_reference(target_reference, activities)
+        if resolved.get("status") != "resolved":
+            return deepcopy(anchor_relation)
+        target = resolved["activity"]
+        return {
+            "kind": anchor_relation.get("kind"),
+            "target_activity_id": target.get("stable_activity_id"),
+            "target_title": target.get("title"),
+        }
+
+    def _mutate_existing_activity(
+        self,
+        existing: Dict[str, Any],
+        operation: Dict[str, Any],
+        source_turn: int,
+        anchor_pool: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        updated = deepcopy(existing)
+        updated["updated_at"] = self._now_iso()
+        updated["source_turn"] = source_turn
+        updated["source"] = "user_operation"
+        updated.setdefault("trace", [])
+
+        for field in ("title", "priority", "location", "notes", "sequence_index"):
+            if operation.get(field) is not None:
+                updated[field] = operation.get(field)
+
+        if operation.get("duration_minutes") is not None:
+            updated["duration_minutes"] = parse_duration_minutes(operation.get("duration_minutes"))
+
+        if operation.get("is_mandatory") is not None:
+            updated["is_mandatory"] = bool(operation.get("is_mandatory"))
+            updated["activity_type"] = "mandatory" if updated["is_mandatory"] else "optional"
+
+        if updated.get("title"):
+            updated["normalized_title"] = clean_title(updated["title"])
+            updated["aliases"] = self._generate_aliases(updated["title"])
+
+        explicit_fixed_start = self._coerce_minutes(operation.get("fixed_start"))
+        explicit_fixed_end = self._coerce_minutes(operation.get("fixed_end"))
+        explicit_earliest = self._coerce_minutes(operation.get("earliest_start"))
+        explicit_latest = self._coerce_minutes(operation.get("latest_end"))
+        explicit_preferred = self._coerce_minutes(operation.get("preferred_start"))
+        explicit_anchor = operation.get("anchor_relation")
+
+        if explicit_anchor:
+            resolved_anchor = self._resolve_anchor_relation(explicit_anchor, anchor_pool)
+            if resolved_anchor:
+                updated["anchor_relation"] = resolved_anchor
+            updated["timing_mode"] = TimingMode.RELATIVE
+            updated["fixed_start"] = None
+            updated["fixed_end"] = None
+            updated["scheduled_start"] = None
+            updated["scheduled_end"] = None
+            if updated.get("location") is None and resolved_anchor:
+                anchor_activity = self._find_activity_by_stable_id(anchor_pool, resolved_anchor.get("target_activity_id"))
+                if anchor_activity:
+                    updated["location"] = anchor_activity.get("location")
+                    updated["location_normalized"] = anchor_activity.get("location_normalized")
+        elif explicit_fixed_start is not None or explicit_fixed_end is not None:
+            updated["timing_mode"] = TimingMode.FIXED
+            updated["anchor_relation"] = None
+            if explicit_fixed_start is not None:
+                updated["fixed_start"] = explicit_fixed_start
+            if explicit_fixed_end is not None:
+                updated["fixed_end"] = explicit_fixed_end
+            elif explicit_fixed_start is not None:
+                updated["fixed_end"] = explicit_fixed_start + int(updated.get("duration_minutes") or DEFAULT_DURATION)
+            updated["earliest_start"] = updated.get("fixed_start")
+            updated["latest_end"] = updated.get("fixed_end")
+            updated["scheduled_start"] = updated.get("fixed_start")
+            updated["scheduled_end"] = updated.get("fixed_end")
+
+        if explicit_earliest is not None:
+            updated["earliest_start"] = explicit_earliest
+        if explicit_latest is not None:
+            updated["latest_end"] = explicit_latest
+        if explicit_preferred is not None:
+            updated["preferred_start"] = explicit_preferred
+            if updated.get("timing_mode") == TimingMode.UNSPECIFIED:
+                updated["timing_mode"] = TimingMode.PREFERRED
+
+        if updated.get("location"):
+            updated["location_normalized"] = _normalize_location(updated.get("location"))
+
+        note = operation.get("notes") or f"{operation.get('op', 'update')} request applied to existing activity."
+        if note not in updated["trace"]:
+            updated["trace"].append(note)
+
+        updated["status"] = "active"
+        updated["is_conflict"] = False
+        updated["is_conflicting"] = False
+        updated["conflict_ids"] = []
+        updated["conflict_with"] = []
+        updated["conflict_reason"] = None
+        updated["conflict_priority"] = None
+        updated["conflict_severity"] = None
+        return self._canonicalize_activity(updated, source_turn=source_turn, default_source="user_operation")
+
+    def _build_conflict_response(
+        self,
+        original_envelope: Dict[str, Any],
+        current_version: int,
+        activity: Dict[str, Any],
+        blockers: List[Dict[str, Any]],
+        allow_clash: bool = False,
+    ) -> Dict[str, Any]:
+        blocker = blockers[0] if blockers else None
+        reason = activity.get("conflict_reason") or "Requested change conflicts with the current locked plan."
+        suggestions: List[str] = []
+
+        if blocker:
+            self._debug(
+                f"[CONFLICT] Requested {activity.get('title')} overlaps with fixed {blocker.get('title')}"
+            )
+            next_start = blocker.get("scheduled_end")
+            transition = self._transition_minutes(blocker, activity, 0)
+            if next_start is not None:
+                suggestions.append(f"Move {activity.get('title')} to {format_clock(next_start + transition)}")
+            existing_fixed = self._coerce_minutes(activity.get("fixed_start"))
+            if existing_fixed is not None:
+                suggestions.append(f"Keep {activity.get('title')} at {format_clock(existing_fixed)}")
+            suggestions.append(f"Change {blocker.get('title')} if that commitment can move")
+
+        conflict_payload = {
+            "status": "conflict",
+            "conflict_target": activity.get("title"),
+            "conflict_reason": reason,
+            "suggestions": suggestions,
+        }
+        envelope = deepcopy(original_envelope)
+        envelope["status"] = "conflict"
+        envelope["planning_mode"] = self._planning_mode(allow_clash)
+        envelope["allow_clash"] = allow_clash
+        envelope["conflict"] = conflict_payload
+        envelope["conflicts"] = [conflict_payload]
+        envelope["unmet_items"] = envelope.get("unmet_items") or []
+        envelope["validation_issues"] = envelope.get("validation_issues") or []
+        envelope["version"] = current_version
+        envelope.setdefault("explanations", [])
+        envelope["explanations"] = self._merge_explanations(
+            envelope.get("explanations", []),
+            [reason],
+        )
+        return {
+            "status": "conflict",
+            "applied": False,
+            "envelope": envelope,
+            "version": current_version,
+            "activities": envelope.get("activities", []),
+            "updatedActivities": [],
+            "deletedItemIds": [],
+            "conflict": conflict_payload,
+        }
+
     def apply_operations(
         self, 
         envelope: Dict[str, Any], 
         operations: List[Dict[str, Any]], 
         base_version: int,
-        new_date: Optional[str] = None
+        new_date: Optional[str] = None,
+        target_date_envelope: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Apply patch operations to a schedule envelope."""
-        current_version = envelope.get("version", 1)
+        """Apply operations against the canonical activity set, then regenerate derived schedule blocks."""
+        current_version = int(envelope.get("version", 1))
         if base_version != current_version:
-            # We raise a specialized exception that main.py can catch
             raise VersionMismatchError(f"Version mismatch: baseVersion {base_version} != currentVersion {current_version}")
 
-        activities_raw = deepcopy(envelope.get("activities") or envelope.get("items") or [])
-        activities = []
-        for raw in activities_raw:
-            # CRITICAL: Filter out previous materializations (buffers/travel)
-            if raw.get("type") not in [None, "activity"]:
+        working_envelope = deepcopy(envelope)
+        canonical_activities = self._load_canonical_activities(working_envelope)
+        preferences = deepcopy(working_envelope.get("preferences", {}))
+        allow_clash = self._resolve_allow_clash(preferences, working_envelope)
+        planning_mode = self._planning_mode(allow_clash)
+        preferences["allow_clash"] = allow_clash
+        preferences["planning_mode"] = planning_mode
+        schedule_date = new_date or working_envelope.get("date") or str(date.today())
+        source_turn = current_version + 1
+
+        updated_activities: List[Dict[str, Any]] = []
+        deleted_activity_ids: List[str] = []
+        mutated_ids: set[str] = set()
+        source_plan_date = working_envelope.get("date")
+
+        for raw_operation in operations:
+            operation = self._normalize_operation(raw_operation)
+            op_type = operation.get("op")
+            active_pool = [item for item in canonical_activities if item.get("status") == "active"]
+
+            if op_type == "shift_plan_date":
+                target_date = operation.get("to_date") or new_date or schedule_date
+                if target_date:
+                    schedule_date = target_date
+                self._debug(f"[STATE] Applying bulk date shift from {source_plan_date} to {schedule_date}")
+                mutated_ids.update(
+                    item.get("stable_activity_id")
+                    for item in active_pool
+                    if item.get("stable_activity_id")
+                )
+                for index, activity in enumerate(canonical_activities):
+                    if activity.get("status") != "active":
+                        continue
+                    shifted = deepcopy(activity)
+                    shifted["updated_at"] = self._now_iso()
+                    shifted["source_turn"] = source_turn
+                    shifted.setdefault("trace", [])
+                    shifted["trace"].append(f"Shifted with the whole plan from {source_plan_date} to {schedule_date}.")
+                    canonical_activities[index] = shifted
+                    updated_activities.append(shifted)
                 continue
-            
-            if "scheduled_start" not in raw and raw.get("startTime"):
-                raw["scheduled_start"] = parse_clock(raw["startTime"])
-            if "scheduled_end" not in raw and raw.get("endTime"):
-                raw["scheduled_end"] = parse_clock(raw["endTime"])
-            activities.append(raw)
-        
-        print(f"[JPLAN][ENGINE_LOGIC] Pre-filtered activities count: {len(activities)}")
-            
-        updated_activities = []
-        deleted_activity_ids = []
-        removed_slots = [] # Track times of removed items to reuse for 'add' in same batch
 
-        for op_data in operations:
-            op_type = op_data.get("op")
-            target_id = op_data.get("target_id")
-            target_title = str(op_data.get("target_title") or "").strip().lower()
-            
             if op_type == "add":
-                new_item = self._normalize_requested_activity(op_data)
-                if new_item:
-                    activities.append(new_item)
-                    updated_activities.append(new_item)
+                anchor = operation.get("anchor_relation")
+                if anchor:
+                    resolved_anchor = self._resolve_anchor_relation(anchor, active_pool)
+                    if resolved_anchor:
+                        operation["anchor_relation"] = resolved_anchor
+                        if not operation.get("location"):
+                            anchor_activity = self._find_activity_by_stable_id(active_pool, resolved_anchor.get("target_activity_id"))
+                            if anchor_activity:
+                                operation["location"] = anchor_activity.get("location")
+                new_activity = self._canonicalize_activity(
+                    operation,
+                    source_turn=source_turn,
+                    default_source="user_operation",
+                )
+                canonical_activities.append(new_activity)
+                updated_activities.append(new_activity)
+                mutated_ids.add(new_activity["stable_activity_id"])
+                self._debug(f"[STATE] Created new activity '{new_activity['title']}' with activity_id={new_activity['stable_activity_id']}")
+                continue
 
-            elif op_type in ["update", "move", "update_priority", "remove", "replace"]:
-                target_found = False
-                target_item = None
-                target_idx = -1
-                raw_target_title = str(target_title or "").strip().lower()
+            target_reference = operation.get("target_id") or operation.get("target_title")
+            resolution = self._resolve_activity_reference(target_reference, active_pool)
+            if resolution.get("status") != "resolved":
+                return {
+                    "status": "clarification_needed",
+                    "applied": False,
+                    "envelope": working_envelope,
+                    "version": current_version,
+                    "activities": working_envelope.get("activities", []),
+                    "updatedActivities": [],
+                    "deletedItemIds": [],
+                    "target_resolution": resolution,
+                }
 
-                # Matching Strategy: ID (if exists) -> Exact Title -> Fuzzy Title
-                for i, item in enumerate(activities):
-                    item_id = item.get("id")
-                    item_title = str(item.get("title") or "").strip().lower()
-                    
-                    if target_id and item_id == target_id:
-                        target_item, target_idx, target_found = item, i, True
-                        break
-                    if not target_found and raw_target_title and item_title == raw_target_title:
-                        target_item, target_idx, target_found = item, i, True
+            target = resolution["activity"]
+            target_id = target["stable_activity_id"]
+            target_index = next(
+                index for index, activity in enumerate(canonical_activities)
+                if activity.get("stable_activity_id") == target_id
+            )
 
-                if not target_found and raw_target_title:
-                    for i, item in enumerate(activities):
-                        item_title = str(item.get("title") or "").strip().lower()
-                        if raw_target_title in item_title or item_title in raw_target_title:
-                            target_item, target_idx, target_found = item, i, True
-                            break
+            if op_type == "remove":
+                removed = deepcopy(canonical_activities[target_index])
+                canonical_activities[target_index]["status"] = "removed"
+                canonical_activities[target_index]["updated_at"] = self._now_iso()
+                canonical_activities[target_index]["source_turn"] = source_turn
+                deleted_activity_ids.append(target_id)
+                mutated_ids.add(target_id)
+                updated_activities.append(canonical_activities[target_index])
+                self._debug(f"[STATE] Marked activity '{removed.get('title')}' as removed")
+                continue
 
-                if target_found:
-                    print(f"[JPLAN][ENGINE_LOGIC] Match found for {op_type}: '{target_item.get('title')}' (at {target_item.get('scheduled_start')})")
-                    if op_type == "remove":
-                        removed = activities.pop(target_idx)
-                        deleted_activity_ids.append(removed["id"])
-                    elif op_type == "replace":
-                        activities.pop(target_idx)
-                        new_item = self._normalize_requested_activity(op_data)
-                        if new_item:
-                            activities.append(new_item)
-                            updated_activities.append(new_item)
-                    else:
-                        updated = self._merge_activity(target_item, op_data)
-                        activities[target_idx] = updated
-                        updated_activities.append(updated)
-                else:
-                    self._debug(f"Target not found for {op_type}: '{target_title}'")
-                    # Fallback to 'add' for everything except remove
-                    if op_type != "remove":
-                        new_item = self._normalize_requested_activity(op_data)
-                        if new_item:
-                            activities.append(new_item)
-                            updated_activities.append(new_item)
+            if op_type == "replace":
+                canonical_activities[target_index]["status"] = "superseded"
+                canonical_activities[target_index]["updated_at"] = self._now_iso()
+                replacement = self._canonicalize_activity(
+                    operation,
+                    source_turn=source_turn,
+                    default_source="user_operation",
+                )
+                canonical_activities.append(replacement)
+                updated_activities.append(replacement)
+                deleted_activity_ids.append(target_id)
+                mutated_ids.add(replacement["stable_activity_id"])
+                self._debug(f"[STATE] Superseded '{target.get('title')}' with new activity_id={replacement['stable_activity_id']}")
+                continue
 
-        # [REPLANNING STRATEGY - Module 9]
-        preferences = envelope.get("preferences", {})
-        schedule_date = new_date or envelope.get("date") or str(date.today())
-        
-        print("\n" + "!"*60)
+            mutated = self._mutate_existing_activity(target, operation, source_turn, active_pool)
+            canonical_activities[target_index] = mutated
+            updated_activities.append(mutated)
+            mutated_ids.add(target_id)
+            self._debug(f"[STATE] Updating existing {mutated.get('title')} activity instead of creating new one")
+
+        active_set = [
+            deepcopy(item)
+            for item in canonical_activities
+            if item.get("status") == "active"
+        ]
+
+        for item in active_set:
+            item["locked_fixed"] = (
+                item.get("timing_mode") == TimingMode.FIXED
+                and item.get("is_mandatory")
+                and item.get("stable_activity_id") not in mutated_ids
+            )
+            if item["locked_fixed"]:
+                self._debug(
+                    f"[STATE] Fixed lock preserved for {item.get('title')} at {format_clock(item.get('fixed_start') or item.get('scheduled_start') or 0)}"
+                )
+
+        if source_plan_date != schedule_date:
+            active_set = self._merge_target_date_context(active_set, target_date_envelope, source_plan_date)
+
+        print("\n" + "!" * 60)
         print(f" [JPLAN] STARTING MODULE 9 - REPLANNING ({schedule_date})")
-        print("!"*60)
-        
-        # This is the authoritative planning step
-        planned_result = self._plan_schedule(schedule_date, activities, preferences)
-        
-        # [PART G] Update envelope with rich scheduling data
-        envelope["date"] = schedule_date
-        envelope["status"] = "ok"
-        envelope["activities"] = [self._format_activity(a) for a in planned_result["activities"]]
-        envelope["schedule_blocks"] = planned_result["schedule_blocks"]
-        envelope["unscheduled"] = [self._format_activity(a) for a in planned_result.get("unscheduled_activities", [])]
-        envelope["version"] = current_version + 1
-        envelope["explanations"] = planned_result.get("explanations", [])
+        print("!" * 60)
+        planned_result = self._plan_schedule(schedule_date, active_set, preferences)
+        conflicts = self._build_conflicts(planned_result["activities"], mutated_ids)
 
-        # [DEBUG] Final Schedule Summary
+        planned_by_id = {
+            item.get("stable_activity_id"): item
+            for item in planned_result.get("activities", [])
+            if item.get("stable_activity_id")
+        }
+        if conflicts and not allow_clash:
+            for mutated_id in mutated_ids:
+                planned_activity = planned_by_id.get(mutated_id)
+                if planned_activity and planned_activity.get("is_conflict"):
+                    blockers = [
+                        planned_by_id.get(blocker_id)
+                        for blocker_id in planned_activity.get("conflict_with") or []
+                        if planned_by_id.get(blocker_id)
+                    ]
+                    return self._build_conflict_response(working_envelope, current_version, planned_activity, blockers, allow_clash=allow_clash)
+
+        updated_envelope = deepcopy(working_envelope)
+        updated_envelope["schema_version"] = 4
+        updated_envelope["date"] = schedule_date
+        updated_envelope["status"] = "partial" if conflicts else "ok"
+        updated_envelope["planning_mode"] = planning_mode
+        updated_envelope["allow_clash"] = allow_clash
+        updated_envelope["preferences"] = preferences
+        updated_envelope["activities"] = [self._format_activity(item) for item in planned_result["activities"]]
+        updated_envelope["schedule_blocks"] = planned_result["schedule_blocks"]
+        updated_envelope["unscheduled_activities"] = [
+            self._format_activity(item) for item in planned_result.get("unscheduled_activities", [])
+        ]
+        updated_envelope["version"] = current_version + 1
+        updated_envelope["explanations"] = planned_result.get("explanations", [])
+        updated_envelope["conflicts"] = conflicts
+        updated_envelope["unmet_items"] = []
+        updated_envelope["validation_issues"] = []
+        updated_envelope["conflict"] = conflicts[0] if conflicts else None
+
         print(f"\n[JPLAN][ENGINE_LOGIC] --- FINAL SCHEDULE SUMMARY ---")
         summary_lines = []
-        for block in envelope.get("schedule_blocks", []):
+        for block in updated_envelope.get("schedule_blocks", []):
             st = block.get("start")
             et = block.get("end")
             title = block.get("title")
             b_type = block.get("block_type")
-            
             line = f"  - [{st} - {et}] {title}"
             if b_type == "activity" and block.get("location"):
                 line += f" ({block['location']})"
             elif b_type == "transition":
                 line += f" ({block.get('duration_minutes')} min)"
-            
             print(line)
             summary_lines.append(line)
-        
         print(f"[JPLAN][ENGINE_LOGIC] ---------------------------")
-        envelope["final_schedule_summary"] = "\n".join(summary_lines)
-        
+        updated_envelope["final_schedule_summary"] = "\n".join(summary_lines)
+
         return {
             "status": "success",
-            "envelope": envelope,
+            "applied": True,
+            "envelope": updated_envelope,
             "planned_result": planned_result,
-            "version": envelope["version"],
-            "activities": envelope["activities"],
-            "updatedActivities": [self._format_activity(a) for a in updated_activities],
-            "deletedItemIds": deleted_activity_ids
+            "version": updated_envelope["version"],
+            "activities": updated_envelope["activities"],
+            "updatedActivities": [self._format_activity(activity) for activity in updated_activities if activity.get("status") == "active"],
+            "deletedItemIds": deleted_activity_ids,
         }
         print(f"[JPLAN][ENGINE_LOGIC] Incoming Ops: {json.dumps(operations, indent=2, ensure_ascii=False)}")
         
@@ -1947,24 +2804,19 @@ class SchedulingEngine:
         return filtered
 
     def _format_activity(self, item: Dict[str, Any]) -> Dict[str, Any]:
-        """Convert internal activity format to external API format."""
-        # Priority 1: Use existing integer timestamps if present
         s_start = item.get("scheduled_start")
         s_end = item.get("scheduled_end")
-        
-        # Priority 2: Parse from startTime/endTime strings if integers are missing
+
         if s_start is None and item.get("startTime"):
             s_start = parse_clock(item["startTime"])
         if s_end is None and item.get("endTime"):
             s_end = parse_clock(item["endTime"])
 
-        # Priority 3: Fallback to fixed_start/end
         if s_start is None:
             s_start = item.get("fixed_start")
         if s_end is None:
             s_end = item.get("fixed_end") or (s_start + (item.get("duration_minutes") or 60) if s_start is not None else None)
 
-        # Final sanity check: if still None, default to 0
         s_start_val = s_start if s_start is not None else 0
         s_end_val = s_end if s_end is not None else s_start_val + 60
 
@@ -1972,28 +2824,56 @@ class SchedulingEngine:
         if isinstance(conflict_with, str):
             conflict_with = [conflict_with]
 
+        stable_activity_id = item.get("stable_activity_id") or item.get("id") or "unknown"
+        fixed_start = item.get("fixed_start")
+        fixed_end = item.get("fixed_end")
+        earliest_start = item.get("earliest_start")
+        latest_end = item.get("latest_end")
+        preferred_start = item.get("preferred_start")
+
         return {
-            "id": item.get("id", "unknown"),
+            "id": stable_activity_id,
+            "stable_activity_id": stable_activity_id,
             "type": item.get("type", "activity"),
+            "entity_type": item.get("entity_type", "activity"),
+            "activity_type": item.get("activity_type") or ("mandatory" if item.get("is_mandatory", True) else "optional"),
             "title": item.get("title", "Untitled"),
+            "normalized_title": item.get("normalized_title") or clean_title(item.get("title", "Untitled")),
             "startTime": format_clock(s_start_val),
             "endTime": format_clock(s_end_val),
             "location": item.get("location"),
+            "location_normalized": item.get("location_normalized") or _normalize_location(item.get("location")),
             "duration": item.get("duration") or self._duration_label(item.get("duration_minutes") or (s_end_val - s_start_val)),
+            "duration_minutes": int(item.get("duration_minutes") or (s_end_val - s_start_val)),
             "priority": item.get("priority", "medium"),
             "isMandatory": bool(item.get("is_mandatory", True) if "is_mandatory" in item else item.get("isMandatory", True)),
+            "timing_mode": item.get("timing_mode") or item.get("timingMode") or TimingMode.UNSPECIFIED,
+            "fixed_start": fixed_start,
+            "fixed_end": fixed_end,
+            "earliest_start": earliest_start,
+            "latest_end": latest_end,
+            "preferred_start": preferred_start,
+            "anchor_relation": deepcopy(item.get("anchor_relation")),
+            "sequence_index": item.get("sequence_index"),
+            "status": item.get("status", "active"),
+            "source_turn": item.get("source_turn"),
+            "created_at": item.get("created_at"),
+            "updated_at": item.get("updated_at"),
             "notes": item.get("notes"),
             "explanation": item["trace"][-1] if item.get("trace") else item.get("explanation"),
             "trace": item.get("trace", []),
             "source": item.get("source", "planner"),
             "isConflict": bool(item.get("is_conflict") or item.get("isConflict", False)),
+            "is_conflicting": bool(item.get("is_conflict") or item.get("isConflict", False)),
+            "conflict_ids": list(item.get("conflict_ids") or []),
             "conflictWith": conflict_with,
             "conflictReason": item.get("conflict_reason") or item.get("conflictReason"),
             "conflictPriority": item.get("conflict_priority"),
             "conflictSeverity": item.get("conflict_severity"),
-            # Preserve internal fields for next processing cycle
             "scheduled_start": s_start_val,
             "scheduled_end": s_end_val,
+            "prep_buffer": item.get("prep_buffer", DEFAULT_PREP_BUFFER),
+            "aliases": list(item.get("aliases") or []),
         }
 
     def _materialize_schedule(
@@ -2132,4 +3012,3 @@ class SchedulingEngine:
 class VersionMismatchError(Exception):
     """Raised when the baseVersion does not match the currentVersion in the backend."""
     pass
-

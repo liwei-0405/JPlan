@@ -24,7 +24,7 @@ supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY
 if supabase_key: supabase_key = supabase_key.strip('"').strip("'")
 
 supabase: Optional[Client] = None
-SCHEDULE_PAYLOAD_VERSION = 3 # Upgraded to 3 for envelope structure
+SCHEDULE_PAYLOAD_VERSION = 4
 
 if not supabase_url or not supabase_key:
     print(f"[ERROR] Supabase credentials missing! URL: {'Found' if supabase_url else 'Missing'}, Key: {'Found' if supabase_key else 'Missing'}")
@@ -45,10 +45,19 @@ def _parse_schedule_payload(payload: Any, user_id: str = "", date: str = "") -> 
         "schema_version": SCHEDULE_PAYLOAD_VERSION,
         "scheduleId": _generate_schedule_id(user_id, date) if user_id and date else "",
         "date": date,
+        "status": "ok",
+        "planning_mode": "feasibility_first",
+        "allow_clash": False,
         "version": 1,
+        "preferences": {},
         "activities": [],
+        "schedule_blocks": [],
         "explanations": [],
         "unscheduled_activities": [],
+        "conflict": None,
+        "conflicts": [],
+        "unmet_items": [],
+        "validation_issues": [],
     }
 
     if payload is None:
@@ -66,10 +75,19 @@ def _parse_schedule_payload(payload: Any, user_id: str = "", date: str = "") -> 
             "schema_version": payload.get("schema_version", SCHEDULE_PAYLOAD_VERSION),
             "scheduleId": payload.get("scheduleId") or _generate_schedule_id(user_id, date),
             "date": payload.get("date") or date,
+            "status": payload.get("status", "ok"),
+            "planning_mode": payload.get("planning_mode", "feasibility_first"),
+            "allow_clash": bool(payload.get("allow_clash", False)),
             "version": payload.get("version", 1),
+            "preferences": payload.get("preferences") or {},
             "activities": payload.get("activities") or payload.get("items") or [],
+            "schedule_blocks": payload.get("schedule_blocks") or [],
             "explanations": payload.get("explanations") or [],
             "unscheduled_activities": payload.get("unscheduled_activities") or [],
+            "conflict": payload.get("conflict"),
+            "conflicts": payload.get("conflicts") or [],
+            "unmet_items": payload.get("unmet_items") or [],
+            "validation_issues": payload.get("validation_issues") or [],
         }
 
     # Backward compatibility
@@ -87,10 +105,19 @@ def _parse_schedule_payload(payload: Any, user_id: str = "", date: str = "") -> 
             "schema_version": payload.get("schema_version", 2),
             "scheduleId": payload.get("scheduleId") or _generate_schedule_id(user_id, date),
             "date": payload.get("date") or date,
+            "status": payload.get("status", "ok"),
+            "planning_mode": payload.get("planning_mode", "feasibility_first"),
+            "allow_clash": bool(payload.get("allow_clash", False)),
             "version": payload.get("version", 1),
+            "preferences": payload.get("preferences") or {},
             "activities": activities if isinstance(activities, list) else [],
+            "schedule_blocks": payload.get("schedule_blocks") or [],
             "explanations": explanations if isinstance(explanations, list) else [],
             "unscheduled_activities": unscheduled if isinstance(unscheduled, list) else [],
+            "conflict": payload.get("conflict"),
+            "conflicts": payload.get("conflicts") or [],
+            "unmet_items": payload.get("unmet_items") or [],
+            "validation_issues": payload.get("validation_issues") or [],
         }
 
     return default_envelope
@@ -122,10 +149,19 @@ def save_plan(
     date: str,
     activities: List[Dict[str, Any]],
     user_id: str,
+    schedule_blocks: Optional[List[Dict[str, Any]]] = None,
     explanations: Optional[List[str]] = None,
     unscheduled_activities: Optional[List[Dict[str, Any]]] = None,
     version: int = 1,
-    schedule_id: Optional[str] = None
+    schedule_id: Optional[str] = None,
+    preferences: Optional[Dict[str, Any]] = None,
+    status: str = "ok",
+    conflict: Optional[Dict[str, Any]] = None,
+    planning_mode: str = "feasibility_first",
+    allow_clash: bool = False,
+    conflicts: Optional[List[Dict[str, Any]]] = None,
+    unmet_items: Optional[List[Dict[str, Any]]] = None,
+    validation_issues: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Save or update a plan in the database."""
     if not supabase: raise Exception("Supabase client not initialized.")
@@ -135,10 +171,21 @@ def save_plan(
 
     envelope = {
         'schema_version': SCHEDULE_PAYLOAD_VERSION,
+        'scheduleId': schedule_id,
+        'date': date,
+        'status': status,
+        'planning_mode': planning_mode,
+        'allow_clash': allow_clash,
         'version': version,
+        'preferences': preferences or {},
         'activities': activities,
+        'schedule_blocks': schedule_blocks or [],
         'explanations': explanations or [],
         'unscheduled_activities': unscheduled_activities or [],
+        'conflict': conflict,
+        'conflicts': conflicts or [],
+        'unmet_items': unmet_items or [],
+        'validation_issues': validation_issues or [],
     }
     
     try:
