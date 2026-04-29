@@ -4,6 +4,7 @@ import { CalendarWidget } from "./CalendarWidget";
 import { Clock, MapPin, Sparkles, Calendar as CalendarIcon } from "lucide-react";
 import type { DailySchedule } from "../App";
 import { useState } from "react";
+import { TimelineGrid } from "./TimelineGrid";
 
 type EntryPageProps = {
   onStartPlanning: (date: Date) => void;
@@ -70,7 +71,7 @@ export function EntryPage({
           </p>
         </div>
 
-        <div className="grid lg:grid-cols-2 gap-6">
+        <div className="grid lg:grid-cols-2 gap-6" >
           {/* Calendar */}
           <div>
             <CalendarWidget
@@ -81,7 +82,7 @@ export function EntryPage({
           </div>
 
           {/* Selected Date's Plan Preview */}
-          <div>
+          <div className="h-[500px]" style={{ height: "40.85vw", maxHeight:"475px" }}>
             <div
               onClick={
                 hasSelectedPlan 
@@ -102,47 +103,20 @@ export function EntryPage({
                   : "cursor-default"
               }`}
             >
-              <div className="flex items-center gap-2 mb-4">
+              <div className="flex items-center gap-2 mb-4 shrink-0">
                 <CalendarIcon className="h-5 w-5 text-primary" />
-                <h3>{isToday ? "Today's Plan" : `Plan for ${selectedDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`}</h3>
+                <h3 className="font-semibold">{isToday ? "Today's Plan" : `Plan for ${selectedDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`}</h3>
                 <div className={`ml-auto opacity-0 ${hasSelectedPlan || !isPastDate ? "group-hover:opacity-100" : ""} transition-opacity text-xs text-muted-foreground`}>
                   {hasSelectedPlan ? 'Click to view' : (!isPastDate ? 'Click to plan' : '')}
                 </div>
               </div>
 
               {hasSelectedPlan ? (
-                <div className="flex-1 space-y-2.5 mb-6">
-                  {selectedSchedule.activities
-                    .filter(a => a.type === "activity")
-                    .slice(0, 4)
-                    .map((activity) => (
-                      <div
-                        key={activity.id}
-                        className="bg-secondary/30 rounded-xl p-3 border border-secondary"
-                      >
-                        <div className="flex items-start justify-between mb-1.5">
-                          <h4 className="text-sm">{activity.title}</h4>
-                        </div>
-                        <div className="flex items-center gap-3 text-xs text-muted-foreground">
-                          <div className="flex items-center gap-1">
-                            <Clock className="h-3.5 w-3.5" />
-                            <span>{activity.startTime}</span>
-                          </div>
-                          {activity.location && (
-                            <div className="flex items-center gap-1">
-                              <MapPin className="h-3.5 w-3.5" />
-                              <span>{activity.location}</span>
-                            </div>
-                          )}
-                        </div>
-                      </div>
-                    ))}
-
-                  {selectedSchedule.activities.filter(a => a.type === "activity").length > 4 && (
-                    <p className="text-sm text-muted-foreground text-center pt-2">
-                      + {selectedSchedule.activities.filter(a => a.type === "activity").length - 4} more activities
-                    </p>
-                  )}
+                <div className="flex-1 overflow-y-auto pr-2 mb-4 -mr-2 custom-scrollbar">
+                  <TimelineGrid
+                    activities={selectedSchedule.activities}
+                    compact={true}
+                  />
                 </div>
               ) : (
                 <div className="flex-1 flex items-center justify-center">
@@ -182,9 +156,9 @@ export function EntryPage({
                     >
                       View Full Schedule
                     </Button>
-                    {isToday && (
+                    {(!isPastDate) && (
                       <Button
-                        onClick={onReplanToday}
+                        onClick={() => onStartPlanning(selectedDate)}
                         variant="outline"
                         className="w-full rounded-xl gap-2"
                         size="lg"

@@ -6,6 +6,7 @@ import { toast } from "sonner";
 import { useState } from "react";
 import { exportPlanToGoogle } from "../services/planService";
 import { supabase } from "../lib/supabase";
+import { TimelineGrid } from "./TimelineGrid";
 
 type ScheduleViewPageProps = {
   schedule: DailySchedule;
@@ -43,7 +44,7 @@ export function ScheduleViewPage({
           toast.error("Google Session Expired or Insufficient Permissions. Re-linking...", { id: exportToast, duration: 4000 });
           // Link again with new scopes
           setTimeout(async () => {
-             await supabase.auth.signInWithOAuth({
+            await supabase.auth.signInWithOAuth({
               provider: 'google',
               options: {
                 queryParams: {
@@ -59,7 +60,7 @@ export function ScheduleViewPage({
         }
         throw new Error(result.error);
       }
-      
+
       const count = result.exportedCount || 0;
       if (count === 0) {
         toast.info("No new activities to export. (Synced Google events are skipped)", { id: exportToast, duration: 5000 });
@@ -80,7 +81,8 @@ export function ScheduleViewPage({
   const isPastDate = scheduleDate < today;
 
   const handleEventClick = (event: ActivityBlock) => {
-    if (event.type === "activity") {
+    const bType = event.block_type || event.type;
+    if (bType === "activity") {
       onModify();
     }
   };
@@ -142,14 +144,14 @@ export function ScheduleViewPage({
             View Explanation
           </Button>
           {isGoogleLinked && (
-            <Button 
-                onClick={() => setShowConfirmDialog(true)} 
-                variant="outline" 
-                className="rounded-xl gap-2 border-primary/20 hover:bg-primary/5 hover:text-primary transition-colors"
-                disabled={isExporting}
+            <Button
+              onClick={() => setShowConfirmDialog(true)}
+              variant="outline"
+              className="rounded-xl gap-2 border-primary/20 hover:bg-primary/5 hover:text-primary transition-colors"
+              disabled={isExporting}
             >
-                {isExporting ? <Loader2 className="h-4 w-4 animate-spin" /> : <CalendarIcon className="h-4 w-4" />}
-                {isExporting ? "Exporting..." : "Push to Google Calendar"}
+              {isExporting ? <Loader2 className="h-4 w-4 animate-spin" /> : <CalendarIcon className="h-4 w-4" />}
+              {isExporting ? "Exporting..." : "Push to Google Calendar"}
             </Button>
           )}
         </div>
@@ -166,7 +168,7 @@ export function ScheduleViewPage({
             padding: '24px'
           }}>
             {/* Backdrop */}
-            <div 
+            <div
               onClick={() => setShowConfirmDialog(false)}
               style={{
                 position: 'absolute',
@@ -176,7 +178,7 @@ export function ScheduleViewPage({
                 WebkitBackdropFilter: 'blur(10px)',
               }}
             />
-            
+
             {/* Modal Content */}
             <div style={{
               position: 'relative',
@@ -195,33 +197,33 @@ export function ScheduleViewPage({
                   to { opacity: 1; transform: scale(1) translateY(0); }
                 }
               `}</style>
-              
+
               <div className="flex flex-col items-center text-center">
                 <div className="mb-6 p-5 bg-primary/10 rounded-[22px]">
                   <CalendarIcon size={36} className="text-primary" />
                 </div>
-                
+
                 <h3 className="text-2xl font-bold mb-4 text-foreground">
                   Export to Google Calendar
                 </h3>
-                
+
                 <p className="text-muted-foreground leading-relaxed mb-10 text-base px-2">
-                  Ready to refresh your Google Calendar? 
+                  Ready to refresh your Google Calendar?
                   <br /><br />
-                  This will perform a <span className="font-extrabold" style={{ color: '#dc2626', fontWeight: 'bold' }}>Total Reset</span> for <span className="font-bold text-foreground" style={{fontWeight: 'bold' }}>{schedule.date}</span>. 
+                  This will perform a <span className="font-extrabold" style={{ color: '#dc2626', fontWeight: 'bold' }}>Total Reset</span> for <span className="font-bold text-foreground" style={{ fontWeight: 'bold' }}>{schedule.date}</span>.
                   All existing events in Google Calendar for this day will be replaced by your current JPlan schedule.
                 </p>
-                
+
                 <div className="flex flex-col sm:flex-row gap-4 w-full">
-                  <Button 
-                    variant="outline" 
+                  <Button
+                    variant="outline"
                     onClick={() => setShowConfirmDialog(false)}
                     style={{ borderRadius: '16px' }}
                     className="flex-1 h-14 border-muted hover:bg-muted font-semibold transition-all"
                   >
                     Cancel
                   </Button>
-                  <Button 
+                  <Button
                     onClick={() => {
                       setShowConfirmDialog(false);
                       handleExportToGoogle();
@@ -238,67 +240,12 @@ export function ScheduleViewPage({
         )}
 
         {/* Timeline */}
-        <div className="space-y-3">
-          {schedule.activities.map((activity, index) => (
-            <div key={activity.id}>
-              {activity.type === "activity" ? (
-                <button
-                  onClick={() => !isPastDate && handleEventClick(activity)}
-                  className={`w-full bg-card border border-border rounded-2xl p-5 shadow-sm transition-all text-left group ${!isPastDate ? 'hover:shadow-md hover:border-primary/30 cursor-pointer' : 'cursor-default'
-                    }`}
-                >
-                  <div className="flex items-start justify-between mb-3">
-                    <h4>{activity.title}</h4>
-                    <div className="flex items-center gap-2">
-                      {activity.duration && (
-                        <span className="text-sm px-3 py-1 rounded-full bg-secondary text-secondary-foreground">
-                          {activity.duration}
-                        </span>
-                      )}
-                      {!isPastDate && (
-                        <div className="opacity-0 group-hover:opacity-100 transition-opacity">
-                          <Edit2 className="h-4 w-4 text-primary" />
-                        </div>
-                      )}
-                    </div>
-                  </div>
-
-                  <div className="flex items-center gap-4 text-sm text-muted-foreground">
-                    <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-muted/50">
-                      <Clock className="h-4 w-4" />
-                      <span>{activity.startTime} – {activity.endTime}</span>
-                    </div>
-
-                    {activity.location && (
-                      <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-muted/50">
-                        <MapPin className="h-4 w-4" />
-                        <span>{activity.location}</span>
-                      </div>
-                    )}
-                  </div>
-                </button>
-              ) : (
-                <div className={`border-l-4 rounded-xl p-4 shadow-sm bg-gradient-to-r ${activity.type === "travel"
-                  ? "from-indigo-50 to-white border-indigo-500"
-                  : "from-emerald-50 to-white border-emerald-500"
-                  }`}>
-                  <div className="flex items-center justify-between">
-                    <span className={`flex items-center gap-2 font-bold text-base ${activity.type === "travel" ? "text-indigo-800" : "text-emerald-800"
-                      }`}>
-                      <div className={`w-2.5 h-2.5 rounded-full ${activity.type === "travel" ? "bg-indigo-500" : "bg-emerald-500"
-                        }`} />
-                      {activity.title}
-                    </span>
-                    <span className={`text-sm font-semibold ${activity.type === "travel" ? "text-indigo-600" : "text-emerald-600"
-                      }`}>
-                      {activity.startTime} – {activity.endTime}
-                    </span>
-                  </div>
-                </div>
-              )}
-            </div>
-          ))}
-        </div>
+        <TimelineGrid
+          activities={schedule.schedule_blocks || schedule.activities}
+          interactive={!isPastDate}
+          onActivityClick={(act) => handleEventClick(act)}
+          showEditIcon={!isPastDate}
+        />
 
         {schedule.activities.length === 0 && (
           <div className="text-center py-12 bg-card rounded-2xl border border-dashed border-border">

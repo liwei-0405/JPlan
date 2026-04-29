@@ -1,14 +1,16 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { Button } from "./ui/button";
 import { Label } from "./ui/label";
-import { ArrowLeft, Bell, Calendar, Check } from "lucide-react";
+import { ArrowLeft, Bell, Calendar, Check, Trash2, Plus } from "lucide-react";
 import { Switch } from "./ui/switch";
+import { useAuth } from "../context/AuthContext";
 
 type PreferencesPageProps = {
   onBack: () => void;
 };
 
 export function PreferencesPage({ onBack }: PreferencesPageProps) {
+  const { user } = useAuth();
   const [dayStart, setDayStart] = useState("8:00 AM");
   const [dayEnd, setDayEnd] = useState("10:00 PM");
   const [preferredHomeReturn, setPreferredHomeReturn] = useState("6:00 PM");
@@ -18,6 +20,57 @@ export function PreferencesPage({ onBack }: PreferencesPageProps) {
   const [notificationsEnabled, setNotificationsEnabled] = useState(true);
   const [reminderBefore, setReminderBefore] = useState(true);
   const [calendarConnected, setCalendarConnected] = useState(true);
+
+  // --- Location Management State ---
+  const [savedLocations, setSavedLocations] = useState<any[]>([]);
+  const [newLocLabel, setNewLocLabel] = useState("");
+  const [newLocAddress, setNewLocAddress] = useState("");
+
+  useEffect(() => {
+    if (user) {
+      fetchLocations();
+    }
+  }, [user]);
+
+  const fetchLocations = async () => {
+    try {
+      const response = await fetch(`http://127.0.0.1:8000/api/locations?user_id=${user?.id}`);
+      if (response.ok) {
+        const data = await response.json();
+        setSavedLocations(data);
+      }
+    } catch (err) {
+      console.error("Failed to fetch locations:", err);
+    }
+  };
+
+  const handleAddLocation = async () => {
+    if (!user || !newLocLabel || !newLocAddress) return;
+    try {
+      const response = await fetch(`http://127.0.0.1:8000/api/locations?user_id=${user.id}&label=${encodeURIComponent(newLocLabel)}&address=${encodeURIComponent(newLocAddress)}`, {
+        method: "POST"
+      });
+      if (response.ok) {
+        setNewLocLabel("");
+        setNewLocAddress("");
+        fetchLocations();
+      }
+    } catch (err) {
+      console.error("Failed to add location:", err);
+    }
+  };
+
+  const handleDeleteLocation = async (label: string) => {
+    if (!user) return;
+    try {
+      await fetch(`http://127.0.0.1:8000/api/locations?user_id=${user.id}&label=${encodeURIComponent(label)}`, {
+        method: "DELETE"
+      });
+      fetchLocations();
+    } catch (err) {
+      console.error("Failed to delete location:", err);
+    }
+  };
 
   const handleSave = () => {
     // In a real app, this would save to backend/local storage
@@ -210,9 +263,72 @@ export function PreferencesPage({ onBack }: PreferencesPageProps) {
             </div>
           </div>
 
+          {/* Saved Locations Section */}
+          <div className="bg-card rounded-2xl border border-border p-5 shadow-sm">
+            <div className="flex items-center gap-3 mb-4">
+              <Check className="h-5 w-5 text-primary" />
+              <h3>Saved Locations</h3>
+            </div>
+            
+            <p className="text-xs text-muted-foreground mb-4">
+              Save places like "Home" or "Campus" to help JPlan calculate travel times.
+            </p>
+
+            {/* Location List */}
+            <div className="space-y-2 mb-4">
+              {savedLocations.map((loc) => (
+                <div key={loc.label} className="flex items-center justify-between p-3 bg-secondary/20 rounded-xl border border-border/50 group">
+                  <div className="overflow-hidden">
+                    <p className="text-sm font-medium">{loc.label}</p>
+                    <p className="text-xs text-muted-foreground truncate">{loc.address}</p>
+                  </div>
+                  <Button 
+                    variant="ghost" 
+                    size="sm" 
+                    className="h-8 w-8 p-0 opacity-0 group-hover:opacity-100 text-destructive hover:text-destructive hover:bg-destructive/10"
+                    onClick={() => handleDeleteLocation(loc.label)}
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </Button>
+                </div>
+              ))}
+              {savedLocations.length === 0 && (
+                <p className="text-center py-4 text-xs text-muted-foreground italic bg-secondary/10 rounded-xl border border-dashed">
+                  No saved locations yet.
+                </p>
+              )}
+            </div>
+
+            {/* Add Location Form */}
+            <div className="grid grid-cols-2 gap-2 mb-2">
+              <input 
+                placeholder="Label (e.g. Home)"
+                value={newLocLabel}
+                onChange={(e) => setNewLocLabel(e.target.value)}
+                className="bg-background border border-border rounded-xl px-3 py-2 text-sm focus:ring-1 focus:ring-primary outline-none"
+              />
+              <input 
+                placeholder="Address / Area"
+                value={newLocAddress}
+                onChange={(e) => setNewLocAddress(e.target.value)}
+                className="bg-background border border-border rounded-xl px-3 py-2 text-sm focus:ring-1 focus:ring-primary outline-none"
+              />
+            </div>
+            <Button 
+              variant="outline" 
+              className="w-full rounded-xl border-dashed hover:bg-primary/5 hover:border-primary/50"
+              onClick={handleAddLocation}
+              disabled={!newLocLabel || !newLocAddress}
+            >
+              <Plus className="mr-2 h-4 w-4" />
+              Add Location
+            </Button>
+          </div>
+
           {/* Planning Options */}
           <div className="bg-card rounded-2xl border border-border p-5 shadow-sm">
             <h3 className="mb-4">Planning Options</h3>
+            {/* ... existing planning options ... */}
 
             <div className="space-y-4">
               <div className="flex items-center justify-between py-2">

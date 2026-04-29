@@ -24,17 +24,43 @@ export type Page =
 
 export type ActivityBlock = {
   id: string;
-  type: "activity" | "travel" | "buffer";
+  type?: "activity" | "travel" | "buffer" | "transition" | "idle";
+  block_type?: "activity" | "transition" | "buffer" | "idle";
   title: string;
   startTime: string;
   endTime: string;
+  start?: string; // Backend compat
+  end?: string;   // Backend compat
   location?: string;
   duration?: string;
+  duration_minutes?: number;
+  priority?: "low" | "medium" | "high";
+  isMandatory?: boolean;
+  notes?: string;
+  explanation?: string | null;
+  trace?: string[];
+  source?: string;
+  isConflict?: boolean;
+  conflictWith?: string[];
+  conflictReason?: string;
+  conflictPriority?: "low" | "medium" | "high";
+  conflictSeverity?: "low" | "medium" | "high";
 };
 
 export type DailySchedule = {
+  scheduleId: string;
   date: string;
+  version: number;
+  schema_version?: number;
   activities: ActivityBlock[];
+  schedule_blocks?: ActivityBlock[];
+  explanations?: string[];
+  unscheduled_activities?: Array<{
+    title: string;
+    reason: string;
+    priority?: "low" | "medium" | "high";
+    isMandatory?: boolean;
+  }>;
 };
 
 const formatToISODate = (date: Date) => {
@@ -115,20 +141,24 @@ export default function App() {
     if (!user) return;
     setCurrentSchedule(schedule);
 
-    // Save to Supabase
+    // Save to Supabase and prefer the backend-normalized payload shape.
     const result = await savePlanToDb(schedule, user.id);
     if (!result.success) {
       console.error('Failed to save plan to database:', result.error);
+      return;
     }
 
+    const persistedSchedule = result.savedPlan || schedule;
+    setCurrentSchedule(persistedSchedule);
+
     // Add to history if not already there
-    const existingIndex = scheduleHistory.findIndex(s => s.date === schedule.date);
+    const existingIndex = scheduleHistory.findIndex(s => s.date === persistedSchedule.date);
     if (existingIndex >= 0) {
       const updated = [...scheduleHistory];
-      updated[existingIndex] = schedule;
+      updated[existingIndex] = persistedSchedule;
       setScheduleHistory(updated);
     } else {
-      setScheduleHistory([...scheduleHistory, schedule]);
+      setScheduleHistory([...scheduleHistory, persistedSchedule]);
     }
   };
 
@@ -168,20 +198,25 @@ export default function App() {
                    }
                 }}
                 onStartPlanning={(date: Date) => {
+                  const dateStr = date.getFullYear() + "-" +
+                    String(date.getMonth() + 1).padStart(2, '0') + "-" +
+                    String(date.getDate()).padStart(2, '0');
+                  const existingPlan = scheduleHistory.find(p => p.date === dateStr);
                   setPlanningDate(date);
-                  setPlanningSchedule(null);
-                  navigate("/planning");
+                  setPlanningSchedule(existingPlan || null);
+                  navigate(`/planning/${dateStr}`);
                 }}
                 onViewSchedule={(schedule: DailySchedule) => {
                   setCurrentSchedule(schedule);
                   navigate("/schedule");
                 }}
                 onReplanToday={() => {
+                  const dateStr = new Date().toISOString().split('T')[0];
                   if (todaySchedule) {
                     setPlanningSchedule(todaySchedule);
                     setPlanningDate(new Date());
-                    navigate("/planning");
                   }
+                  navigate(`/planning/${dateStr}`);
                 }}
                 onSettingsClick={() => navigate("/preferences")}
                 todaySchedule={todaySchedule}
@@ -192,7 +227,7 @@ export default function App() {
         />
 
         <Route
-          path="/planning"
+          path="/planning/:date"
           element={
             <ProtectedRoute>
               <PlanningInputPage
@@ -212,6 +247,8 @@ export default function App() {
             </ProtectedRoute>
           }
         />
+        {/* Fallback for planning without date */}
+        <Route path="/planning" element={<Navigate to={`/planning/${new Date().toISOString().split('T')[0]}`} replace />} />
 
         <Route
           path="/schedule"
@@ -237,7 +274,6 @@ export default function App() {
                   onViewPreferences={() => navigate("/preferences")}
                   onUpdateSchedule={(updatedSchedule) => {
                     setCurrentSchedule(updatedSchedule);
-                    saveSchedule(updatedSchedule);
                   }}
                 />
               ) : (

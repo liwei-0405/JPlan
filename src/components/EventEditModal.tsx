@@ -14,22 +14,17 @@ type EventEditModalProps = {
 };
 
 export function EventEditModal({ event, onSave, onCancel, onDelete, allActivities }: EventEditModalProps) {
-  const [title, setTitle] = useState(event.title);
-  const [startTime, setStartTime] = useState(event.startTime);
-  const [endTime, setEndTime] = useState(event.endTime);
-  const [location, setLocation] = useState(event.location || "");
-  const [duration, setDuration] = useState(event.duration || "");
-  const [showConflictWarning, setShowConflictWarning] = useState(false);
   const [formData, setFormData] = useState({ ...event });
   const [isConflict, setIsConflict] = useState(false);
 
   useEffect(() => {
     const newStartMins = timeToMinutes(formData.startTime);
     const newEndMins = timeToMinutes(formData.endTime);
+    // Handle overnight normalization for conflict check
     const effectiveEnd = newEndMins < newStartMins ? newEndMins + 1440 : newEndMins;
 
     const hasCollision = allActivities.some(act => {
-      if (act.id === event.id) return false; // 排除当前正在编辑的活动
+      if (act.id === event.id) return false; // Skip the current event being edited
       const s = timeToMinutes(act.startTime);
       let e = timeToMinutes(act.endTime);
       if (e < s) e += 1440;
@@ -37,36 +32,10 @@ export function EventEditModal({ event, onSave, onCancel, onDelete, allActivitie
     });
 
     setIsConflict(hasCollision);
-  }, [formData.startTime, formData.endTime, allActivities]);
+  }, [formData.startTime, formData.endTime, allActivities, event.id]);
 
   const handleSave = () => {
-    // Simple validation: check if times make sense
-    const hasConflict = checkForPotentialConflict();
-
-    if (hasConflict) {
-      setShowConflictWarning(true);
-      return;
-    }
-
-    const updatedEvent: ActivityBlock = {
-      ...event,
-      title,
-      startTime,
-      endTime,
-      location: location || undefined,
-      duration: duration || undefined,
-    };
-
-    onSave(updatedEvent);
-  };
-
-  const checkForPotentialConflict = (): boolean => {
-    // Basic time validation
-    if (!startTime || !endTime) return false;
-
-    // You could add more sophisticated conflict detection here
-    // For now, just a simple placeholder
-    return false;
+    onSave(formData);
   };
 
   const handleEndTimeChange = (newEndTime12h: string) => {
@@ -110,18 +79,6 @@ export function EventEditModal({ event, onSave, onCancel, onDelete, allActivitie
     setFormData({ ...formData, duration: durStr, endTime: formattedEnd });
   };
 
-  const handleSaveAnyway = () => {
-    const updatedEvent: ActivityBlock = {
-      ...event,
-      title,
-      startTime,
-      endTime,
-      location: location || undefined,
-      duration: duration || undefined,
-    };
-    onSave(updatedEvent);
-  };
-
   return (
     <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
       <div className="bg-card rounded-2xl border border-border shadow-xl max-w-md w-full max-h-[90vh] overflow-y-auto">
@@ -150,8 +107,8 @@ export function EventEditModal({ event, onSave, onCancel, onDelete, allActivitie
             <Label htmlFor="title">Activity Title</Label>
             <Input
               id="title"
-              value={title}
-              onChange={(e) => setTitle(e.target.value)}
+              value={formData.title}
+              onChange={(e) => setFormData({ ...formData, title: e.target.value })}
               placeholder="Activity name"
               className="mt-1.5 rounded-xl"
             />
@@ -198,42 +155,24 @@ export function EventEditModal({ event, onSave, onCancel, onDelete, allActivitie
             <Label htmlFor="location">Location (optional)</Label>
             <Input
               id="location"
-              value={location}
-              onChange={(e) => setLocation(e.target.value)}
+              value={formData.location || ""}
+              onChange={(e) => setFormData({ ...formData, location: e.target.value })}
               placeholder="e.g., Downtown Office"
               className="mt-1.5 rounded-xl"
             />
           </div>
 
           {/* Conflict Warning */}
-          {showConflictWarning && (
-            <div className="bg-yellow-50 border border-yellow-200 rounded-xl p-4 flex gap-3">
-              <AlertCircle className="h-5 w-5 text-yellow-600 flex-shrink-0 mt-0.5" />
+          {isConflict && (
+            <div className="bg-destructive/5 border border-destructive/20 rounded-xl p-4 flex gap-3">
+              <AlertCircle className="h-5 w-5 text-destructive flex-shrink-0 mt-0.5" />
               <div className="flex-1">
-                <p className="text-sm mb-2">
-                  This change may affect schedule feasibility.
+                <p className="text-sm font-semibold text-destructive mb-1">
+                  Time Conflict Detected
                 </p>
-                <p className="text-sm text-muted-foreground mb-3">
-                  You can adjust it manually or replan using the assistant.
+                <p className="text-xs text-muted-foreground">
+                  This activity overlaps with another scheduled event. You can still save it and adjust later.
                 </p>
-                <div className="flex gap-2">
-                  <Button
-                    onClick={handleSaveAnyway}
-                    variant="outline"
-                    size="sm"
-                    className="rounded-lg"
-                  >
-                    Save Anyway
-                  </Button>
-                  <Button
-                    onClick={() => setShowConflictWarning(false)}
-                    variant="ghost"
-                    size="sm"
-                    className="rounded-lg"
-                  >
-                    Cancel
-                  </Button>
-                </div>
               </div>
             </div>
           )}
@@ -259,11 +198,11 @@ export function EventEditModal({ event, onSave, onCancel, onDelete, allActivitie
             Cancel
           </Button>
           <Button
-            onClick={() => onSave(formData)}
-            className={`rounded-xl ${isConflict ? "bg-destructive hover:bg-destructive/90" : ""}`}
-            disabled={!title.trim() || !formData.startTime || !formData.endTime || isConflict}
+            onClick={handleSave}
+            className={`rounded-xl px-8 ${isConflict ? "bg-destructive hover:bg-destructive/90" : ""}`}
+            disabled={!formData.title.trim() || !formData.startTime || !formData.endTime}
           >
-            {isConflict ? "Conflict Detected" : "Save Changes"}
+            {isConflict ? "Save Anyway" : "Save Changes"}
           </Button>
         </div>
       </div>
@@ -271,40 +210,29 @@ export function EventEditModal({ event, onSave, onCancel, onDelete, allActivitie
   );
 }
 
-// Helper functions to convert between 12-hour and 24-hour formats
+// Helper functions
 function convertTo24Hour(time12h: string): string {
   if (!time12h) return "";
-
   const [time, modifier] = time12h.split(" ");
   let [hours, minutes] = time.split(":");
-
-  if (hours === "12") {
-    hours = "00";
-  }
-
-  if (modifier === "PM") {
-    hours = String(parseInt(hours, 10) + 12);
-  }
-
+  if (hours === "12") hours = "00";
+  if (modifier === "PM") hours = String(parseInt(hours, 10) + 12);
   return `${hours.padStart(2, '0')}:${minutes}`;
 }
 
 function convertTo12Hour(time24h: string): string {
   if (!time24h) return "";
-
   let [hours, minutes] = time24h.split(":");
   const hoursNum = parseInt(hours, 10);
-
   const modifier = hoursNum >= 12 ? "PM" : "AM";
   const hours12 = hoursNum % 12 || 12;
-
   return `${hours12}:${minutes} ${modifier}`;
 }
 
 function timeToMinutes(timeStr: string): number {
+  if (!timeStr) return 0;
   let hours = 0;
   let minutes = 0;
-
   if (timeStr.includes("AM") || timeStr.includes("PM")) {
     const [time, period] = timeStr.split(" ");
     [hours, minutes] = time.split(":").map(Number);

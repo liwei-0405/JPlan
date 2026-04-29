@@ -8,14 +8,13 @@ type ExplanationPanelProps = {
 };
 
 export function ExplanationPanel({ schedule, onBack }: ExplanationPanelProps) {
-  // Generate explanations based on schedule
   const explanations = generateExplanations(schedule);
 
   return (
     <div className="min-h-screen bg-gradient-to-b from-background to-secondary/20">
       <div className="max-w-3xl mx-auto px-6 py-8">
-        <Button 
-          variant="ghost" 
+        <Button
+          variant="ghost"
           onClick={onBack}
           className="mb-8 rounded-xl"
         >
@@ -35,7 +34,7 @@ export function ExplanationPanel({ schedule, onBack }: ExplanationPanelProps) {
 
         <div className="space-y-4">
           {explanations.map((explanation, index) => (
-            <div 
+            <div
               key={index}
               className="bg-card border border-border rounded-2xl p-5 shadow-sm hover:shadow-md transition-shadow"
             >
@@ -72,69 +71,30 @@ export function ExplanationPanel({ schedule, onBack }: ExplanationPanelProps) {
 }
 
 function generateExplanations(schedule: DailySchedule): string[] {
-  const explanations: string[] = [];
-  
-  // Check for travel blocks
-  const hasTravelBlocks = schedule.activities.some(a => a.type === "travel");
-  if (hasTravelBlocks) {
-    explanations.push("Extra travel time was added between locations to ensure you can move between activities comfortably.");
+  const collected = new Set<string>();
+
+  for (const explanation of schedule.explanations || []) {
+    if (explanation?.trim()) collected.add(explanation.trim());
   }
 
-  // Check for morning activities
-  const morningActivities = schedule.activities.filter(a => {
-    const time = a.startTime.toLowerCase();
-    return time.includes("am") || time.startsWith("12:");
-  });
-  
-  if (morningActivities.length > 0 && morningActivities[0].title.toLowerCase().includes("gym")) {
-    explanations.push("The gym session was scheduled early in the morning when the facility is less crowded and fits better before other commitments.");
-  }
-
-  // Check for specific time activities
-  const hasFixedTime = schedule.activities.some(a => 
-    a.title.toLowerCase().includes("meeting") || 
-    a.title.toLowerCase().includes("appointment")
-  );
-  
-  if (hasFixedTime) {
-    explanations.push("Activities with specific time requirements were prioritized and scheduled at their designated times.");
-  }
-
-  // Check for lunch timing
-  const lunchActivity = schedule.activities.find(a => 
-    a.title.toLowerCase().includes("lunch")
-  );
-  
-  if (lunchActivity) {
-    explanations.push("Lunch was scheduled during typical meal hours to align with restaurant availability and social dining norms.");
-  }
-
-  // Check for afternoon/evening activities
-  const afternoonActivities = schedule.activities.filter(a => {
-    const startTime = a.startTime.toLowerCase();
-    if (startTime.includes("pm")) {
-      const hour = parseInt(startTime.split(":")[0]);
-      return hour >= 2 && hour < 6;
+  for (const activity of schedule.activities) {
+    if (activity.explanation?.trim()) {
+      collected.add(activity.explanation.trim());
     }
-    return false;
-  });
-
-  if (afternoonActivities.some(a => a.title.toLowerCase().includes("dentist"))) {
-    explanations.push("Medical appointments were scheduled based on typical clinic operating hours.");
+    for (const trace of activity.trace || []) {
+      if (trace?.trim()) collected.add(trace.trim());
+    }
   }
 
-  // General feasibility note
-  explanations.push("All activities were arranged to ensure adequate time for completion without overlap or rushing between tasks.");
-
-  // Check for activities that might need special consideration
-  const workActivity = schedule.activities.find(a => 
-    a.title.toLowerCase().includes("work") || 
-    a.title.toLowerCase().includes("project")
-  );
-  
-  if (workActivity) {
-    explanations.push("Longer focus-based activities were scheduled in continuous blocks to maintain productivity and avoid interruptions.");
+  for (const item of schedule.unscheduled_activities || []) {
+    if (item.reason?.trim()) {
+      collected.add(`${item.title} was left out because ${item.reason.charAt(0).toLowerCase()}${item.reason.slice(1)}`);
+    }
   }
 
-  return explanations;
+  if (collected.size === 0) {
+    collected.add("This schedule currently has no planner trace, so only the final timeline is available.");
+  }
+
+  return Array.from(collected);
 }

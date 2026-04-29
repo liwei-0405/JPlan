@@ -125,3 +125,29 @@ CREATE POLICY "Admins can read all plans" ON daily_plans
     (auth.jwt() -> 'user_metadata' ->> 'role') = 'admin'
   );
 
+-- User Specific Locations Table
+CREATE TABLE IF NOT EXISTS user_locations (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID REFERENCES auth.users(id) ON DELETE CASCADE,
+    label TEXT NOT NULL, -- e.g. "Home", "School", "Office"
+    address TEXT NOT NULL,
+    latitude DOUBLE PRECISION,
+    longitude DOUBLE PRECISION,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL,
+    UNIQUE(user_id, label)
+);
+
+-- RLS for user_locations
+ALTER TABLE user_locations ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "Users can manage their own locations" ON user_locations;
+CREATE POLICY "Users can manage their own locations" ON user_locations 
+  FOR ALL USING (auth.uid() = user_id);
+
+-- Trigger for user_locations updated_at
+DROP TRIGGER IF EXISTS update_user_locations_updated_at ON user_locations;
+CREATE TRIGGER update_user_locations_updated_at
+  BEFORE UPDATE ON user_locations
+  FOR EACH ROW
+  EXECUTE FUNCTION update_updated_at_column();

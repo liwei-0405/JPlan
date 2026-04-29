@@ -3,6 +3,8 @@ Database layer for Supabase operations
 """
 import os
 import json
+import hashlib
+from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any
 from supabase import create_client, Client
 from dotenv import load_dotenv
@@ -22,6 +24,7 @@ supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY
 if supabase_key: supabase_key = supabase_key.strip('"').strip("'")
 
 supabase: Optional[Client] = None
+SCHEDULE_PAYLOAD_VERSION = 3 # Upgraded to 3 for envelope structure
 
 if not supabase_url or not supabase_key:
     print(f"[ERROR] Supabase credentials missing! URL: {'Found' if supabase_url else 'Missing'}, Key: {'Found' if supabase_key else 'Missing'}")
@@ -31,106 +34,171 @@ else:
     except Exception as e:
         print(f"[ERROR] Failed to initialize Supabase client: {e}")
 
-def _parse_activities(activities: Any) -> List[Dict[str, Any]]:
-    """Helper to ensure activities is always a list of dicts"""
-    if activities is None:
-        return []
-    if isinstance(activities, list):
-        return activities
-    if isinstance(activities, str):
-        try:
-            parsed = json.loads(activities)
-            return parsed if isinstance(parsed, list) else []
-        except:
-            return []
-    return []
+def _generate_schedule_id(user_id: str, date: str) -> str:
+    """Generate a stable schedule ID based on user and date."""
+    seed = f"{user_id}:{date}"
+    return hashlib.md5(seed.encode()).hexdigest()
 
+def _parse_schedule_payload(payload: Any, user_id: str = "", date: str = "") -> Dict[str, Any]:
+    """Normalize saved JSONB payload into a ScheduleEnvelope dict."""
+    default_envelope = {
+        "schema_version": SCHEDULE_PAYLOAD_VERSION,
+        "scheduleId": _generate_schedule_id(user_id, date) if user_id and date else "",
+        "date": date,
+        "version": 1,
+        "activities": [],
+        "explanations": [],
+        "unscheduled_activities": [],
+    }
+
+    if payload is None:
+        return default_envelope
+
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except Exception:
+            return default_envelope
+
+    # If it's already an envelope (schema_version >= 3)
+    if isinstance(payload, dict) and payload.get("schema_version", 0) >= 3:
+        return {
+            "schema_version": payload.get("schema_version", SCHEDULE_PAYLOAD_VERSION),
+            "scheduleId": payload.get("scheduleId") or _generate_schedule_id(user_id, date),
+            "date": payload.get("date") or date,
+            "version": payload.get("version", 1),
+            "activities": payload.get("activities") or payload.get("items") or [],
+            "explanations": payload.get("explanations") or [],
+            "unscheduled_activities": payload.get("unscheduled_activities") or [],
+        }
+
+    # Backward compatibility
+    if isinstance(payload, list):
+        res = default_envelope.copy()
+        res["activities"] = payload
+        res["schema_version"] = 1
+        return res
+
+    if isinstance(payload, dict):
+        activities = payload.get("activities") or payload.get("items")
+        explanations = payload.get("explanations")
+        unscheduled = payload.get("unscheduled_activities")
+        return {
+            "schema_version": payload.get("schema_version", 2),
+            "scheduleId": payload.get("scheduleId") or _generate_schedule_id(user_id, date),
+            "date": payload.get("date") or date,
+            "version": payload.get("version", 1),
+            "activities": activities if isinstance(activities, list) else [],
+            "explanations": explanations if isinstance(explanations, list) else [],
+            "unscheduled_activities": unscheduled if isinstance(unscheduled, list) else [],
+        }
+
+    return default_envelope
 
 def get_all_plans(user_id: str) -> List[Dict[str, Any]]:
-    """
-    Fetch all saved plans for a specific user from the database
-    """
-    if not supabase:
-        raise Exception("Supabase client not initialized.")
+    """Fetch all saved plans for a specific user."""
+    if not supabase: raise Exception("Supabase client not initialized.")
     
     try:
-        response = supabase.table('daily_plans')\
-            .select('*')\
-            .eq('user_id', user_id)\
-            .order('date', desc=True)\
-            .execute()
-        
-        results = [{'date': p['date'], 'activities': _parse_activities(p['activities'])} for p in response.data]
-        return results
+        response = supabase.table('daily_plans').select('*').eq('user_id', user_id).order('date', desc=True).execute()
+        return [_parse_schedule_payload(p.get('activities'), user_id, p.get('date', '')) for p in response.data]
     except Exception as e:
         print(f"Error fetching plans: {e}")
         raise
 
-
 def get_plan_by_date(date: str, user_id: str) -> Optional[Dict[str, Any]]:
-    """
-    Fetch a plan for a specific date and user
-    """
-    if not supabase:
-        raise Exception("Supabase client not initialized.")
+    """Fetch a plan for a specific date and user."""
+    if not supabase: raise Exception("Supabase client not initialized.")
     
     try:
-        response = supabase.table('daily_plans')\
-            .select('*')\
-            .eq('date', date)\
-            .eq('user_id', user_id)\
-            .execute()
-        
-        if not response.data:
-            return None
-        
-        plan = response.data[0]
-        return {'date': plan['date'], 'activities': _parse_activities(plan.get('activities'))}
+        response = supabase.table('daily_plans').select('*').eq('date', date).eq('user_id', user_id).execute()
+        if not response.data: return None
+        return _parse_schedule_payload(response.data[0].get('activities'), user_id, date)
     except Exception as e:
         print(f"Error fetching plan: {e}")
         raise
 
+def save_plan(
+    date: str,
+    activities: List[Dict[str, Any]],
+    user_id: str,
+    explanations: Optional[List[str]] = None,
+    unscheduled_activities: Optional[List[Dict[str, Any]]] = None,
+    version: int = 1,
+    schedule_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """Save or update a plan in the database."""
+    if not supabase: raise Exception("Supabase client not initialized.")
+    
+    if not schedule_id:
+        schedule_id = _generate_schedule_id(user_id, date)
 
-def save_plan(date: str, activities: List[Dict[str, Any]], user_id: str) -> Dict[str, Any]:
-    """
-    Save or update a plan in the database for a specific user
-    """
-    if not supabase:
-        raise Exception("Supabase client not initialized.")
+    envelope = {
+        'schema_version': SCHEDULE_PAYLOAD_VERSION,
+        'version': version,
+        'activities': activities,
+        'explanations': explanations or [],
+        'unscheduled_activities': unscheduled_activities or [],
+    }
     
     try:
-        response = supabase.table('daily_plans')\
-            .upsert({
-                'user_id': user_id,
-                'date': date,
-                'activities': activities
-            }, on_conflict='user_id, date')\
-            .execute()
+        response = supabase.table('daily_plans').upsert({
+            'user_id': user_id,
+            'date': date,
+            'activities': envelope
+        }, on_conflict='user_id, date').execute()
         
         if response.data:
-            plan = response.data[0]
-            return {'date': plan['date'], 'activities': _parse_activities(plan.get('activities'))}
+            print(f"[JPLAN][DATABASE] Successfully saved plan for user {user_id} on date {date}")
+            return _parse_schedule_payload(response.data[0].get('activities'), user_id, date)
         else:
             raise Exception("Failed to save plan")
     except Exception as e:
         print(f"Error saving plan: {e}")
         raise
 
+def get_user_locations(user_id: str) -> List[Dict[str, Any]]:
+    """Fetch all saved locations for a specific user."""
+    if not supabase: raise Exception("Supabase client not initialized.")
+    try:
+        response = supabase.table('user_locations').select('*').eq('user_id', user_id).execute()
+        return response.data or []
+    except Exception as e:
+        print(f"Error fetching user locations: {e}")
+        return []
+
+def add_user_location(user_id: str, label: str, address: str, lat: Optional[float] = None, lng: Optional[float] = None) -> Dict[str, Any]:
+    """Add or update a saved location for a user."""
+    if not supabase: raise Exception("Supabase client not initialized.")
+    try:
+        response = supabase.table('user_locations').upsert({
+            'user_id': user_id,
+            'label': label,
+            'address': address,
+            'latitude': lat,
+            'longitude': lng,
+            'updated_at': datetime.now(timezone.utc).isoformat()
+        }, on_conflict='user_id, label').execute()
+        return response.data[0] if response.data else {}
+    except Exception as e:
+        print(f"Error saving user location: {e}")
+        raise
+
+def delete_user_location(user_id: str, label: str) -> bool:
+    """Delete a saved location."""
+    if not supabase: raise Exception("Supabase client not initialized.")
+    try:
+        supabase.table('user_locations').delete().eq('user_id', user_id).eq('label', label).execute()
+        return True
+    except Exception as e:
+        print(f"Error deleting location: {e}")
+        raise
 
 def delete_plan(date: str, user_id: str) -> bool:
-    """
-    Delete a plan for a specific date and user
-    """
-    if not supabase:
-        raise Exception("Supabase client not initialized.")
-    
+    """Delete a plan for a specific date and user."""
+    if not supabase: raise Exception("Supabase client not initialized.")
     try:
-        supabase.table('daily_plans')\
-            .delete()\
-            .eq('date', date)\
-            .eq('user_id', user_id)\
-            .execute()
-        
+        supabase.table('daily_plans').delete().eq('date', date).eq('user_id', user_id).execute()
         return True
     except Exception as e:
         print(f"Error deleting plan: {e}")

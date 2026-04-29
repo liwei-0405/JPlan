@@ -1,4 +1,6 @@
 import { useState, useEffect, useRef } from "react";
+import { useParams } from "react-router-dom";
+import { getPlanByDate } from "../services/planService";
 import { Button } from "./ui/button";
 import { Textarea } from "./ui/textarea";
 import { Input } from "./ui/input";
@@ -21,6 +23,7 @@ import {
 import type { DailySchedule, ActivityBlock } from "../App";
 import { EventEditModal } from "./EventEditModal";
 import { useAuth } from "../context/AuthContext";
+import { TimelineGrid } from "./TimelineGrid";
 
 
 type PlanningInputPageProps = {
@@ -41,16 +44,39 @@ export function PlanningInputPage({
   onUpdateSchedule,
 }: PlanningInputPageProps) {
   const { user } = useAuth();
-  const isoDateStr = selectedDate.getFullYear() + "-" +
+  const params = useParams<{ date: string }>();
+  const routeDateStr = params.date;
+  
+  // Use route date if available, otherwise fallback to prop date
+  const isoDateStr = routeDateStr || (selectedDate.getFullYear() + "-" +
     String(selectedDate.getMonth() + 1).padStart(2, '0') + "-" +
-    String(selectedDate.getDate()).padStart(2, '0');
+    String(selectedDate.getDate()).padStart(2, '0'));
 
   // State Management
   const [activeMode, setActiveMode] = useState<"assistant" | "manual">("assistant");
-  const [previewSchedule, setPreviewSchedule] = useState<DailySchedule | null>(initialSchedule || {
+  const [previewSchedule, setPreviewSchedule] = useState<DailySchedule | null>(initialSchedule || (isoDateStr === (selectedDate.getFullYear() + "-" +
+    String(selectedDate.getMonth() + 1).padStart(2, '0') + "-" +
+    String(selectedDate.getDate()).padStart(2, '0')) ? initialSchedule : null) || {
     date: isoDateStr,
     activities: []
   });
+
+  // Auto-load data on mount/refresh if missing
+  useEffect(() => {
+    if (!initialSchedule && user && isoDateStr) {
+      const loadData = async () => {
+        try {
+          const data = await getPlanByDate(isoDateStr, user.id);
+          if (data) {
+            setPreviewSchedule(data as DailySchedule);
+          }
+        } catch (err) {
+          console.error("Failed to auto-load schedule:", err);
+        }
+      };
+      loadData();
+    }
+  }, [isoDateStr, user, initialSchedule]);
   // Store the original schedule string for comparison to detect changes
   const originalScheduleJson = useRef(JSON.stringify(initialSchedule || {
     date: isoDateStr,
@@ -81,9 +107,78 @@ export function PlanningInputPage({
   const [conversationHistory, setConversationHistory] = useState<Array<{ role: "user" | "assistant", message: string }>>([
     {
       role: "assistant",
-      message: "Hi! I'm your planning assistant. You can add activities manually, or tell me what you'd like to plan and I'll help create your schedule."
+      message: "Hi! I'm your planning assistant. I'll generate a draft schedule here first. Nothing is saved until you press Save & Implement Plan."
     }
   ]);
+
+  // Voice Recognition state
+  const [isRecording, setIsRecording] = useState(false);
+  const recognitionRef = useRef<any>(null);
+
+  const startSpeechRecognition = () => {
+    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+
+    if (!SpeechRecognition) {
+      setConversationHistory(prev => [...prev, {
+        role: "assistant",
+        message: "Your browser doesn't support live speech recognition. Try using Chrome or Safari."
+      }]);
+      return;
+    }
+
+    const recognition = new SpeechRecognition();
+    recognitionRef.current = recognition;
+
+    recognition.lang = 'en-US';
+    recognition.interimResults = true;
+    recognition.continuous = true;
+
+    recognition.onstart = () => {
+      setIsRecording(true);
+      setChatInput(""); // Clear before starting
+    };
+
+    recognition.onresult = (event: any) => {
+      let finalTranscript = '';
+      let interimTranscript = '';
+
+      for (let i = 0; i < event.results.length; ++i) {
+        if (event.results[i].isFinal) {
+          finalTranscript += event.results[i][0].transcript;
+        } else {
+          interimTranscript += event.results[i][0].transcript;
+        }
+      }
+
+      setChatInput(finalTranscript + interimTranscript);
+    };
+
+    recognition.onerror = (event: any) => {
+      console.error("Speech recognition error", event.error);
+      setIsRecording(false);
+      recognition.stop();
+    };
+
+    recognition.onend = () => {
+      setIsRecording(false);
+    };
+
+    recognition.start();
+  };
+
+  const stopSpeechRecognition = () => {
+    if (recognitionRef.current) {
+      recognitionRef.current.stop();
+      setIsRecording(false);
+
+      // Auto-send if we have text
+      // We use a small timeout to ensure the state has updated with the final transcript
+      setTimeout(() => {
+        const sendBtn = document.getElementById('chat-send-button');
+        if (sendBtn) sendBtn.click();
+      }, 300);
+    }
+  };
 
   const chatEndRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -125,7 +220,7 @@ export function PlanningInputPage({
 
     if (hasCollision) {
       setIsConflict(true);
-      return;
+      // Fall through — we still allow adding the event, just flag it
     }
 
     const newActivity: ActivityBlock = {
@@ -185,9 +280,6 @@ export function PlanningInputPage({
 
     if (hasCollision) {
       setIsConflict(true);
-
-      alert("Conflict Detected! This time slot overlaps with another activity.");
-      return;
     }
 
     // 3. If there is no conflict, execute the update and sort
@@ -280,7 +372,7 @@ export function PlanningInputPage({
         <div className="mb-8">
           <h2 className="mb-2">Plan Your Day</h2>
           <p className="text-muted-foreground">
-            Add activities manually or chat with the assistant for help
+            Build a draft plan with AI or manual edits, then save when you're happy with it
           </p>
         </div>
 
@@ -302,50 +394,14 @@ export function PlanningInputPage({
               </Button>
             </div>
 
-            <div className="flex-1 overflow-y-auto p-6 space-y-3 bg-secondary/5">
-              {previewSchedule && previewSchedule.activities.length > 0 ? (
-                previewSchedule.activities.map((activity) => (
-                  <div key={activity.id}>
-                    {activity.type === "activity" ? (
-                      <button
-                        onClick={() => handleEventClick(activity)}
-                        className="w-full group relative p-4 rounded-2xl border bg-background hover:border-primary transition-all text-left shadow-sm hover:shadow-md"
-                      >
-                        <div className="flex justify-between items-start">
-                          <div className="space-y-1">
-                            <div className="flex items-center gap-3">
-                              <span className="text-[11px] font-bold px-2 py-1 rounded-lg bg-primary/10 text-primary uppercase">
-                                {activity.startTime} - {activity.endTime}
-                              </span>
-                              <h4 className="text-sm font-semibold text-card-foreground">{activity.title}</h4>
-                            </div>
-                            <div className="flex items-center gap-3 text-xs text-muted-foreground ml-1">
-                              <span className="flex items-center gap-1"><Clock size={12} /> {activity.duration}</span>
-                              {activity.location && <span className="flex items-center gap-1"><MapPin size={12} /> {activity.location}</span>}
-                            </div>
-                          </div>
-                          <Edit3 size={14} className="text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity" />
-                        </div>
-                      </button>
-                    ) : (
-                      <button
-                        onClick={() => handleEventClick(activity)}
-                        className="w-full text-left group transition-all"
-                      >
-                        <div className={`mx-4 border-l-2 border-dashed pl-6 py-3 group-hover:bg-primary/5 rounded-r-xl pr-4 flex justify-between items-center transition-all ${activity.type === "travel"
-                          ? "border-indigo-500 bg-indigo-50/50"
-                          : "border-emerald-500 bg-emerald-50/50"
-                          }`}>
-                          <div className={`text-[11px] uppercase flex items-center gap-2 font-bold ${activity.type === "travel" ? "text-indigo-700" : "text-emerald-700"
-                            }`}>
-                            <Clock size={11} /> {activity.startTime} - {activity.endTime} • {activity.title}
-                          </div>
-                          <Edit3 size={12} className="text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity" />
-                        </div>
-                      </button>
-                    )}
-                  </div>
-                ))
+            <div className="flex-1 overflow-y-auto p-6 bg-secondary/5">
+              {previewSchedule && (previewSchedule.schedule_blocks?.length || previewSchedule.activities.length > 0) ? (
+                <TimelineGrid
+                  activities={previewSchedule.schedule_blocks || previewSchedule.activities}
+                  interactive={true}
+                  onActivityClick={handleEventClick}
+                  showEditIcon={true}
+                />
               ) : (
                 <div className="h-full flex flex-col items-center justify-center text-muted-foreground opacity-30 italic">
                   <Bot size={48} className="mb-2" />
@@ -401,18 +457,29 @@ export function PlanningInputPage({
                   </div>
                   <div className="p-4 border-t bg-secondary/5">
                     <div className="flex gap-2 items-end">
-                      <Button variant="ghost" size="icon" className="h-10 w-10 rounded-xl shrink-0" disabled={isProcessing}>
-                        <Mic size={20} className="text-muted-foreground" />
+                      <Button
+                        variant={isRecording ? "destructive" : "ghost"}
+                        size="icon"
+                        className={`h-10 w-10 rounded-xl shrink-0 transition-all ${isRecording ? 'animate-pulse scale-110 shadow-lg shadow-destructive/20' : ''}`}
+                        disabled={isProcessing}
+                        onClick={isRecording ? stopSpeechRecognition : startSpeechRecognition}
+                      >
+                        <Mic size={20} className={isRecording ? "text-white" : "text-muted-foreground"} />
                       </Button>
                       <Textarea
                         value={chatInput}
                         onChange={(e) => setChatInput(e.target.value)}
-                        placeholder="e.g. Move lunch to 1pm..."
+                        placeholder={isRecording ? "Listening..." : "e.g. Move lunch to 1pm..."}
                         className="min-h-[80px] rounded-xl resize-none"
                         disabled={isProcessing}
                         onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSendMessage(); } }}
                       />
-                      <Button onClick={handleSendMessage} disabled={isProcessing || !chatInput.trim()} className="h-10 w-10 rounded-xl shrink-0 p-0">
+                      <Button
+                        id="chat-send-button"
+                        onClick={handleSendMessage}
+                        disabled={isProcessing || !chatInput.trim()}
+                        className="h-10 w-10 rounded-xl shrink-0 p-0"
+                      >
                         {isProcessing ? <Loader2 className="h-5 w-5 animate-spin" /> : <Send size={18} />}
                       </Button>
                     </div>
@@ -519,7 +586,7 @@ export function PlanningInputPage({
             <div className="p-4 bg-primary/5 border border-primary/10 rounded-2xl">
               <p className="text-xs text-muted-foreground leading-relaxed">
                 💡 <b>Tip:</b> You can switch between AI and Manual mode anytime.
-                Manual changes are preserved when you talk to the AI.
+                Manual changes are preserved when you talk to the AI, and this page stays as a draft until you save.
               </p>
             </div>
 
@@ -773,7 +840,7 @@ function formatTo12Hour(timeStr: string): string {
   let [hours, minutes] = timeStr.split(':').map(Number);
   const period = hours >= 12 ? "PM" : "AM";
   const displayHour = hours % 12 || 12;
-  return `${displayHour.toString().padStart(2, "0")}:${minutes.toString().padStart(2, "0")} ${period}`;
+  return `${displayHour}:${minutes.toString().padStart(2, "0")} ${period}`;
 }
 
 function timeToMinutes(timeStr: string): number {

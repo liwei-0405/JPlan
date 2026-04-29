@@ -309,17 +309,26 @@ class CalendarService:
             existing_google_events = self.get_calendar_events(access_token, clean_min, clean_max)
             deleted_count = 0
             for gev in existing_google_events:
-                # Check if it falls on the target date (comparing only the YYYY-MM-DD part)
+                # Proper cleanup: Check if event overlaps with the target date
                 start_obj = gev.get("start", {})
-                start_raw = start_obj.get("dateTime") or start_obj.get("date", "")
+                end_obj = gev.get("end", {})
                 
-                if start_raw.startswith(date_str):
+                start_raw = start_obj.get("dateTime") or start_obj.get("date", "")
+                end_raw = end_obj.get("dateTime") or end_obj.get("date", "")
+                
+                # We target events that involve the local date_str
+                # If any of the start or end dates contain the date_str, we delete it
+                should_delete = False
+                if date_str in start_raw or date_str in end_raw:
+                    should_delete = True
+                
+                if should_delete:
                     try:
                         del_url = f"https://www.googleapis.com/calendar/v3/calendars/primary/events/{gev.get('id')}"
                         del_resp = requests.delete(del_url, headers=headers)
                         del_resp.raise_for_status()
                         deleted_count += 1
-                        print(f"[DEBUG] Deleted existing event to prepare for full sync: {gev.get('summary')}")
+                        print(f"[DEBUG] Deleted existing event for full sync reset: {gev.get('summary')} ({start_raw})")
                     except Exception as del_err:
                         print(f"[ERROR] Failed to delete event {gev.get('id')}: {del_err}")
             
