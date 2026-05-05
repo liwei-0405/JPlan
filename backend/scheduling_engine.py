@@ -45,6 +45,50 @@ CONFLICT_SEVERITY_RULES = {
     "user-forced": "high",
 }
 
+FIXED_EVENT_KEYWORDS = {
+    "appointment",
+    "class",
+    "exam",
+    "flight",
+    "interview",
+    "lecture",
+    "meeting",
+    "presentation",
+    "seminar",
+    "train",
+    "workshop",
+}
+
+PREFERRED_EXACT_KEYWORDS = {
+    "assignment",
+    "coding",
+    "fyp",
+    "groceries",
+    "grocery",
+    "gym",
+    "implementation",
+    "shopping",
+    "study",
+    "workout",
+}
+
+SOCIAL_OR_BOOKED_KEYWORDS = {
+    "appointment",
+    "booked",
+    "booking",
+    "client",
+    "date",
+    "doctor",
+    "friend",
+    "girl",
+    "girlfriend",
+    "reservation",
+    "reserved",
+    "team",
+    "trainer",
+    "with",
+}
+
 PARSER_PROMPT = """
 You are the parsing layer for JPlan. Convert user requests into structured operations.
 Return ONLY ONE JSON object with: intent, reply, transcription, date, operations, conflict_analysis.
@@ -335,6 +379,7 @@ class SchedulingEngine:
             requested_operations = [{**activity, "op": "add"} for activity in (parsed.get("activities") or [])]
 
         for raw_op in requested_operations:
+            raw_op = {**raw_op, "_user_message": latest_request}
             operation = self._normalize_operation(raw_op)
             if operation["op"] != "add":
                 continue
@@ -515,7 +560,13 @@ class SchedulingEngine:
             
             # Print Token Usage
             usage = getattr(response, "usage_metadata", None)
+            token_usage = None
             if usage:
+                token_usage = {
+                    "prompt": int(getattr(usage, "prompt_token_count", 0) or 0),
+                    "candidates": int(getattr(usage, "candidates_token_count", 0) or 0),
+                    "total": int(getattr(usage, "total_token_count", 0) or 0),
+                }
                 print(f"\n[JPLAN][API] [TOKEN_USAGE] Prompt: {usage.prompt_token_count} | Candidates: {usage.candidates_token_count} | Total: {usage.total_token_count}")
             
             parsed = self._safe_json_loads(raw_response_text)
@@ -566,6 +617,8 @@ class SchedulingEngine:
         parsed.setdefault("preferences", {})
         parsed["_reply_source"] = "llm"
         parsed["_llm_reply"] = raw_llm_reply
+        if token_usage:
+            parsed["_token_usage"] = token_usage
         parsed = self._normalize_plan_level_operations(parsed, latest_request, current_schedule)
         self._debug_json("LLM parsed request", parsed)
         self._debug(
@@ -1472,6 +1525,7 @@ class SchedulingEngine:
         conflict_item["is_conflict"] = True
         conflict_item["conflict_with"] = list(dict.fromkeys(conflict_ids))
         conflict_item["conflict_reason"] = reason
+        conflict_item["reason_codes"] = [self._reason_code_from_text(reason)]
         conflict_item["conflict_priority"] = conflict_item.get("priority", "medium")
         conflict_item["conflict_severity"] = self._conflict_severity(conflict_item, overlapping)
         conflict_item.setdefault("trace", [])
@@ -1493,6 +1547,7 @@ class SchedulingEngine:
                 if clash_id != existing.get("id")
             ]
             existing["conflict_reason"] = existing.get("conflict_reason") or "This activity overlaps with another retained block."
+            existing["reason_codes"] = list(dict.fromkeys((existing.get("reason_codes") or []) + ["fixed_overlap"]))
             existing["conflict_priority"] = existing.get("priority", "medium")
             existing["conflict_severity"] = self._conflict_severity(existing, [conflict_item])
             existing.setdefault("trace", [])
@@ -1549,6 +1604,18 @@ class SchedulingEngine:
         if overlap_count == 1:
             return "medium"
         return "low"
+
+    def _reason_code_from_text(self, reason: Optional[str]) -> str:
+        clean = clean_title(reason or "")
+        if "outside day" in clean or "boundary" in clean:
+            return "outside_day"
+        if "no feasible slot" in clean or "no space" in clean or "narrative window" in clean:
+            return "no_relative_slot"
+        if "travel" in clean or "tight" in clean:
+            return "travel_tight"
+        if "clash" in clean or "overlap" in clean:
+            return "fixed_overlap"
+        return "infeasible_request"
 
     def _validate_locked_item(
         self,
@@ -1617,6 +1684,14 @@ class SchedulingEngine:
                 item.get("earliest_start") or day_start,
                 day_start
             )
+            preferred_start = item.get("preferred_start")
+            if (
+                preferred_start is not None
+                and candidate_start < preferred_start
+                and preferred_start + duration + after_transition <= gap_end
+                and preferred_start + duration <= (item.get("latest_end") or day_end)
+            ):
+                candidate_start = preferred_start
             candidate_end = candidate_start + duration
 
             # Feasibility Checks
@@ -1636,6 +1711,8 @@ class SchedulingEngine:
             total_score = base_score - delay_penalty
             if prefer_latest:
                 total_score += candidate_start
+            if preferred_start is not None:
+                total_score -= abs(candidate_start - preferred_start) * 1.5
             
             if total_score > best_score:
                 best_score = total_score
@@ -1855,6 +1932,101 @@ class SchedulingEngine:
             return TimingMode.WINDOW
         return TimingMode.UNSPECIFIED
 
+    def _contains_any_keyword(self, text: str, keywords: set[str]) -> bool:
+        clean = clean_title(text)
+        return any(keyword in clean for keyword in keywords)
+
+    def _classify_timing_with_domain_rules(
+        self,
+        raw: Dict[str, Any],
+        title: str,
+        timing_mode: str,
+        fixed_start: Optional[int],
+        fixed_end: Optional[int],
+        earliest_start: Optional[int],
+        latest_end: Optional[int],
+        preferred_start: Optional[int],
+        anchor_relation: Optional[Dict[str, Any]],
+    ) -> Tuple[str, Optional[int], Optional[int], Optional[int], Optional[str]]:
+        evidence_text = " ".join(
+            str(value or "")
+            for value in (
+                title,
+                raw.get("notes"),
+                raw.get("transcription"),
+                raw.get("_user_message"),
+                raw.get("_latest_request"),
+            )
+        )
+        exact_time = fixed_start is not None or fixed_end is not None
+
+        if anchor_relation:
+            return (
+                TimingMode.RELATIVE,
+                None,
+                None,
+                preferred_start,
+                "Smart timing: relative because the request is anchored before/after another activity.",
+            )
+
+        if exact_time:
+            if self._contains_any_keyword(evidence_text, FIXED_EVENT_KEYWORDS):
+                return (
+                    TimingMode.FIXED,
+                    fixed_start,
+                    fixed_end,
+                    preferred_start,
+                    "Smart timing: fixed because the activity type is usually a locked commitment.",
+                )
+
+            if self._contains_any_keyword(evidence_text, SOCIAL_OR_BOOKED_KEYWORDS):
+                return (
+                    TimingMode.FIXED,
+                    fixed_start,
+                    fixed_end,
+                    preferred_start,
+                    "Smart timing: fixed because the request sounds like a booked or social commitment.",
+                )
+
+            if self._contains_any_keyword(evidence_text, PREFERRED_EXACT_KEYWORDS):
+                preferred = preferred_start or fixed_start
+                return (
+                    TimingMode.PREFERRED,
+                    None,
+                    None,
+                    preferred,
+                    "Smart timing: preferred because the activity is usually movable even though a time was mentioned.",
+                )
+
+            if timing_mode == TimingMode.FIXED:
+                return (
+                    TimingMode.FIXED,
+                    fixed_start,
+                    fixed_end,
+                    preferred_start,
+                    "Smart timing: fixed because an exact time was requested.",
+                )
+
+        if preferred_start is not None:
+            return (
+                TimingMode.PREFERRED,
+                fixed_start,
+                fixed_end,
+                preferred_start,
+                "Smart timing: preferred because the request has a soft target time.",
+            )
+
+        if earliest_start is not None or latest_end is not None:
+            return (
+                TimingMode.WINDOW,
+                fixed_start,
+                fixed_end,
+                preferred_start,
+                "Smart timing: window because the request has an earliest/latest time constraint.",
+            )
+
+        return timing_mode, fixed_start, fixed_end, preferred_start, None
+
     def _generate_aliases(self, title: str) -> List[str]:
         normalized = clean_title(title)
         if not normalized:
@@ -1926,6 +2098,18 @@ class SchedulingEngine:
             anchor_relation,
         )
 
+        timing_mode, fixed_start, fixed_end, preferred_start, timing_trace = self._classify_timing_with_domain_rules(
+            raw,
+            title,
+            timing_mode,
+            fixed_start,
+            fixed_end,
+            earliest_start,
+            latest_end,
+            preferred_start,
+            anchor_relation,
+        )
+
         if timing_mode == TimingMode.FIXED and fixed_start is not None:
             earliest_start = fixed_start
             latest_end = fixed_end
@@ -1953,6 +2137,8 @@ class SchedulingEngine:
         trace = list(raw.get("trace") or [])
         if raw.get("notes") and raw.get("notes") not in trace:
             trace.append(raw.get("notes"))
+        if timing_trace and timing_trace not in trace:
+            trace.append(timing_trace)
 
         return {
             "id": stable_activity_id,
@@ -2105,6 +2291,7 @@ class SchedulingEngine:
                 if pair_key in seen_pairs:
                     continue
                 seen_pairs.add(pair_key)
+                conflict_identity = "|".join(pair_key)
 
                 user_forced = left_id in forced_ids or right_id in forced_ids
                 priority_label = self._conflict_priority_label(left, right, user_forced)
@@ -2117,6 +2304,8 @@ class SchedulingEngine:
                 conflict = {
                     "conflict_id": conflict_id,
                     "type": "time_overlap",
+                    "conflict_identity": conflict_identity,
+                    "reason_codes": ["fixed_overlap" if priority_label.startswith("fixed") else "time_overlap"],
                     "activities": [left.get("title"), right.get("title")],
                     "activity_ids": [left_id, right_id],
                     "start": format_clock(overlap_start),
@@ -2141,6 +2330,7 @@ class SchedulingEngine:
         shifted_activities: List[Dict[str, Any]],
         target_date_envelope: Optional[Dict[str, Any]],
         source_date: Optional[str],
+        target_date: Optional[str],
     ) -> List[Dict[str, Any]]:
         target_context = self._load_canonical_activities(target_date_envelope)
         existing_active = [item for item in target_context if item.get("status") == "active"]
@@ -2153,7 +2343,8 @@ class SchedulingEngine:
                 continue
             merged.append(activity)
         if source_date:
-            self._debug(f"[STATE] Applying bulk date shift from {source_date} to {target_date_envelope.get('date') if target_date_envelope else source_date}")
+            target_label = target_date or (target_date_envelope.get("date") if target_date_envelope else source_date)
+            self._debug(f"[STATE] Applying bulk date shift from {source_date} to {target_label}")
             self._debug(f"[STATE] Shifted {len(shifted_activities)} active activities to target date")
         return merged
 
@@ -2172,6 +2363,222 @@ class SchedulingEngine:
         if normalized.get("fixed_start") is not None and not normalized.get("timing_mode"):
             normalized["timing_mode"] = TimingMode.FIXED
         return normalized
+
+    def _conflict_identity(self, conflict: Dict[str, Any]) -> Optional[str]:
+        activity_ids = conflict.get("activity_ids") or []
+        if len(activity_ids) < 2:
+            return conflict.get("conflict_identity")
+        return "|".join(sorted(str(activity_id) for activity_id in activity_ids))
+
+    def _existing_conflict_identities(self, envelope: Dict[str, Any]) -> set[str]:
+        identities: set[str] = set()
+        for conflict in envelope.get("conflicts") or []:
+            identity = self._conflict_identity(conflict)
+            if identity:
+                identities.add(identity)
+        return identities
+
+    def _message_explicitly_targets_activity(self, message: str, title: str) -> bool:
+        clean_message = clean_title(message)
+        clean_activity = clean_title(title)
+        action_words = ("move", "shift", "reschedule", "change", "edit", "update")
+        return any(f"{word} {clean_activity}" in clean_message for word in action_words)
+
+    def _infer_anchor_from_user_message(
+        self,
+        operation: Dict[str, Any],
+        active_pool: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        message = clean_title(operation.get("_user_message") or "")
+        target_title = clean_title(operation.get("target_title") or operation.get("title") or "")
+        if not message or not target_title:
+            return None
+
+        for anchor in active_pool:
+            anchor_title = clean_title(anchor.get("title") or "")
+            if not anchor_title or anchor_title == target_title:
+                continue
+            before_patterns = (
+                f"{target_title} before {anchor_title}",
+                f"{target_title} before the {anchor_title}",
+            )
+            after_patterns = (
+                f"{target_title} after {anchor_title}",
+                f"{target_title} after the {anchor_title}",
+            )
+            if any(pattern in message for pattern in before_patterns):
+                return {"kind": "before", "target_title": anchor.get("title")}
+            if any(pattern in message for pattern in after_patterns):
+                return {"kind": "after", "target_title": anchor.get("title")}
+        return None
+
+    def _prepare_operations_for_apply(
+        self,
+        operations: List[Dict[str, Any]],
+        active_pool: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        prepared: List[Dict[str, Any]] = []
+
+        for raw_operation in operations:
+            operation = self._normalize_operation(raw_operation)
+            inferred_anchor = self._infer_anchor_from_user_message(operation, active_pool)
+            if inferred_anchor:
+                operation["anchor_relation"] = inferred_anchor
+                operation["timing_mode"] = TimingMode.RELATIVE
+                operation["fixed_start"] = None
+                operation["fixed_end"] = None
+
+            target_reference = operation.get("target_id") or operation.get("target_title")
+            resolution = self._resolve_activity_reference(target_reference, active_pool) if target_reference else {"status": "missing"}
+            target = resolution.get("activity") if resolution.get("status") == "resolved" else None
+            has_anchor = bool(operation.get("anchor_relation"))
+            explicit_fixed = operation.get("fixed_start") is not None or operation.get("fixed_end") is not None
+            message = operation.get("_user_message") or ""
+
+            if (
+                target
+                and has_anchor
+                and not explicit_fixed
+                and target.get("timing_mode") == TimingMode.FIXED
+                and not self._message_explicitly_targets_activity(message, target.get("title", ""))
+            ):
+                self._debug(f"[STATE] Ignored parser operation that tried to move fixed anchor '{target.get('title')}'")
+                continue
+
+            prepared.append(operation)
+
+        return prepared
+
+    def _operation_postcondition(
+        self,
+        operation: Dict[str, Any],
+        target: Dict[str, Any],
+        active_pool: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        anchor = operation.get("anchor_relation")
+        if not anchor:
+            return None
+        resolved_anchor = self._resolve_anchor_relation(anchor, active_pool)
+        anchor_id = (resolved_anchor or {}).get("target_activity_id")
+        if not anchor_id:
+            return None
+        return {
+            "kind": clean_title((resolved_anchor or {}).get("kind") or "after"),
+            "target_activity_id": target.get("stable_activity_id"),
+            "target_title": target.get("title"),
+            "anchor_activity_id": anchor_id,
+            "anchor_title": (resolved_anchor or {}).get("target_title"),
+        }
+
+    def _validate_postconditions(
+        self,
+        planned_by_id: Dict[str, Dict[str, Any]],
+        postconditions: List[Dict[str, Any]],
+        planned_activities: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
+        failures: List[Dict[str, Any]] = []
+        planned_items = planned_activities or list(planned_by_id.values())
+        for condition in postconditions:
+            target = planned_by_id.get(condition.get("target_activity_id"))
+            anchor = planned_by_id.get(condition.get("anchor_activity_id"))
+            if not target or not anchor:
+                failures.append({**condition, "reason": "Target or anchor activity was not found after replanning."})
+                continue
+
+            kind = condition.get("kind") or "after"
+            target_start = target.get("scheduled_start") or 0
+            target_end = target.get("scheduled_end") or 0
+            anchor_start = anchor.get("scheduled_start") or 0
+            anchor_end = anchor.get("scheduled_end") or 0
+            required_duration = parse_duration_minutes(target.get("duration_minutes"), minimum=0)
+
+            if kind == "before":
+                ok = target_end <= anchor_start
+                prior_blocks = [
+                    item for item in planned_items
+                    if item.get("stable_activity_id") not in {target.get("stable_activity_id"), anchor.get("stable_activity_id")}
+                    and item.get("scheduled_end") is not None
+                    and item.get("scheduled_end") <= anchor_start
+                ]
+                available_start = max([item.get("scheduled_end") or DEFAULT_DAY_START for item in prior_blocks] + [DEFAULT_DAY_START])
+                available_end = anchor_start
+                reason = f"{target.get('title')} could not be placed before {anchor.get('title')}."
+            else:
+                ok = target_start >= anchor_end
+                next_blocks = [
+                    item for item in planned_items
+                    if item.get("stable_activity_id") not in {target.get("stable_activity_id"), anchor.get("stable_activity_id")}
+                    and item.get("scheduled_start") is not None
+                    and item.get("scheduled_start") >= anchor_end
+                ]
+                available_start = anchor_end
+                available_end = min([item.get("scheduled_start") or DEFAULT_DAY_END for item in next_blocks] + [DEFAULT_DAY_END])
+                reason = f"{target.get('title')} could not be placed after {anchor.get('title')}."
+
+            if not ok:
+                available_minutes = max(0, available_end - available_start)
+                if available_minutes < required_duration:
+                    detail = (
+                        f"The available window is {format_clock(available_start)}-{format_clock(available_end)} "
+                        f"({available_minutes} min), but {target.get('title')} needs {required_duration} min."
+                    )
+                else:
+                    detail = "The final schedule did not satisfy the requested ordering after replanning."
+                failures.append({
+                    **condition,
+                    "reason": reason,
+                    "detail": detail,
+                    "target_start": format_clock(target_start),
+                    "target_end": format_clock(target_end),
+                    "anchor_start": format_clock(anchor_start),
+                    "anchor_end": format_clock(anchor_end),
+                    "required_duration_minutes": required_duration,
+                    "available_window_start": format_clock(available_start),
+                    "available_window_end": format_clock(available_end),
+                    "available_window_minutes": available_minutes,
+                })
+        return failures
+
+    def _build_postcondition_response(
+        self,
+        original_envelope: Dict[str, Any],
+        current_version: int,
+        failures: List[Dict[str, Any]],
+        allow_clash: bool,
+    ) -> Dict[str, Any]:
+        failure = failures[0]
+        reason = failure.get("detail") or failure.get("reason") or "The requested ordering could not be satisfied."
+        conflict_payload = {
+            "status": "conflict",
+            "type": "postcondition_failed",
+            "conflict_target": failure.get("target_title"),
+            "conflict_reason": reason,
+            "reason_codes": ["postcondition_failed", "no_relative_slot"],
+            "suggestions": [
+                f"Choose a different time for {failure.get('target_title')}",
+                f"Move {failure.get('anchor_title')} if that commitment can change",
+            ],
+            "postcondition": failure,
+        }
+        envelope = deepcopy(original_envelope)
+        envelope["status"] = "conflict"
+        envelope["planning_mode"] = self._planning_mode(allow_clash)
+        envelope["allow_clash"] = allow_clash
+        envelope["conflict"] = conflict_payload
+        envelope["conflicts"] = [conflict_payload]
+        envelope["version"] = current_version
+        envelope["validation_issues"] = list(envelope.get("validation_issues") or []) + [reason]
+        return {
+            "status": "conflict",
+            "applied": False,
+            "envelope": envelope,
+            "version": current_version,
+            "activities": envelope.get("activities", []),
+            "updatedActivities": [],
+            "deletedItemIds": [],
+            "conflict": conflict_payload,
+            "postcondition_results": failures,
+        }
 
     def _find_activity_by_stable_id(
         self,
@@ -2389,6 +2796,7 @@ class SchedulingEngine:
             "status": "conflict",
             "conflict_target": activity.get("title"),
             "conflict_reason": reason,
+            "reason_codes": [self._reason_code_from_text(reason)],
             "suggestions": suggestions,
         }
         envelope = deepcopy(original_envelope)
@@ -2443,14 +2851,22 @@ class SchedulingEngine:
         deleted_activity_ids: List[str] = []
         mutated_ids: set[str] = set()
         source_plan_date = working_envelope.get("date")
+        existing_conflict_identities = self._existing_conflict_identities(working_envelope)
+        postconditions: List[Dict[str, Any]] = []
+        operations_to_apply = self._prepare_operations_for_apply(
+            operations,
+            [item for item in canonical_activities if item.get("status") == "active"],
+        )
 
-        for raw_operation in operations:
-            operation = self._normalize_operation(raw_operation)
+        for operation in operations_to_apply:
             op_type = operation.get("op")
             active_pool = [item for item in canonical_activities if item.get("status") == "active"]
 
             if op_type == "shift_plan_date":
                 target_date = operation.get("to_date") or new_date or schedule_date
+                if target_date == source_plan_date:
+                    self._debug(f"[STATE] Skipping bulk date shift because the plan is already on {source_plan_date}")
+                    continue
                 if target_date:
                     schedule_date = target_date
                 self._debug(f"[STATE] Applying bulk date shift from {source_plan_date} to {schedule_date}")
@@ -2489,6 +2905,9 @@ class SchedulingEngine:
                 canonical_activities.append(new_activity)
                 updated_activities.append(new_activity)
                 mutated_ids.add(new_activity["stable_activity_id"])
+                postcondition = self._operation_postcondition(operation, new_activity, active_pool + [new_activity])
+                if postcondition:
+                    postconditions.append(postcondition)
                 self._debug(f"[STATE] Created new activity '{new_activity['title']}' with activity_id={new_activity['stable_activity_id']}")
                 continue
 
@@ -2543,6 +2962,9 @@ class SchedulingEngine:
             canonical_activities[target_index] = mutated
             updated_activities.append(mutated)
             mutated_ids.add(target_id)
+            postcondition = self._operation_postcondition(operation, mutated, active_pool)
+            if postcondition:
+                postconditions.append(postcondition)
             self._debug(f"[STATE] Updating existing {mutated.get('title')} activity instead of creating new one")
 
         active_set = [
@@ -2563,23 +2985,41 @@ class SchedulingEngine:
                 )
 
         if source_plan_date != schedule_date:
-            active_set = self._merge_target_date_context(active_set, target_date_envelope, source_plan_date)
+            active_set = self._merge_target_date_context(active_set, target_date_envelope, source_plan_date, schedule_date)
 
         print("\n" + "!" * 60)
         print(f" [JPLAN] STARTING MODULE 9 - REPLANNING ({schedule_date})")
         print("!" * 60)
         planned_result = self._plan_schedule(schedule_date, active_set, preferences)
         conflicts = self._build_conflicts(planned_result["activities"], mutated_ids)
+        for conflict in conflicts:
+            identity = self._conflict_identity(conflict)
+            conflict["conflict_lifecycle"] = "existing" if identity in existing_conflict_identities else "new"
 
         planned_by_id = {
             item.get("stable_activity_id"): item
             for item in planned_result.get("activities", [])
             if item.get("stable_activity_id")
         }
-        if conflicts and not allow_clash:
+        postcondition_failures = self._validate_postconditions(
+            planned_by_id,
+            postconditions,
+            planned_result.get("activities", []),
+        )
+        if postcondition_failures and not allow_clash:
+            self._debug(f"[CONFLICT] Requested ordering was not satisfied: {postcondition_failures[0].get('reason')}")
+            return self._build_postcondition_response(working_envelope, current_version, postcondition_failures, allow_clash=allow_clash)
+
+        blocking_conflicts = [
+            conflict for conflict in conflicts
+            if any(str(activity_id) in mutated_ids for activity_id in conflict.get("activity_ids") or [])
+        ]
+        if blocking_conflicts and not allow_clash:
             for mutated_id in mutated_ids:
                 planned_activity = planned_by_id.get(mutated_id)
                 if planned_activity and planned_activity.get("is_conflict"):
+                    if not any(str(mutated_id) in [str(activity_id) for activity_id in conflict.get("activity_ids") or []] for conflict in blocking_conflicts):
+                        continue
                     blockers = [
                         planned_by_id.get(blocker_id)
                         for blocker_id in planned_activity.get("conflict_with") or []
@@ -2590,7 +3030,7 @@ class SchedulingEngine:
         updated_envelope = deepcopy(working_envelope)
         updated_envelope["schema_version"] = 4
         updated_envelope["date"] = schedule_date
-        updated_envelope["status"] = "partial" if conflicts else "ok"
+        updated_envelope["status"] = "partial" if (conflicts or postcondition_failures) else "ok"
         updated_envelope["planning_mode"] = planning_mode
         updated_envelope["allow_clash"] = allow_clash
         updated_envelope["preferences"] = preferences
@@ -2603,8 +3043,9 @@ class SchedulingEngine:
         updated_envelope["explanations"] = planned_result.get("explanations", [])
         updated_envelope["conflicts"] = conflicts
         updated_envelope["unmet_items"] = []
-        updated_envelope["validation_issues"] = []
-        updated_envelope["conflict"] = conflicts[0] if conflicts else None
+        updated_envelope["validation_issues"] = [failure.get("reason") for failure in postcondition_failures if failure.get("reason")]
+        updated_envelope["conflict"] = conflicts[0] if conflicts else ({"type": "postcondition_failed", **postcondition_failures[0]} if postcondition_failures else None)
+        updated_envelope["postcondition_results"] = postcondition_failures
 
         print(f"\n[JPLAN][ENGINE_LOGIC] --- FINAL SCHEDULE SUMMARY ---")
         summary_lines = []
@@ -2746,6 +3187,216 @@ class SchedulingEngine:
             print(f"[JPLAN][LLM_ADVISOR] Advisor call failed: {e}")
             return "Note: This change creates some overlaps in your schedule."
 
+    def _compact_result_summary(
+        self,
+        result: Dict[str, Any],
+        allow_clash: bool,
+    ) -> Dict[str, Any]:
+        envelope = result.get("envelope") or result.get("schedule_data") or {}
+        conflict = result.get("conflict") or envelope.get("conflict")
+        conflicts = envelope.get("conflicts") or result.get("conflicts") or []
+        postcondition_results = result.get("postcondition_results") or envelope.get("postcondition_results") or []
+        changed = result.get("updatedActivities") or []
+        if not changed and envelope.get("activities"):
+            changed = envelope.get("activities", [])[:8]
+
+        return {
+            "status": result.get("status") or envelope.get("status") or ("partial" if conflicts else "success"),
+            "applied": bool(result.get("applied", result.get("status") != "conflict")),
+            "allow_clash": allow_clash,
+            "conflict": conflict or (conflicts[0] if conflicts else None),
+            "conflicts": conflicts[:3],
+            "postcondition_results": postcondition_results[:3],
+            "changed": [
+                {
+                    "title": item.get("title"),
+                    "start": item.get("startTime") or item.get("start"),
+                    "end": item.get("endTime") or item.get("end"),
+                    "is_conflict": bool(item.get("is_conflict") or item.get("isConflict") or item.get("is_conflicting")),
+                }
+                for item in changed[:8]
+                if isinstance(item, dict)
+            ],
+        }
+
+    def _fallback_result_reply(
+        self,
+        latest_request: str,
+        summary: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        status = summary.get("status") or "success"
+        conflict = summary.get("conflict") or {}
+        allow_clash = bool(summary.get("allow_clash"))
+        applied = bool(summary.get("applied"))
+        reason = (
+            conflict.get("conflict_reason")
+            or conflict.get("explanation")
+            or "The requested change conflicts with the current schedule."
+        )
+        suggestions = conflict.get("suggestions") or conflict.get("suggested_resolution") or []
+        target = conflict.get("conflict_target")
+        if not target and conflict.get("activities"):
+            target = ", ".join(str(item) for item in conflict.get("activities", [])[:2])
+
+        existing_conflicts = [
+            item for item in (summary.get("conflicts") or [])
+            if item.get("conflict_lifecycle") == "existing"
+        ]
+        if applied and existing_conflicts and not allow_clash:
+            existing = existing_conflicts[0]
+            names = ", ".join(str(item) for item in (existing.get("activities") or [])[:2])
+            existing_text = f" Your existing {names} clash is still marked." if names else " An existing clash is still marked."
+            return {
+                "reply": f"I updated the new request.{existing_text}",
+                "reply_status": "partial",
+                "recommend_allow_clash": False,
+                "reply_reason": existing.get("explanation") or existing.get("conflict_reason"),
+            }
+
+        if status == "conflict" and not applied and not allow_clash:
+            suggestion_text = f" A possible option is: {suggestions[0]}." if suggestions else ""
+            return {
+                "reply": (
+                    f"I couldn't apply that change because {reason} "
+                    f"Your existing plan was kept unchanged for feasibility.{suggestion_text} "
+                    "If you want to force the overlap, turn on Allow Clash and send the request again."
+                ),
+                "reply_status": "conflict",
+                "recommend_allow_clash": True,
+                "reply_reason": reason,
+            }
+
+        if (status in {"conflict", "partial"} or summary.get("conflicts")) and allow_clash:
+            target_text = f" for {target}" if target else ""
+            return {
+                "reply": (
+                    f"I kept your requested change{target_text}, but it creates a clash: {reason} "
+                    "I marked it so you can resolve it later."
+                ),
+                "reply_status": "partial",
+                "recommend_allow_clash": False,
+                "reply_reason": reason,
+            }
+
+        if status == "partial" or summary.get("conflicts"):
+            return {
+                "reply": "I updated the plan, but part of the result is tight or needs attention. I marked the issue in the schedule.",
+                "reply_status": "partial",
+                "recommend_allow_clash": False,
+                "reply_reason": reason if conflict else None,
+            }
+
+        changed_titles = [item.get("title") for item in summary.get("changed", []) if item.get("title")]
+        if changed_titles:
+            return {
+                "reply": f"I updated your schedule for: {', '.join(changed_titles[:3])}.",
+                "reply_status": "success",
+                "recommend_allow_clash": False,
+                "reply_reason": None,
+            }
+        return {
+            "reply": "I updated your schedule based on your request.",
+            "reply_status": "success",
+            "recommend_allow_clash": False,
+            "reply_reason": None,
+        }
+
+    def _reply_claims_failure(self, reply: str) -> bool:
+        clean_reply = clean_title(reply)
+        failure_phrases = (
+            "not applied",
+            "not appropriately slotted",
+            "not successfully",
+            "could not",
+            "couldnt",
+            "couldn't",
+            "cannot",
+            "did not",
+            "didnt",
+            "didn't",
+            "unable",
+            "failed",
+        )
+        return any(phrase in clean_reply for phrase in failure_phrases)
+
+    def compose_result_reply(
+        self,
+        latest_request: str,
+        parsed: Dict[str, Any],
+        result: Dict[str, Any],
+        allow_clash: bool,
+    ) -> Dict[str, Any]:
+        """Second-pass result-aware reply. The LLM phrases; deterministic checks decide truth."""
+        summary = self._compact_result_summary(result, allow_clash)
+        fallback = self._fallback_result_reply(latest_request, summary)
+
+        if not getattr(self.client, "models", None):
+            return fallback
+
+        prompt = f"""
+You are JPlan's final response writer. Use ONLY this scheduling result.
+Write naturally, like a helpful planning assistant, not a formal system notice.
+Keep it short: 1-3 sentences.
+If applied=false, clearly say the requested change was not applied as intended, but do not use all-caps.
+If RESULT_SUMMARY includes timing details, mention the concrete reason, such as the available window and required duration.
+If status is ok/success and applied=true, say the schedule was applied.
+If allow_clash=false and status=conflict, gently mention Allow Clash only as an option to force the overlap.
+Do not claim success unless applied=true.
+Do not invent reasons, times, blockers, or suggestions outside RESULT_SUMMARY.
+Do not mention unslotted or failed tasks unless RESULT_SUMMARY says there is a conflict or unmet item.
+
+USER_REQUEST:
+{latest_request}
+
+PARSED_OPERATIONS:
+{json.dumps(parsed.get("operations") or parsed.get("activities") or [], ensure_ascii=True)[:1200]}
+
+RESULT_SUMMARY:
+{json.dumps(summary, ensure_ascii=True)[:1800]}
+"""
+        try:
+            print("\n" + "#" * 60)
+            print(" [JPLAN] STARTING MODULE 8 - RESULT-AWARE REPLY")
+            print("#" * 60)
+            response = self.client.models.generate_content(
+                model="gemini-3.1-flash-lite-preview",
+                contents=prompt,
+            )
+            usage = getattr(response, "usage_metadata", None)
+            token_usage = None
+            if usage:
+                token_usage = {
+                    "prompt": int(getattr(usage, "prompt_token_count", 0) or 0),
+                    "candidates": int(getattr(usage, "candidates_token_count", 0) or 0),
+                    "total": int(getattr(usage, "total_token_count", 0) or 0),
+                }
+                print(
+                    f"[JPLAN][LLM_REPLY] Token Usage: Prompt={token_usage['prompt']} | "
+                    f"Candidates={token_usage['candidates']} | Total={token_usage['total']}"
+                )
+            reply = (response.text or "").strip()
+            if not reply:
+                return fallback
+
+            if fallback["reply_status"] == "conflict":
+                if not self._reply_claims_failure(reply):
+                    return {**fallback, "token_usage": token_usage}
+            elif fallback["reply_status"] == "success" and self._reply_claims_failure(reply):
+                return {**fallback, "token_usage": token_usage}
+            elif fallback["reply_status"] == "partial" and summary.get("conflicts"):
+                clean_reply = clean_title(reply)
+                if "clash" not in clean_reply and "conflict" not in clean_reply and "overlap" not in clean_reply:
+                    return {**fallback, "token_usage": token_usage}
+
+            return {
+                **fallback,
+                "reply": reply,
+                "token_usage": token_usage,
+            }
+        except Exception as exc:
+            print(f"[JPLAN][LLM_REPLY] Result-aware reply failed: {exc}")
+            return fallback
+
     def _mark_activity_conflicts(self, activities: List[Dict[str, Any]]):
         """Internal helper to mark conflicts among activities in place."""
         for item in activities:
@@ -2870,6 +3521,7 @@ class SchedulingEngine:
             "conflictReason": item.get("conflict_reason") or item.get("conflictReason"),
             "conflictPriority": item.get("conflict_priority"),
             "conflictSeverity": item.get("conflict_severity"),
+            "reason_codes": list(item.get("reason_codes") or []),
             "scheduled_start": s_start_val,
             "scheduled_end": s_end_val,
             "prep_buffer": item.get("prep_buffer", DEFAULT_PREP_BUFFER),

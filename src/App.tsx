@@ -51,9 +51,9 @@ export type ActivityBlock = {
 };
 
 export type DailySchedule = {
-  scheduleId: string;
+  scheduleId?: string;
   date: string;
-  version: number;
+  version?: number;
   schema_version?: number;
   status?: "ok" | "partial" | "conflict" | "infeasible" | string;
   planning_mode?: "feasibility_first" | "clash_allowed" | string;

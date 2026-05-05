@@ -27,6 +27,9 @@ export type PatchResponse = {
 
 export type ChatResponse = {
     reply: string;
+    reply_status?: 'success' | 'partial' | 'conflict' | 'error';
+    recommend_allow_clash?: boolean;
+    reply_reason?: string | null;
     patch?: PatchResponse;
     full_schedule?: DailySchedule;
     transcription?: string;

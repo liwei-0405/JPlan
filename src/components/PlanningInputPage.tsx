@@ -111,7 +111,7 @@ export function PlanningInputPage({
   // Chat state
   const [chatInput, setChatInput] = useState("");
   const [isProcessing, setIsProcessing] = useState(false);
-  const [conversationHistory, setConversationHistory] = useState<Array<{ role: "user" | "assistant", message: string }>>([
+  const [conversationHistory, setConversationHistory] = useState<Array<{ role: "user" | "assistant", message: string, status?: "success" | "partial" | "conflict" | "error" }>>([
     {
       role: "assistant",
       message: "Hi! I'm your planning assistant. I'll generate a draft schedule here first. Nothing is saved until you press Save & Implement Plan."
@@ -245,8 +245,10 @@ export function PlanningInputPage({
     );
 
     setPreviewSchedule({
+      ...(previewSchedule || {}),
       date: isoDateStr,
       activities: updatedActivities,
+      schedule_blocks: syncActivityBlocks(previewSchedule?.schedule_blocks, updatedActivities),
     });
 
     // Reset form
@@ -290,11 +292,18 @@ export function PlanningInputPage({
     }
 
     // 3. If there is no conflict, execute the update and sort
-    const updatedActivities = previewSchedule.activities.map(a =>
-      a.id === updatedEvent.id ? updatedEvent : a
+    const existingIndex = previewSchedule.activities.findIndex(a => a.id === updatedEvent.id);
+    const updatedActivities = (
+      existingIndex >= 0
+        ? previewSchedule.activities.map(a => a.id === updatedEvent.id ? updatedEvent : a)
+        : [...previewSchedule.activities, updatedEvent]
     ).sort((a, b) => timeToMinutes(a.startTime) - timeToMinutes(b.startTime));
 
-    setPreviewSchedule({ ...previewSchedule, activities: updatedActivities });
+    setPreviewSchedule({
+      ...previewSchedule,
+      activities: updatedActivities,
+      schedule_blocks: syncActivityBlocks(previewSchedule.schedule_blocks, updatedActivities),
+    });
     setEditingEvent(null);
     setIsConflict(false);
   };
@@ -302,7 +311,11 @@ export function PlanningInputPage({
   const handleDeleteEvent = () => {
     if (!editingEvent || !previewSchedule) return;
     const updatedActivities = previewSchedule.activities.filter(a => a.id !== editingEvent.id);
-    setPreviewSchedule({ ...previewSchedule, activities: updatedActivities });
+    setPreviewSchedule({
+      ...previewSchedule,
+      activities: updatedActivities,
+      schedule_blocks: removeDeletedActivityBlock(previewSchedule.schedule_blocks, editingEvent.id),
+    });
     setEditingEvent(null);
   };
 
@@ -341,7 +354,8 @@ export function PlanningInputPage({
       // Add assistant response to conversation
       setConversationHistory(prev => [...prev, {
         role: "assistant" as const,
-        message: data.reply
+        message: data.reply,
+        status: data.reply_status,
       }]);
 
       if (data.schedule_data) {
@@ -471,7 +485,7 @@ export function PlanningInputPage({
                   <div className="flex-1 overflow-y-auto p-4 space-y-4">
                     {conversationHistory.map((msg, i) => (
                       <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                        <div className={`max-w-[85%] p-3 rounded-2xl text-sm ${msg.role === 'user' ? 'bg-primary text-primary-foreground' : 'bg-secondary'
+                        <div className={`max-w-[85%] p-3 rounded-2xl text-sm ${msg.role === 'user' ? 'bg-primary text-primary-foreground' : msg.status === 'conflict' ? 'bg-destructive/10 text-destructive border border-destructive/20' : msg.status === 'partial' ? 'bg-yellow-50 text-yellow-900 border border-yellow-200' : 'bg-secondary'
                           }`}>
                           {msg.message}
                         </div>
@@ -740,6 +754,57 @@ function calculateEndTime(startTime: string, durationStr: string): string {
   const h = Math.floor(endTotal / 60) % 24;
   const m = endTotal % 60;
   return formatTo12Hour(`${h}:${m}`);
+}
+
+function syncActivityBlocks(
+  existingBlocks: ActivityBlock[] | undefined,
+  activities: ActivityBlock[],
+): ActivityBlock[] | undefined {
+  if (!existingBlocks) return activities;
+
+  const activityMap = new Map(activities.map((activity) => [activity.id, activity]));
+  const usedIds = new Set<string>();
+
+  const syncedBlocks = existingBlocks.map((block) => {
+    const replacement = activityMap.get(block.id);
+    const blockType = block.block_type || block.type;
+
+    if (!replacement || (blockType && blockType !== "activity")) {
+      return block;
+    }
+
+    usedIds.add(replacement.id);
+    return {
+      ...block,
+      ...replacement,
+      start: replacement.startTime,
+      end: replacement.endTime,
+    };
+  });
+
+  for (const activity of activities) {
+    if (!usedIds.has(activity.id)) {
+      syncedBlocks.push({
+        ...activity,
+        start: activity.startTime,
+        end: activity.endTime,
+      });
+    }
+  }
+
+  return syncedBlocks.sort((a, b) => {
+    const startA = timeToMinutes(a.startTime || a.start || "");
+    const startB = timeToMinutes(b.startTime || b.start || "");
+    return startA - startB;
+  });
+}
+
+function removeDeletedActivityBlock(
+  existingBlocks: ActivityBlock[] | undefined,
+  deletedId: string,
+): ActivityBlock[] | undefined {
+  if (!existingBlocks) return existingBlocks;
+  return existingBlocks.filter((block) => block.id !== deletedId);
 }
 
 function parseTime(timeStr: string): number {

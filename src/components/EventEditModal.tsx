@@ -14,8 +14,12 @@ type EventEditModalProps = {
 };
 
 export function EventEditModal({ event, onSave, onCancel, onDelete, allActivities }: EventEditModalProps) {
-  const [formData, setFormData] = useState({ ...event });
+  const [formData, setFormData] = useState(() => normalizeEventForEdit(event));
   const [isConflict, setIsConflict] = useState(false);
+
+  useEffect(() => {
+    setFormData(normalizeEventForEdit(event));
+  }, [event]);
 
   useEffect(() => {
     const newStartMins = timeToMinutes(formData.startTime);
@@ -25,8 +29,8 @@ export function EventEditModal({ event, onSave, onCancel, onDelete, allActivitie
 
     const hasCollision = allActivities.some(act => {
       if (act.id === event.id) return false; // Skip the current event being edited
-      const s = timeToMinutes(act.startTime);
-      let e = timeToMinutes(act.endTime);
+      const s = timeToMinutes(act.startTime || act.start || "");
+      let e = timeToMinutes(act.endTime || act.end || "");
       if (e < s) e += 1440;
       return (newStartMins < e) && (effectiveEnd > s);
     });
@@ -35,7 +39,13 @@ export function EventEditModal({ event, onSave, onCancel, onDelete, allActivitie
   }, [formData.startTime, formData.endTime, allActivities, event.id]);
 
   const handleSave = () => {
-    onSave(formData);
+    onSave({
+      ...formData,
+      title: formData.title.trim(),
+      location: formData.location?.trim() || undefined,
+      start: formData.startTime,
+      end: formData.endTime,
+    });
   };
 
   const handleEndTimeChange = (newEndTime12h: string) => {
@@ -211,8 +221,40 @@ export function EventEditModal({ event, onSave, onCancel, onDelete, allActivitie
 }
 
 // Helper functions
+function normalizeEventForEdit(event: ActivityBlock): ActivityBlock {
+  const startTime = event.startTime || event.start || "";
+  const endTime = event.endTime || event.end || "";
+
+  return {
+    ...event,
+    startTime,
+    endTime,
+    start: startTime,
+    end: endTime,
+    duration: event.duration || deriveDuration(startTime, endTime),
+  };
+}
+
+function deriveDuration(startTime: string, endTime: string): string {
+  if (!startTime || !endTime) return "";
+
+  const startMins = timeToMinutes(startTime);
+  const endMins = timeToMinutes(endTime);
+  let diff = endMins - startMins;
+  if (diff < 0) diff += 1440;
+
+  const hours = Math.floor(diff / 60);
+  const minutes = diff % 60;
+
+  if (hours === 0 && minutes === 0) return "0m";
+  if (hours === 0) return `${minutes}m`;
+  if (minutes === 0) return `${hours}h`;
+  return `${hours}h ${minutes}m`;
+}
+
 function convertTo24Hour(time12h: string): string {
   if (!time12h) return "";
+  if (!time12h.includes("AM") && !time12h.includes("PM")) return time12h;
   const [time, modifier] = time12h.split(" ");
   let [hours, minutes] = time.split(":");
   if (hours === "12") hours = "00";

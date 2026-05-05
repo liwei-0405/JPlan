@@ -78,6 +78,7 @@ class ScheduleItem(BaseModel):
     conflictReason: Optional[str] = None
     conflictPriority: Optional[str] = None
     conflictSeverity: Optional[str] = None
+    reason_codes: Optional[List[str]] = []
 
 class UnscheduledActivity(BaseModel):
     title: str
@@ -142,6 +143,9 @@ class ChatResponse(BaseModel):
     full_schedule: Optional[ScheduleEnvelope] = None 
     schedule_data: Optional[ScheduleEnvelope] = None # Compatibility with legacy frontend
     transcription: str | None = None
+    reply_status: Optional[str] = None
+    recommend_allow_clash: bool = False
+    reply_reason: Optional[str] = None
 
 class PlanRequest(BaseModel):
     date: str
@@ -200,6 +204,17 @@ def extract_shift_target_date(operations: List[Dict[str, Any]]) -> Optional[str]
             return operation.get("to_date")
     return None
 
+def log_total_token_usage(parsed: Dict[str, Any], reply_meta: Optional[Dict[str, Any]] = None) -> None:
+    parser_usage = parsed.get("_token_usage") or {}
+    reply_usage = (reply_meta or {}).get("token_usage") or {}
+    total_prompt = int(parser_usage.get("prompt", 0) or 0) + int(reply_usage.get("prompt", 0) or 0)
+    total_candidates = int(parser_usage.get("candidates", 0) or 0) + int(reply_usage.get("candidates", 0) or 0)
+    total = int(parser_usage.get("total", 0) or 0) + int(reply_usage.get("total", 0) or 0)
+    if total:
+        debug_log(
+            f"[TOKEN_USAGE_TOTAL] Prompt={total_prompt} | Candidates={total_candidates} | Total={total}"
+        )
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat_with_llm(request: ChatRequest):
     debug_log(f"Received chat | user={request.user_id} | message={request.message!r}")
@@ -247,6 +262,7 @@ async def chat_with_llm(request: ChatRequest):
         reply = parsed.get("reply", "I've processed your request.")
         
         if intent == "chat" and not parsed.get("operations") and not parsed.get("activities"):
+            log_total_token_usage(parsed)
             return ChatResponse(reply=reply, transcription=parsed.get("transcription"))
 
         if request.current_schedule and (parsed.get("operations") or parsed.get("activities")):
@@ -255,6 +271,13 @@ async def chat_with_llm(request: ChatRequest):
                 if not ops and parsed.get("activities"):
                     for act in parsed.get("activities"):
                         ops.append({**act, "op": "add"})
+                ops = [
+                    {
+                        **op,
+                        "_user_message": parsed.get("transcription") or request.message,
+                    }
+                    for op in ops
+                ]
 
                 target_date_envelope = None
                 shift_target_date = extract_shift_target_date(ops)
@@ -269,22 +292,30 @@ async def chat_with_llm(request: ChatRequest):
                     target_date_envelope=target_date_envelope,
                 )
                 
-                final_reply = reply
-                if patch_result.get("advisor_suggestion"):
-                    final_reply = f"{reply}\n\n💡 {patch_result['advisor_suggestion']}"
+                reply_meta = scheduling_engine.compose_result_reply(
+                    latest_request=request.message,
+                    parsed={**parsed, "operations": ops},
+                    result=patch_result,
+                    allow_clash=bool(request.allow_clash),
+                )
+                final_reply = reply_meta["reply"]
+                log_total_token_usage(parsed, reply_meta)
 
                 return ChatResponse(
                     reply=final_reply,
-                patch=SchedulePatchResponse(
-                    scheduleId=patch_result["envelope"].get("scheduleId") or "temp-id",
-                    version=patch_result["version"],
-                    applied=bool(patch_result.get("applied", True)),
-                    updatedActivities=patch_result["updatedActivities"],
-                    deletedItemIds=patch_result["deletedItemIds"],
-                    explanation=final_reply
-                ),
+                    patch=SchedulePatchResponse(
+                        scheduleId=patch_result["envelope"].get("scheduleId") or "temp-id",
+                        version=patch_result["version"],
+                        applied=bool(patch_result.get("applied", True)),
+                        updatedActivities=patch_result["updatedActivities"],
+                        deletedItemIds=patch_result["deletedItemIds"],
+                        explanation=final_reply
+                    ),
                     schedule_data=patch_result["envelope"],
-                    transcription=parsed.get("transcription")
+                    transcription=parsed.get("transcription"),
+                    reply_status=reply_meta.get("reply_status"),
+                    recommend_allow_clash=bool(reply_meta.get("recommend_allow_clash")),
+                    reply_reason=reply_meta.get("reply_reason"),
                 )
             except VersionMismatchError:
                 debug_log("Version mismatch during patch, fallback to full schedule.")
@@ -297,15 +328,26 @@ async def chat_with_llm(request: ChatRequest):
         
         schedule_dict = result.get("schedule_data")
         if schedule_dict:
+            reply_meta = scheduling_engine.compose_result_reply(
+                latest_request=request.message,
+                parsed=parsed,
+                result=result,
+                allow_clash=bool(request.allow_clash),
+            )
+            log_total_token_usage(parsed, reply_meta)
             full_envelope_dict = database._parse_schedule_payload(schedule_dict, request.user_id, schedule_dict.get("date"))
             full_envelope = ScheduleEnvelope(**full_envelope_dict)
             return ChatResponse(
-                reply=result.get("reply", reply),
+                reply=reply_meta["reply"],
                 full_schedule=full_envelope,
                 schedule_data=full_envelope,
-                transcription=result.get("transcription")
+                transcription=result.get("transcription"),
+                reply_status=reply_meta.get("reply_status"),
+                recommend_allow_clash=bool(reply_meta.get("recommend_allow_clash")),
+                reply_reason=reply_meta.get("reply_reason"),
             )
         
+        log_total_token_usage(parsed)
         return ChatResponse(
             reply=result.get("reply", reply), 
             schedule_data=None,

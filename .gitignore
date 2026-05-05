@@ -33,3 +33,6 @@ desktop.ini
 .idea/
 *.swp
 *.swo
+
+# Logs
+final combined method.txt
