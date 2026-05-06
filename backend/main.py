@@ -8,13 +8,15 @@ from google import genai
 from typing import List, Dict, Any, Optional
 import database
 from scheduling_engine import SchedulingEngine, VersionMismatchError
+from travel_service import TravelService
 
 # load environment variables from .env file
 load_dotenv()
 
 # Gemini API
 client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
-scheduling_engine = SchedulingEngine(client)
+travel_service = TravelService()
+scheduling_engine = SchedulingEngine(client, travel_service=travel_service)
 
 # Calendar Service (Supabase initialed in database module)
 import calendar_service
@@ -55,6 +57,14 @@ class ScheduleItem(BaseModel):
     raw_llm_location: Optional[str] = None
     explicit_user_location: Optional[bool] = False
     location_warning: Optional[str] = None
+    saved_location_label: Optional[str] = None
+    resolved_location: Optional[Dict[str, Any]] = None
+    travel_estimate_source: Optional[str] = None
+    travel_validation_status: Optional[str] = None
+    transport_mode: Optional[str] = None
+    route_duration_minutes: Optional[int] = None
+    from_coordinate: Optional[Dict[str, float]] = None
+    to_coordinate: Optional[Dict[str, float]] = None
     duration: Optional[str] = None
     duration_minutes: Optional[int] = None
     priority: Optional[str] = "medium"
@@ -100,8 +110,11 @@ class ScheduleEnvelope(BaseModel):
     version: Optional[int] = 1
     schema_version: Optional[int] = 4
     status: Optional[str] = "ok"
+    schedule_status: Optional[str] = "ok"
+    travel_validation_status: Optional[str] = "not_requested"
     planning_mode: Optional[str] = "feasibility_first"
     allow_clash: Optional[bool] = False
+    accurate_travel_time: Optional[bool] = False
     preferences: Optional[Dict[str, Any]] = {}
     activities: List[ScheduleItem]
     schedule_blocks: Optional[List[ScheduleItem]] = [] # Explicit timeline
@@ -109,6 +122,9 @@ class ScheduleEnvelope(BaseModel):
     unscheduled_activities: List[UnscheduledActivity] = []
     conflict: Optional[Dict[str, Any]] = None
     conflicts: Optional[List[Dict[str, Any]]] = []
+    warnings: Optional[List[Dict[str, Any]]] = []
+    location_resolution_requests: Optional[List[Dict[str, Any]]] = []
+    route_conflicts: Optional[List[Dict[str, Any]]] = []
     unmet_items: Optional[List[Dict[str, Any]]] = []
     validation_issues: Optional[List[str]] = []
 
@@ -144,6 +160,7 @@ class ChatRequest(BaseModel):
     current_schedule: Optional[ScheduleEnvelope] = None
     user_id: str | None = None
     allow_clash: bool = False
+    accurate_travel_time: bool = False
 
 class ChatResponse(BaseModel):
     reply: str
@@ -168,13 +185,34 @@ class PlanRequest(BaseModel):
     conflict: Optional[Dict[str, Any]] = None
     planning_mode: Optional[str] = "feasibility_first"
     allow_clash: bool = False
+    accurate_travel_time: bool = False
+    schedule_status: Optional[str] = None
+    travel_validation_status: Optional[str] = None
     conflicts: Optional[List[Dict[str, Any]]] = []
+    warnings: Optional[List[Dict[str, Any]]] = []
+    location_resolution_requests: Optional[List[Dict[str, Any]]] = []
+    route_conflicts: Optional[List[Dict[str, Any]]] = []
     unmet_items: Optional[List[Dict[str, Any]]] = []
     validation_issues: Optional[List[str]] = []
 
 class ExportRequest(BaseModel):
     user_id: str
     date: str
+
+class LocationResolveRequest(BaseModel):
+    user_id: str
+    label: str
+    address: str
+    display_name: Optional[str] = None
+    category: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    source: Optional[str] = "ors_geocoded"
+    confirmed_by_user: bool = True
+
+class TravelCompleteRequest(BaseModel):
+    user_id: str
+    schedule: ScheduleEnvelope
 
 
 def debug_log(message: str) -> None:
@@ -232,8 +270,10 @@ async def chat_with_llm(request: ChatRequest):
         current_envelope = request.current_schedule.model_dump() if request.current_schedule else None
         if current_envelope is not None:
             current_envelope["allow_clash"] = bool(request.allow_clash)
+            current_envelope["accurate_travel_time"] = bool(request.accurate_travel_time)
             current_envelope.setdefault("preferences", {})
             current_envelope["preferences"]["allow_clash"] = bool(request.allow_clash)
+            current_envelope["preferences"]["accurate_travel_time"] = bool(request.accurate_travel_time)
 
         # Optimization: Create a lightweight context for the LLM
         lightweight_schedule = None
@@ -252,6 +292,7 @@ async def chat_with_llm(request: ChatRequest):
                 "activities": clean_activities,
                 "version": request.current_schedule.version,
                 "allow_clash": bool(request.allow_clash),
+                "accurate_travel_time": bool(request.accurate_travel_time),
             }
 
         # Fetch saved locations for the user to provide context to LLM
@@ -265,6 +306,7 @@ async def chat_with_llm(request: ChatRequest):
         )
         parsed.setdefault("preferences", {})
         parsed["preferences"]["allow_clash"] = bool(request.allow_clash)
+        parsed["preferences"]["accurate_travel_time"] = bool(request.accurate_travel_time)
         
         intent = parsed.get("intent", "chat")
         reply = parsed.get("reply", "I've processed your request.")
@@ -298,6 +340,7 @@ async def chat_with_llm(request: ChatRequest):
                     base_version=request.current_schedule.version,
                     new_date=parsed.get("date"),
                     target_date_envelope=target_date_envelope,
+                    saved_locations=saved_locations,
                 )
                 
                 reply_meta = scheduling_engine.compose_result_reply(
@@ -332,6 +375,7 @@ async def chat_with_llm(request: ChatRequest):
             parsed=parsed,
             current_schedule=current_envelope,
             latest_request=request.message,
+            saved_locations=saved_locations,
         )
         
         schedule_dict = result.get("schedule_data")
@@ -382,11 +426,13 @@ async def apply_operations_endpoint(scheduleId: str, request: SchedulePatchReque
         shift_target_date = extract_shift_target_date(ops)
         if shift_target_date and shift_target_date != current_plan.get("date"):
             target_date_envelope = database.get_plan_by_date(shift_target_date, request.user_id)
+        saved_locations = database.get_user_locations(request.user_id)
         result = scheduling_engine.apply_operations(
             envelope=current_plan,
             operations=ops,
             base_version=request.baseVersion,
             target_date_envelope=target_date_envelope,
+            saved_locations=saved_locations,
         )
         
         updated_envelope = result["envelope"]
@@ -405,6 +451,12 @@ async def apply_operations_endpoint(scheduleId: str, request: SchedulePatchReque
             planning_mode=updated_envelope.get("planning_mode", "feasibility_first"),
             allow_clash=bool(updated_envelope.get("allow_clash", False)),
             conflicts=updated_envelope.get("conflicts"),
+            warnings=updated_envelope.get("warnings"),
+            schedule_status=updated_envelope.get("schedule_status"),
+            accurate_travel_time=bool(updated_envelope.get("accurate_travel_time", False)),
+            travel_validation_status=updated_envelope.get("travel_validation_status"),
+            location_resolution_requests=updated_envelope.get("location_resolution_requests"),
+            route_conflicts=updated_envelope.get("route_conflicts"),
             unmet_items=updated_envelope.get("unmet_items"),
             validation_issues=updated_envelope.get("validation_issues"),
         )
@@ -474,12 +526,19 @@ async def save_plan_endpoint(plan: PlanRequest):
             preferences={
                 "allow_clash": bool(plan.allow_clash),
                 "planning_mode": plan.planning_mode,
+                "accurate_travel_time": bool(plan.accurate_travel_time),
             },
             status=plan.status or "ok",
+            schedule_status=plan.schedule_status or plan.status or "ok",
+            travel_validation_status=plan.travel_validation_status or "not_requested",
             conflict=plan.conflict,
             planning_mode=plan.planning_mode,
             allow_clash=bool(plan.allow_clash),
+            accurate_travel_time=bool(plan.accurate_travel_time),
             conflicts=plan.conflicts,
+            warnings=plan.warnings,
+            location_resolution_requests=plan.location_resolution_requests,
+            route_conflicts=plan.route_conflicts,
             unmet_items=plan.unmet_items,
             validation_issues=plan.validation_issues,
         )
@@ -619,6 +678,79 @@ async def get_locations(user_id: str):
 @app.post("/api/locations")
 async def add_location(user_id: str, label: str, address: str, lat: float = None, lng: float = None):
     return database.add_user_location(user_id, label, address, lat, lng)
+
+@app.get("/api/locations/geocode")
+async def geocode_location(query: str, category: Optional[str] = None):
+    expanded = travel_service.expand_alias(query, category)
+    try:
+        geocode_result = travel_service.geocode_candidates_with_metadata(expanded, category=category, limit=5)
+        return {
+            "query": query,
+            "expanded_query": expanded,
+            **geocode_result,
+        }
+    except Exception as exc:
+        warning = f"Geocoding unavailable: {exc}"
+        return {
+            "query": query,
+            "expanded_query": expanded,
+            "candidates": [],
+            "geocode_status": "fallback_unavailable",
+            "providers_used": [],
+            "warnings": [warning],
+            "warning": warning,
+        }
+
+@app.post("/api/locations/resolve")
+async def resolve_location(request: LocationResolveRequest):
+    lat = request.latitude
+    lng = request.longitude
+    display_name = request.display_name or request.label
+    address = request.address
+    source = request.source or "ors_geocoded"
+
+    if lat is None or lng is None:
+        expanded = travel_service.expand_alias(address or request.label, request.category)
+        candidates = travel_service.geocode_candidates(expanded, limit=5)
+        if not candidates:
+            raise HTTPException(status_code=400, detail="No geocoding candidates found for this location")
+        return {
+            "requires_confirmation": True,
+            "expanded_query": expanded,
+            "candidates": candidates,
+        }
+
+    return database.add_user_location(
+        request.user_id,
+        request.label,
+        address,
+        lat,
+        lng,
+        display_name=display_name,
+        source=source,
+        confirmed_by_user=request.confirmed_by_user,
+    )
+
+@app.post("/api/travel/complete", response_model=ScheduleEnvelope)
+async def complete_travel_validation(request: TravelCompleteRequest):
+    envelope = request.schedule.model_dump()
+    envelope["accurate_travel_time"] = True
+    envelope.setdefault("preferences", {})
+    envelope["preferences"]["accurate_travel_time"] = True
+    schedule_id = envelope.get("scheduleId") or envelope.get("schedule_id") or "(draft)"
+    print(
+        f"[TRAVEL][COMPLETE] Starting accurate travel validation "
+        f"schedule_id={schedule_id} date={envelope.get('date')}"
+    )
+    saved_locations = database.get_user_locations(request.user_id)
+    validated = scheduling_engine._apply_accurate_travel_if_requested(envelope, saved_locations)
+    print(
+        f"[TRAVEL][VALIDATION] travel_validation_status={validated.get('travel_validation_status')}"
+    )
+    print(
+        f"[TRAVEL][COMPLETE] Updated transition blocks: {validated.get('updated_transition_count', 0)}"
+    )
+    return ScheduleEnvelope(**validated)
 
 @app.delete("/api/locations")
 async def delete_location(user_id: str, label: str):

@@ -6,6 +6,15 @@ import pytest
 sys.path.append(os.path.dirname(__file__))
 
 from scheduling_engine import SchedulingEngine, TimingMode, parse_clock
+from travel_service import TravelService
+
+
+@pytest.fixture(autouse=True)
+def disable_persistent_geocode_cache(monkeypatch):
+    import travel_service
+
+    monkeypatch.setattr(travel_service.database, "get_geocode_cache", lambda **kwargs: None, raising=False)
+    monkeypatch.setattr(travel_service.database, "save_geocode_cache", lambda **kwargs: False, raising=False)
 
 
 class DummyClient:
@@ -115,6 +124,56 @@ class Always503ParserModels:
 class Always503ParserClient:
     def __init__(self):
         self.models = Always503ParserModels()
+
+
+class FakeTravelService:
+    def __init__(self, route_minutes=12, route_error=None, geocode_candidates=None):
+        self.route_minutes_value = route_minutes
+        self.route_error = route_error
+        self.geocode_candidates_value = geocode_candidates or []
+        self.route_calls = 0
+        self.geocode_calls = 0
+
+    def expand_alias(self, label, category=None):
+        if str(label).lower() == "mmu":
+            return "Multimedia University Cyberjaya, Selangor, Malaysia"
+        return label
+
+    def saved_location_matches(self, label, category, saved_locations):
+        key = (str(label or "") + " " + str(category or "")).lower()
+        matches = []
+        for saved in saved_locations or []:
+            haystack = " ".join(str(saved.get(field) or "") for field in ("label", "display_name", "address", "category")).lower()
+            if any(part and part in haystack for part in key.split()):
+                matches.append(saved)
+        return matches
+
+    def confirmed_saved_location(self, label, category, saved_locations):
+        for saved in self.saved_location_matches(label, category, saved_locations):
+            if saved.get("latitude") is not None and saved.get("longitude") is not None:
+                return saved
+        return None
+
+    def format_saved_match(self, saved):
+        return {
+            "label": saved.get("label"),
+            "display_name": saved.get("display_name") or saved.get("label"),
+            "address": saved.get("address"),
+            "latitude": saved.get("latitude"),
+            "longitude": saved.get("longitude"),
+            "source": saved.get("source") or "saved_profile",
+            "confirmed_by_user": bool(saved.get("confirmed_by_user", True)),
+        }
+
+    def geocode_candidates(self, query, limit=5):
+        self.geocode_calls += 1
+        return self.geocode_candidates_value[:limit]
+
+    def route_minutes(self, from_coord, to_coord, transport_mode="driving-car", time_bucket=None):
+        self.route_calls += 1
+        if self.route_error:
+            raise self.route_error
+        return self.route_minutes_value
 
 
 def _initial_parsed_request():
@@ -1299,7 +1358,7 @@ def test_location_normalizer_defaults_gym_to_fitness_center():
     assert gym["location_status"] == "resolved_default"
 
 
-def test_busy_workday_grocery_location_is_store_not_llm_home():
+def test_busy_workday_location_mentions_are_scoped_to_nearest_activity():
     engine = SchedulingEngine(DummyClient())
     request_text = (
         "Generate a busy workday for me, this is for 24th of May. At that day I have a "
@@ -1316,21 +1375,824 @@ def test_busy_workday_grocery_location_is_store_not_llm_home():
     for operation in parsed["operations"]:
         if operation["title"] == "Grocery Shopping":
             operation["location"] = "home"
+        if operation["title"] == "Project Meeting":
+            operation["location"] = "school"
+        if operation["title"] == "FYP Implementation":
+            operation["location"] = "school"
 
     envelope = engine.build_schedule_response(
         parsed=parsed,
         current_schedule=None,
         latest_request=request_text,
     )["schedule_data"]
+    meeting = _activity_by_title(envelope, "Project Meeting")
+    seminar = _activity_by_title(envelope, "Seminar")
+    lunch = _activity_by_title(envelope, "Lunch")
+    fyp = _activity_by_title(envelope, "FYP Implementation")
     grocery = _activity_by_title(envelope, "Grocery Shopping")
+    gym = _activity_by_title(envelope, "Gym Workout")
     grocery_block = next(
         block
         for block in envelope["schedule_blocks"]
         if block.get("block_type") == "activity" and block.get("title") == "Grocery Shopping"
     )
 
+    assert meeting["location"] == "office"
+    assert meeting["location_category"] == "office"
+    assert meeting["location_source"] == "explicit_user"
+    assert meeting["location"] != "library"
+    assert seminar["location"] == "library"
+    assert seminar["location_source"] == "explicit_user"
+    assert lunch["location"] == "school"
+    assert lunch["location_category"] == "campus_area"
+    assert lunch["location_source"] == "explicit_user"
+    assert fyp["location"] == "school"
+    assert fyp["location_category"] == "workplace"
     assert grocery["location"] != "home"
+    assert grocery["location"] != "office"
+    assert grocery["location"] != "library"
     assert grocery["location"] in {"store", "supermarket", "market"}
     assert grocery["location_category"] == "supermarket"
+    assert gym["location"] == "gym"
+    assert gym["location"] != "office"
+    assert gym["location"] != "library"
     assert grocery_block["location"] != "home"
     assert grocery_block["location_category"] == "supermarket"
+
+
+def test_location_normalizer_does_not_leak_library_to_meeting():
+    engine = SchedulingEngine(DummyClient())
+    request_text = "Meeting at Main Office, followed by Seminar at Library."
+    parsed = {
+        "intent": "add",
+        "reply": "Draft created.",
+        "transcription": request_text,
+        "date": "2026-05-02",
+        "preferences": {"allow_clash": False},
+        "operations": [
+            {"op": "add", "title": "Meeting", "duration_minutes": 60, "location": "school"},
+            {"op": "add", "title": "Seminar", "duration_minutes": 60, "location": "library"},
+        ],
+    }
+
+    envelope = engine.build_schedule_response(
+        parsed=parsed,
+        current_schedule=None,
+        latest_request=request_text,
+    )["schedule_data"]
+
+    meeting = _activity_by_title(envelope, "Meeting")
+    seminar = _activity_by_title(envelope, "Seminar")
+    assert meeting["location"] == "office"
+    assert meeting["location_source"] == "explicit_user"
+    assert seminar["location"] == "library"
+    assert meeting["location"] != seminar["location"]
+
+
+def test_location_normalizer_does_not_leak_library_to_lunch():
+    engine = SchedulingEngine(DummyClient())
+    request_text = "Seminar at Library. Lunch near campus."
+    parsed = {
+        "intent": "add",
+        "reply": "Draft created.",
+        "transcription": request_text,
+        "date": "2026-05-02",
+        "preferences": {"allow_clash": False},
+        "operations": [
+            {"op": "add", "title": "Seminar", "duration_minutes": 60, "location": "library"},
+            {"op": "add", "title": "Lunch", "duration_minutes": 60, "location": "library"},
+        ],
+    }
+
+    envelope = engine.build_schedule_response(
+        parsed=parsed,
+        current_schedule=None,
+        latest_request=request_text,
+    )["schedule_data"]
+
+    seminar = _activity_by_title(envelope, "Seminar")
+    lunch = _activity_by_title(envelope, "Lunch")
+    assert seminar["location"] == "library"
+    assert lunch["location"] == "school"
+    assert lunch["location_category"] == "campus_area"
+    assert lunch["location_source"] == "explicit_user"
+
+
+def test_location_normalizer_allows_explicit_shared_location_wording():
+    engine = SchedulingEngine(DummyClient())
+    request_text = "Meeting and Seminar both at the Library."
+    parsed = {
+        "intent": "add",
+        "reply": "Draft created.",
+        "transcription": request_text,
+        "date": "2026-05-02",
+        "preferences": {"allow_clash": False},
+        "operations": [
+            {"op": "add", "title": "Meeting", "duration_minutes": 60},
+            {"op": "add", "title": "Seminar", "duration_minutes": 60},
+        ],
+    }
+
+    envelope = engine.build_schedule_response(
+        parsed=parsed,
+        current_schedule=None,
+        latest_request=request_text,
+    )["schedule_data"]
+
+    assert _activity_by_title(envelope, "Meeting")["location"] == "library"
+    assert _activity_by_title(envelope, "Seminar")["location"] == "library"
+
+
+def test_location_normalizer_allows_same_phrase_shared_campus_location():
+    engine = SchedulingEngine(DummyClient())
+    request_text = "Lunch and Study at campus."
+    parsed = {
+        "intent": "add",
+        "reply": "Draft created.",
+        "transcription": request_text,
+        "date": "2026-05-02",
+        "preferences": {"allow_clash": False},
+        "operations": [
+            {"op": "add", "title": "Lunch", "duration_minutes": 60},
+            {"op": "add", "title": "Study", "duration_minutes": 60},
+        ],
+    }
+
+    envelope = engine.build_schedule_response(
+        parsed=parsed,
+        current_schedule=None,
+        latest_request=request_text,
+    )["schedule_data"]
+
+    assert _activity_by_title(envelope, "Lunch")["location"] == "school"
+    assert _activity_by_title(envelope, "Lunch")["location_source"] == "explicit_user"
+    assert _activity_by_title(envelope, "Study")["location"] == "school"
+    assert _activity_by_title(envelope, "Study")["location_source"] == "explicit_user"
+
+
+def test_accurate_travel_off_keeps_heuristic_without_location_pending():
+    engine = SchedulingEngine(DummyClient(), travel_service=FakeTravelService())
+    parsed = {
+        "intent": "add",
+        "reply": "Draft created.",
+        "transcription": "Fit in a grocery shopping trip.",
+        "date": "2026-05-02",
+        "preferences": {"accurate_travel_time": False},
+        "operations": [
+            {"op": "add", "title": "Grocery Shopping", "duration_minutes": 45, "location": "home"},
+        ],
+    }
+
+    envelope = engine.build_schedule_response(parsed, None, "Fit in a grocery shopping trip.")["schedule_data"]
+
+    assert envelope["accurate_travel_time"] is False
+    assert envelope["travel_validation_status"] == "not_requested"
+    assert envelope["location_resolution_requests"] == []
+    assert envelope["status"] != "location_pending"
+
+
+def test_accurate_travel_on_missing_location_returns_location_pending_with_candidates():
+    fake_travel = FakeTravelService(geocode_candidates=[
+        {
+            "display_name": "Supermarket Cyberjaya",
+            "address": "Cyberjaya, Selangor",
+            "latitude": 2.92,
+            "longitude": 101.65,
+            "source": "ors_geocoded",
+        }
+    ])
+    engine = SchedulingEngine(DummyClient(), travel_service=fake_travel)
+    parsed = {
+        "intent": "add",
+        "reply": "Draft created.",
+        "transcription": "Fit in a grocery shopping trip.",
+        "date": "2026-05-02",
+        "preferences": {"accurate_travel_time": True},
+        "operations": [
+            {"op": "add", "title": "Grocery Shopping", "duration_minutes": 45, "location": "home"},
+        ],
+    }
+
+    envelope = engine.build_schedule_response(parsed, None, "Fit in a grocery shopping trip.")["schedule_data"]
+
+    assert envelope["schedule_status"] == "location_pending"
+    assert envelope["travel_validation_status"] == "pending_locations"
+    assert envelope["location_resolution_requests"]
+    request = envelope["location_resolution_requests"][0]
+    assert request["title"] == "Grocery Shopping"
+    assert request["category"] == "supermarket"
+    assert request["geocode_candidates"][0]["display_name"] == "Supermarket Cyberjaya"
+    assert fake_travel.geocode_calls >= 1
+
+
+def test_accurate_travel_with_saved_coordinates_uses_route_service():
+    fake_travel = FakeTravelService(route_minutes=18)
+    engine = SchedulingEngine(DummyClient(), travel_service=fake_travel)
+    parsed = {
+        "intent": "add",
+        "reply": "Draft created.",
+        "transcription": "Meeting at Main Office followed by Seminar at Library.",
+        "date": "2026-05-02",
+        "preferences": {"accurate_travel_time": True},
+        "operations": [
+            {"op": "add", "title": "Meeting", "timing_mode": TimingMode.FIXED, "fixed_start": "09:00", "duration_minutes": 60, "location": "office"},
+            {"op": "add", "title": "Seminar", "timing_mode": TimingMode.FIXED, "fixed_start": "10:30", "duration_minutes": 60, "location": "library"},
+        ],
+    }
+    saved_locations = [
+        {"label": "office", "address": "Main Office", "latitude": 2.9, "longitude": 101.6},
+        {"label": "library", "address": "Library", "latitude": 2.91, "longitude": 101.61},
+    ]
+
+    envelope = engine.build_schedule_response(
+        parsed,
+        None,
+        "Meeting at Main Office followed by Seminar at Library.",
+        saved_locations=saved_locations,
+    )["schedule_data"]
+    transition = next(block for block in envelope["schedule_blocks"] if block.get("block_type") == "transition")
+
+    assert envelope["travel_validation_status"] == "validated"
+    assert transition["travel_estimate_source"] == "routing_service"
+    assert transition["route_duration_minutes"] == 18
+    assert fake_travel.route_calls == 1
+
+
+def test_complete_travel_validation_clears_location_pending_state():
+    fake_travel = FakeTravelService(route_minutes=18)
+    engine = SchedulingEngine(DummyClient(), travel_service=fake_travel)
+    pending_envelope = {
+        "date": "2026-05-02",
+        "status": "location_pending",
+        "schedule_status": "location_pending",
+        "travel_validation_status": "pending_locations",
+        "accurate_travel_time": True,
+        "preferences": {"accurate_travel_time": True},
+        "location_resolution_requests": [
+            {"activity_id": "meeting", "title": "Meeting"},
+        ],
+        "validation_issues": [
+            "Accurate travel time is pending location confirmation for Meeting.",
+        ],
+        "schedule_blocks": [
+            {
+                "block_type": "activity",
+                "id": "meeting",
+                "stable_activity_id": "meeting",
+                "title": "Meeting",
+                "start": "09:00 AM",
+                "end": "10:00 AM",
+                "location": "office",
+                "location_label": "office",
+            },
+            {
+                "block_type": "transition",
+                "title": "Travel to library",
+                "start": "10:00 AM",
+                "end": "10:30 AM",
+                "duration_minutes": 30,
+            },
+            {
+                "block_type": "activity",
+                "id": "seminar",
+                "stable_activity_id": "seminar",
+                "title": "Seminar",
+                "start": "10:30 AM",
+                "end": "11:30 AM",
+                "location": "library",
+                "location_label": "library",
+            },
+        ],
+        "activities": [],
+        "warnings": [],
+    }
+    saved_locations = [
+        {"label": "office", "address": "Main Office", "latitude": 2.9, "longitude": 101.6},
+        {"label": "library", "address": "Library", "latitude": 2.91, "longitude": 101.61},
+    ]
+
+    envelope = engine._apply_accurate_travel_if_requested(pending_envelope, saved_locations)
+
+    assert envelope["travel_validation_status"] == "validated"
+    assert envelope["schedule_status"] == "ok"
+    assert envelope["status"] == "ok"
+    assert envelope["location_resolution_requests"] == []
+    assert envelope["validation_issues"] == []
+
+
+def test_complete_travel_validation_uses_event_level_resolved_locations():
+    fake_travel = FakeTravelService(route_minutes=18)
+    engine = SchedulingEngine(DummyClient(), travel_service=fake_travel)
+    pending_envelope = {
+        "date": "2026-05-02",
+        "status": "location_pending",
+        "schedule_status": "location_pending",
+        "travel_validation_status": "pending_locations",
+        "accurate_travel_time": True,
+        "preferences": {"accurate_travel_time": True},
+        "location_resolution_requests": [
+            {"activity_id": "meeting", "title": "Meeting"},
+            {"activity_id": "seminar", "title": "Seminar"},
+        ],
+        "validation_issues": [
+            "Accurate travel time is pending location confirmation for Meeting.",
+            "Accurate travel time is pending location confirmation for Seminar.",
+        ],
+        "schedule_blocks": [
+            {
+                "block_type": "activity",
+                "id": "meeting",
+                "stable_activity_id": "meeting",
+                "title": "Meeting",
+                "start": "09:00 AM",
+                "end": "10:00 AM",
+                "location": "Main Office map point",
+                "location_label": "Main Office map point",
+                "resolved_location": {
+                    "display_name": "Main Office map point",
+                    "latitude": 2.9,
+                    "longitude": 101.6,
+                    "source": "event_confirmed",
+                    "confirmed_by_user": True,
+                },
+            },
+            {
+                "block_type": "transition",
+                "title": "Travel to Library map point",
+                "start": "10:00 AM",
+                "end": "10:30 AM",
+                "duration_minutes": 30,
+            },
+            {
+                "block_type": "activity",
+                "id": "seminar",
+                "stable_activity_id": "seminar",
+                "title": "Seminar",
+                "start": "10:30 AM",
+                "end": "11:30 AM",
+                "location": "Library map point",
+                "location_label": "Library map point",
+                "resolved_location": {
+                    "display_name": "Library map point",
+                    "latitude": 2.91,
+                    "longitude": 101.61,
+                    "source": "manual_map_pin",
+                    "confirmed_by_user": True,
+                },
+            },
+        ],
+        "activities": [],
+        "warnings": [],
+    }
+
+    envelope = engine._apply_accurate_travel_if_requested(pending_envelope, saved_locations=[])
+    transition = next(block for block in envelope["schedule_blocks"] if block.get("block_type") == "transition")
+
+    assert envelope["travel_validation_status"] == "validated"
+    assert envelope["schedule_status"] == "ok"
+    assert envelope["location_resolution_requests"] == []
+    assert transition["travel_estimate_source"] == "routing_service"
+    assert transition["from_coordinate"] == {"latitude": 2.9, "longitude": 101.6}
+    assert transition["to_coordinate"] == {"latitude": 2.91, "longitude": 101.61}
+    assert fake_travel.route_calls == 1
+
+
+def test_accurate_route_duration_retimes_transition_and_creates_idle_slack():
+    fake_travel = FakeTravelService(route_minutes=4)
+    engine = SchedulingEngine(DummyClient(), travel_service=fake_travel)
+    pending_envelope = {
+        "date": "2026-05-02",
+        "status": "location_pending",
+        "schedule_status": "location_pending",
+        "travel_validation_status": "pending_locations",
+        "accurate_travel_time": True,
+        "preferences": {"accurate_travel_time": True},
+        "location_resolution_requests": [],
+        "validation_issues": [
+            "Accurate travel time is pending location confirmation for Seminar.",
+        ],
+        "explanations": [
+            "Accurate travel time is pending until the requested locations are confirmed.",
+        ],
+        "activities": [
+            {
+                "id": "meeting",
+                "stable_activity_id": "meeting",
+                "title": "Project Meeting",
+                "startTime": "09:00 AM",
+                "endTime": "10:30 AM",
+                "location": "office",
+                "location_label": "office",
+            },
+            {
+                "id": "seminar",
+                "stable_activity_id": "seminar",
+                "title": "Seminar",
+                "startTime": "11:00 AM",
+                "endTime": "12:30 PM",
+                "location": "library",
+                "location_label": "library",
+            },
+        ],
+        "schedule_blocks": [
+            {
+                "block_type": "activity",
+                "id": "meeting",
+                "stable_activity_id": "meeting",
+                "title": "Project Meeting",
+                "start": "09:00 AM",
+                "end": "10:30 AM",
+                "startTime": "09:00 AM",
+                "endTime": "10:30 AM",
+                "location": "office",
+                "location_label": "office",
+            },
+            {
+                "block_type": "idle",
+                "title": "Free Time",
+                "start": "10:30 AM",
+                "end": "10:35 AM",
+                "duration_minutes": 5,
+            },
+            {
+                "block_type": "buffer",
+                "title": "Prep / Buffer",
+                "start": "10:35 AM",
+                "end": "10:40 AM",
+                "duration_minutes": 5,
+            },
+            {
+                "block_type": "transition",
+                "title": "Travel to library",
+                "start": "10:40 AM",
+                "end": "11:00 AM",
+                "duration_minutes": 20,
+                "from_location": "office",
+                "to_location": "library",
+            },
+            {
+                "block_type": "activity",
+                "id": "seminar",
+                "stable_activity_id": "seminar",
+                "title": "Seminar",
+                "start": "11:00 AM",
+                "end": "12:30 PM",
+                "startTime": "11:00 AM",
+                "endTime": "12:30 PM",
+                "location": "library",
+                "location_label": "library",
+            },
+        ],
+        "warnings": [],
+    }
+    saved_locations = [
+        {"label": "office", "display_name": "Main Office", "address": "Main Office", "latitude": 2.9, "longitude": 101.6, "source": "saved_profile"},
+        {"label": "library", "display_name": "Library", "address": "Library", "latitude": 2.91, "longitude": 101.61, "source": "saved_profile"},
+    ]
+
+    envelope = engine._apply_accurate_travel_if_requested(pending_envelope, saved_locations)
+    travel = next(block for block in envelope["schedule_blocks"] if block.get("block_type") == "transition")
+    new_idle = next(
+        block for block in envelope["schedule_blocks"]
+        if block.get("block_type") == "idle" and block.get("start") == "10:40 AM"
+    )
+    seminar = next(block for block in envelope["schedule_blocks"] if block.get("title") == "Seminar")
+
+    assert travel["start"] == "10:56 AM"
+    assert travel["end"] == "11:00 AM"
+    assert travel["duration_minutes"] == 4
+    assert travel["route_duration_minutes"] == 4
+    assert parse_clock(travel["end"]) - parse_clock(travel["start"]) == travel["duration_minutes"]
+    assert travel["travel_estimate_source"] == "routing_service"
+    assert travel["travel_validation_status"] == "validated"
+    assert new_idle["end"] == "10:56 AM"
+    assert new_idle["duration_minutes"] == 16
+    assert seminar["start"] == "11:00 AM"
+    assert envelope["travel_validation_status"] == "validated"
+    assert envelope["location_resolution_requests"] == []
+    assert not any("pending" in explanation.lower() for explanation in envelope["explanations"])
+    assert "Accurate travel time has been validated using the routing service." in envelope["explanations"]
+    assert all(activity.get("resolved_location") for activity in envelope["activities"])
+    assert all(activity.get("location_status") == "resolved" for activity in envelope["activities"])
+
+
+def test_accurate_travel_with_coordinates_and_ors_failure_uses_fallback_not_location_pending():
+    fake_travel = FakeTravelService(route_error=RuntimeError("ORS down"))
+    engine = SchedulingEngine(DummyClient(), travel_service=fake_travel)
+    parsed = {
+        "intent": "add",
+        "reply": "Draft created.",
+        "transcription": "Meeting at Main Office followed by Seminar at Library.",
+        "date": "2026-05-02",
+        "preferences": {"accurate_travel_time": True},
+        "operations": [
+            {"op": "add", "title": "Meeting", "timing_mode": TimingMode.FIXED, "fixed_start": "09:00", "duration_minutes": 60, "location": "office"},
+            {"op": "add", "title": "Seminar", "timing_mode": TimingMode.FIXED, "fixed_start": "10:30", "duration_minutes": 60, "location": "library"},
+        ],
+    }
+    saved_locations = [
+        {"label": "office", "address": "Main Office", "latitude": 2.9, "longitude": 101.6},
+        {"label": "library", "address": "Library", "latitude": 2.91, "longitude": 101.61},
+    ]
+
+    envelope = engine.build_schedule_response(
+        parsed,
+        None,
+        "Meeting at Main Office followed by Seminar at Library.",
+        saved_locations=saved_locations,
+    )["schedule_data"]
+
+    assert envelope["travel_validation_status"] == "fallback_used"
+    assert envelope["schedule_status"] != "location_pending"
+    assert envelope["warnings"]
+
+
+def test_travel_service_expands_mmu_alias_before_geocoding():
+    service = TravelService(api_key=None)
+
+    assert service.expand_alias("MMU") == "Multimedia University Cyberjaya, Selangor, Malaysia"
+
+
+def test_travel_service_biases_malaysia_geocoding(monkeypatch):
+    calls = []
+
+    class FakeRequestsResponse:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.payload
+
+    def fake_get(url, params, timeout, headers=None):
+        calls.append({"url": url, "params": params, "timeout": timeout})
+        if "openrouteservice" in url:
+            return FakeRequestsResponse({"features": []})
+        return FakeRequestsResponse([])
+
+    import travel_service
+
+    monkeypatch.setattr(travel_service.requests, "get", fake_get)
+    service = TravelService(api_key="fake-key")
+
+    service.geocode_candidates("The Arc Cyberjaya Malaysia")
+
+    ors_call = next(call for call in calls if "openrouteservice" in call["url"])
+    assert ors_call["params"]["boundary.country"] == "MYS"
+    assert ors_call["params"]["focus.point.lat"]
+    assert ors_call["params"]["focus.point.lon"]
+
+
+def test_travel_service_skips_nominatim_when_ors_candidate_is_good(monkeypatch):
+    calls = []
+
+    class FakeRequestsResponse:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.payload
+
+    def fake_get(url, params, timeout, headers=None):
+        calls.append({"url": url, "params": params, "headers": headers})
+        if "openrouteservice" in url:
+            return FakeRequestsResponse({
+                "features": [
+                    {
+                        "geometry": {"coordinates": [101.6373443, 2.9248643]},
+                        "properties": {
+                            "label": "The Arc @ Cyberjaya, Cyberjaya, Selangor, Malaysia",
+                            "country": "Malaysia",
+                            "region": "Selangor",
+                            "confidence": 1,
+                        },
+                    }
+                ]
+            })
+        raise AssertionError("Nominatim should not be called when ORS has a good candidate")
+
+    import travel_service
+
+    monkeypatch.setattr(travel_service.requests, "get", fake_get)
+    service = TravelService(api_key="fake-key")
+
+    result = service.geocode_candidates_with_metadata("The Arc Cyberjaya Malaysia")
+
+    assert result["geocode_status"] == "ok"
+    assert result["providers_used"] == ["ors"]
+    assert result["candidates"][0]["source"] == "ors_geocoded"
+    assert all("nominatim" not in call["url"] for call in calls)
+
+
+def test_travel_service_uses_nominatim_when_ors_candidates_are_unrelated(monkeypatch):
+    class FakeRequestsResponse:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.payload
+
+    def fake_get(url, params, timeout, headers=None):
+        if "openrouteservice" in url:
+            return FakeRequestsResponse({
+                "features": [
+                    {
+                        "geometry": {"coordinates": [-0.22698, 51.97965]},
+                        "properties": {
+                            "label": "The Arcade, Letchworth Garden City, England, United Kingdom",
+                            "country": "United Kingdom",
+                            "region": "England",
+                            "confidence": 1,
+                        },
+                    }
+                ]
+            })
+        return FakeRequestsResponse([
+            {
+                "display_name": "The Arc @ Cyberjaya, Cyberjaya, Sepang, Selangor, Malaysia",
+                "lat": "2.9248643",
+                "lon": "101.6373443",
+                "importance": 0.7,
+                "address": {"country": "Malaysia", "state": "Selangor", "city": "Cyberjaya"},
+            }
+        ])
+
+    import travel_service
+
+    monkeypatch.setattr(travel_service.requests, "get", fake_get)
+    service = TravelService(api_key="fake-key")
+    service.nominatim_min_interval_seconds = 0
+
+    result = service.geocode_candidates_with_metadata("The Arc Cyberjaya Malaysia")
+    candidates = result["candidates"]
+
+    assert candidates[0]["display_name"].startswith("The Arc @ Cyberjaya")
+    assert candidates[0]["source"] == "nominatim_geocoded"
+    assert result["providers_used"] == ["ors", "nominatim"]
+
+
+def test_travel_service_nominatim_cache_hit_avoids_http(monkeypatch):
+    cached = [
+        {
+            "display_name": "Cached The Arc",
+            "address": "Cyberjaya, Malaysia",
+            "latitude": 2.9248643,
+            "longitude": 101.6373443,
+            "source": "nominatim_geocoded",
+        }
+    ]
+
+    import travel_service
+
+    monkeypatch.setattr(
+        travel_service.database,
+        "get_geocode_cache",
+        lambda normalized_query, provider, country_hint=None, category_hint=None: cached if provider == "nominatim" else None,
+        raising=False,
+    )
+
+    def fail_get(*args, **kwargs):
+        raise AssertionError("HTTP should not be called for a persistent cache hit")
+
+    monkeypatch.setattr(travel_service.requests, "get", fail_get)
+    service = TravelService(api_key="fake-key")
+
+    candidates = service._nominatim_geocode_candidates("The Arc Cyberjaya Malaysia", 5, "my", None)
+
+    assert candidates == cached
+
+
+def test_travel_service_saves_ors_geocode_cache(monkeypatch):
+    saved = []
+
+    class FakeRequestsResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "features": [
+                    {
+                        "geometry": {"coordinates": [101.6373443, 2.9248643]},
+                        "properties": {
+                            "label": "The Arc @ Cyberjaya, Malaysia",
+                            "country": "Malaysia",
+                            "region": "Selangor",
+                        },
+                    }
+                ]
+            }
+
+    import travel_service
+
+    monkeypatch.setattr(travel_service.requests, "get", lambda *args, **kwargs: FakeRequestsResponse())
+    monkeypatch.setattr(
+        travel_service.database,
+        "save_geocode_cache",
+        lambda **kwargs: saved.append(kwargs) or True,
+        raising=False,
+    )
+    service = TravelService(api_key="fake-key")
+
+    result = service.geocode_candidates_with_metadata("The Arc Cyberjaya Malaysia")
+
+    assert result["candidates"]
+    assert saved
+    assert saved[0]["provider"] == "ors"
+    assert saved[0]["normalized_query"] == "the arc cyberjaya malaysia"
+
+
+def test_travel_service_nominatim_throttle_serializes_requests(monkeypatch):
+    sleeps = []
+
+    class FakeRequestsResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return []
+
+    import travel_service
+
+    travel_service._LAST_NOMINATIM_REQUEST_AT = 0.0
+    monkeypatch.setattr(travel_service.requests, "get", lambda *args, **kwargs: FakeRequestsResponse())
+    monkeypatch.setattr(travel_service.time, "sleep", lambda seconds: sleeps.append(seconds))
+    service = TravelService(api_key="fake-key")
+    service.nominatim_min_interval_seconds = 1.0
+
+    service._nominatim_geocode_candidates("first uncached place", 5, None, None)
+    service._nominatim_geocode_candidates("second uncached place", 5, None, None)
+
+    assert any(wait >= 0.9 for wait in sleeps)
+
+
+def test_travel_service_nominatim_failure_returns_ors_candidates_with_warning(monkeypatch):
+    class FakeRequestsResponse:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.payload
+
+    def fake_get(url, params, timeout, headers=None):
+        if "openrouteservice" in url:
+            return FakeRequestsResponse({
+                "features": [
+                    {
+                        "geometry": {"coordinates": [-0.22698, 51.97965]},
+                        "properties": {
+                            "label": "The Arcade, Letchworth Garden City, England, United Kingdom",
+                            "country": "United Kingdom",
+                            "region": "England",
+                        },
+                    }
+                ]
+            })
+        raise RuntimeError("Nominatim down")
+
+    import travel_service
+
+    monkeypatch.setattr(travel_service.requests, "get", fake_get)
+    service = TravelService(api_key="fake-key")
+    service.nominatim_min_interval_seconds = 0
+
+    result = service.geocode_candidates_with_metadata("The Arc Cyberjaya Malaysia")
+
+    assert result["geocode_status"] == "partial"
+    assert result["providers_used"] == ["ors"]
+    assert result["candidates"][0]["source"] == "ors_geocoded"
+    assert any("fallback search" in warning for warning in result["warnings"])
+
+
+def test_travel_service_dedupes_nearby_same_named_candidates():
+    service = TravelService(api_key=None)
+    first = {
+        "display_name": "The Arc @ Cyberjaya",
+        "address": "The Arc @ Cyberjaya, Cyber 11, Cyberjaya, Selangor, Malaysia",
+        "latitude": 2.9248643,
+        "longitude": 101.6373443,
+        "source": "nominatim_geocoded",
+    }
+    second = {
+        "display_name": "The Arc Cyberjaya",
+        "address": "The Arc Cyberjaya, Persiaran Bestari, Cyber 11, Cyberjaya, Selangor, Malaysia",
+        "latitude": 2.9251,
+        "longitude": 101.6377,
+        "source": "nominatim_geocoded",
+    }
+
+    merged = service._merge_geocode_candidates([second], [first], 5)
+
+    assert len(merged) == 1
+    assert merged[0]["display_name"] == "The Arc @ Cyberjaya"

@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { useParams } from "react-router-dom";
-import { getPlanByDate } from "../services/planService";
+import { completeTravelValidation, geocodeLocation, getPlanByDate, getSavedLocations, type GeocodeCandidate, type SavedLocation } from "../services/planService";
 import { Button } from "./ui/button";
 import { Textarea } from "./ui/textarea";
 import { Input } from "./ui/input";
@@ -25,6 +25,7 @@ import type { DailySchedule, ActivityBlock } from "../App";
 import { EventEditModal } from "./EventEditModal";
 import { useAuth } from "../context/AuthContext";
 import { TimelineGrid } from "./TimelineGrid";
+import { LocationPickerDialog, candidateToMapPoint, type MapPoint } from "./LocationPickerDialog";
 
 
 type PlanningInputPageProps = {
@@ -34,6 +35,23 @@ type PlanningInputPageProps = {
   selectedDate: Date;
   initialSchedule: DailySchedule | null;
   onUpdateSchedule: (schedule: DailySchedule) => void;
+};
+
+type LocationResolutionRequest = {
+  activity_id: string;
+  title: string;
+  category?: string;
+  current_guess?: string;
+  expanded_query?: string;
+  reason?: string;
+  saved_matches?: GeocodeCandidate[];
+  geocode_candidates?: GeocodeCandidate[];
+  affected_transitions?: Array<{
+    from_activity?: string;
+    to_activity?: string;
+    from_location?: string;
+    to_location?: string;
+  }>;
 };
 
 export function PlanningInputPage({
@@ -62,6 +80,14 @@ export function PlanningInputPage({
     activities: []
   });
   const [allowClash, setAllowClash] = useState<boolean>(Boolean(initialSchedule?.allow_clash));
+  const [accurateTravelTime, setAccurateTravelTime] = useState<boolean>(Boolean(initialSchedule?.accurate_travel_time));
+  const [locationInputs, setLocationInputs] = useState<Record<string, string>>({});
+  const [locationCandidates, setLocationCandidates] = useState<Record<string, GeocodeCandidate[]>>({});
+  const [resolvingLocationId, setResolvingLocationId] = useState<string | null>(null);
+  const [mapPickerRequest, setMapPickerRequest] = useState<LocationResolutionRequest | null>(null);
+  const [mapPickerCandidate, setMapPickerCandidate] = useState<GeocodeCandidate | null>(null);
+  const [isSavingMapPin, setIsSavingMapPin] = useState(false);
+  const [savedLocationsForPicker, setSavedLocationsForPicker] = useState<SavedLocation[]>([]);
 
   // Auto-load data on mount/refresh if missing
   useEffect(() => {
@@ -72,6 +98,7 @@ export function PlanningInputPage({
           if (data) {
             setPreviewSchedule(data as DailySchedule);
             setAllowClash(Boolean((data as DailySchedule).allow_clash));
+            setAccurateTravelTime(Boolean((data as DailySchedule).accurate_travel_time));
           }
         } catch (err) {
           console.error("Failed to auto-load schedule:", err);
@@ -80,6 +107,13 @@ export function PlanningInputPage({
       loadData();
     }
   }, [isoDateStr, user, initialSchedule]);
+
+  useEffect(() => {
+    if (!user?.id) return;
+    getSavedLocations(user.id)
+      .then(setSavedLocationsForPicker)
+      .catch((error) => console.error("Failed to fetch saved locations for picker:", error));
+  }, [user?.id]);
   // Store the original schedule string for comparison to detect changes
   const originalScheduleJson = useRef(JSON.stringify(initialSchedule || {
     date: isoDateStr,
@@ -92,10 +126,16 @@ export function PlanningInputPage({
       onUpdateSchedule({
         ...previewSchedule,
         allow_clash: allowClash,
+        accurate_travel_time: accurateTravelTime,
+        preferences: {
+          ...(previewSchedule.preferences || {}),
+          allow_clash: allowClash,
+          accurate_travel_time: accurateTravelTime,
+        },
         planning_mode: allowClash ? "clash_allowed" : "feasibility_first",
       });
     }
-  }, [previewSchedule, onUpdateSchedule, allowClash]);
+  }, [previewSchedule, onUpdateSchedule, allowClash, accurateTravelTime]);
 
   const [editingEvent, setEditingEvent] = useState<ActivityBlock | null>(null);
   const [showExitConfirmation, setShowExitConfirmation] = useState(false);
@@ -111,7 +151,7 @@ export function PlanningInputPage({
   // Chat state
   const [chatInput, setChatInput] = useState("");
   const [isProcessing, setIsProcessing] = useState(false);
-  const [conversationHistory, setConversationHistory] = useState<Array<{ role: "user" | "assistant", message: string, status?: "success" | "partial" | "warning" | "conflict" | "error" }>>([
+  const [conversationHistory, setConversationHistory] = useState<Array<{ role: "user" | "assistant", message: string, status?: "success" | "partial" | "warning" | "location_pending" | "conflict" | "error" }>>([
     {
       role: "assistant",
       message: "Hi! I'm your planning assistant. I'll generate a draft schedule here first. Nothing is saved until you press Save & Implement Plan."
@@ -342,6 +382,7 @@ export function PlanningInputPage({
           current_schedule: previewSchedule, // send current schedule if any
           user_id: user?.id,
           allow_clash: allowClash,
+          accurate_travel_time: accurateTravelTime,
         }),
       });
 
@@ -362,6 +403,7 @@ export function PlanningInputPage({
         setPreviewSchedule({
           ...(data.schedule_data as DailySchedule),
           allow_clash: allowClash,
+          accurate_travel_time: accurateTravelTime,
         });
       }
     } catch (error) {
@@ -373,6 +415,229 @@ export function PlanningInputPage({
       setIsProcessing(false);
     }
   };
+
+  const pendingLocationRequests = (previewSchedule?.location_resolution_requests || []) as LocationResolutionRequest[];
+  const isLocationPending = previewSchedule?.schedule_status === "location_pending" || previewSchedule?.status === "location_pending";
+
+  const normalizeLocationTarget = (value?: string | null) => (value || "").trim().toLowerCase();
+
+  const matchesLocationRequest = (item: Partial<ActivityBlock>, request: LocationResolutionRequest) => {
+    const requestId = String(request.activity_id || "");
+    const itemId = String(item.stable_activity_id || item.id || "");
+    if (requestId && itemId && requestId === itemId) return true;
+    return normalizeLocationTarget(item.title) === normalizeLocationTarget(request.title);
+  };
+
+  const attachResolvedLocation = (
+    item: ActivityBlock,
+    request: LocationResolutionRequest,
+    candidate: GeocodeCandidate,
+  ): ActivityBlock => {
+    if (!matchesLocationRequest(item, request)) return item;
+
+    const displayName = candidate.display_name || candidate.address || request.current_guess || request.title;
+    const address = candidate.address || candidate.display_name || request.current_guess || request.title;
+    const savedLocationLabel = candidate.label || (candidate.source === "saved_profile" ? candidate.display_name : undefined);
+    const resolvedLocation = {
+      label: savedLocationLabel || request.current_guess || request.title,
+      display_name: displayName,
+      address,
+      category: request.category,
+      latitude: candidate.latitude,
+      longitude: candidate.longitude,
+      source: candidate.source || "event_confirmed",
+      confirmed_by_user: candidate.confirmed_by_user ?? true,
+      resolved_for_activity_id: request.activity_id,
+      saved_location_label: savedLocationLabel,
+    };
+
+    return {
+      ...item,
+      location: displayName,
+      location_label: displayName,
+      location_category: request.category || item.location_category,
+      location_status: "resolved",
+      location_source: candidate.source || "event_confirmed",
+      location_warning: undefined,
+      saved_location_label: savedLocationLabel || item.saved_location_label,
+      resolved_location: resolvedLocation,
+    };
+  };
+
+  const applyResolvedLocationToDraft = (request: LocationResolutionRequest, candidate: GeocodeCandidate) => {
+    setPreviewSchedule(prev => {
+      if (!prev) return prev;
+      const remaining = ((prev.location_resolution_requests || []) as LocationResolutionRequest[])
+        .filter(item => item.activity_id !== request.activity_id);
+      return {
+        ...prev,
+        activities: (prev.activities || []).map(item => attachResolvedLocation(item, request, candidate)),
+        schedule_blocks: (prev.schedule_blocks || []).map(item => attachResolvedLocation(item, request, candidate)),
+        location_resolution_requests: remaining,
+        schedule_status: remaining.length ? prev.schedule_status : "location_pending",
+        travel_validation_status: remaining.length ? prev.travel_validation_status : "pending_locations",
+        validation_issues: (prev.validation_issues || []).filter(issue => !String(issue).includes(request.title)),
+      };
+    });
+    setLocationCandidates(prev => {
+      const next = { ...prev };
+      delete next[request.activity_id];
+      return next;
+    });
+  };
+
+  const openLocationMapPicker = (request: LocationResolutionRequest, candidate?: GeocodeCandidate) => {
+    setMapPickerRequest(request);
+    setMapPickerCandidate(candidate || null);
+  };
+
+  const handleSearchLocation = async (request: LocationResolutionRequest) => {
+    const query = locationInputs[request.activity_id] || request.current_guess || request.title;
+    if (!query.trim()) return;
+    setResolvingLocationId(request.activity_id);
+    try {
+      const result = await geocodeLocation(query, request.category);
+      setLocationCandidates(prev => ({
+        ...prev,
+        [request.activity_id]: result.candidates || [],
+      }));
+      openLocationMapPicker(request, (result.candidates || [])[0]);
+      if (!result.candidates?.length) {
+        setConversationHistory(prev => [...prev, {
+          role: "assistant",
+          message: `I couldn't find candidates for ${request.title}. You can still pin it manually on the map.`,
+          status: "warning",
+        }]);
+      }
+    } catch (error) {
+      setConversationHistory(prev => [...prev, {
+        role: "assistant",
+        message: "I couldn't search that location right now. Try a more specific address or use a saved place.",
+        status: "warning",
+      }]);
+    } finally {
+      setResolvingLocationId(null);
+    }
+  };
+
+  const handleConfirmLocation = async (request: LocationResolutionRequest, candidate: GeocodeCandidate) => {
+    setResolvingLocationId(request.activity_id);
+    try {
+      applyResolvedLocationToDraft(request, candidate);
+      setConversationHistory(prev => [...prev, {
+        role: "assistant",
+        message: `Confirmed ${request.title} at ${candidate.display_name || candidate.address || request.current_guess || request.title}. This map point is attached to the current draft.`,
+        status: "success",
+      }]);
+    } catch (error) {
+      setConversationHistory(prev => [...prev, {
+        role: "assistant",
+        message: error instanceof Error ? error.message : "I couldn't attach that location to the draft.",
+        status: "warning",
+      }]);
+    } finally {
+      setResolvingLocationId(null);
+    }
+  };
+
+  const handleConfirmMapLocation = async (candidate: GeocodeCandidate) => {
+    if (!mapPickerRequest) return;
+    setIsSavingMapPin(true);
+    try {
+      await handleConfirmLocation(mapPickerRequest, {
+        ...candidate,
+        source: candidate.source || "manual_map_pin",
+      });
+      setMapPickerRequest(null);
+      setMapPickerCandidate(null);
+    } finally {
+      setIsSavingMapPin(false);
+    }
+  };
+
+  const handleCompleteTravelValidation = async () => {
+    if (!previewSchedule || !user?.id) return;
+    setIsProcessing(true);
+    try {
+      const validated = await completeTravelValidation({
+        ...previewSchedule,
+        accurate_travel_time: true,
+        preferences: {
+          ...(previewSchedule.preferences || {}),
+          accurate_travel_time: true,
+        },
+      }, user.id);
+      setPreviewSchedule({
+        ...validated,
+        allow_clash: allowClash,
+        accurate_travel_time: true,
+      });
+      setConversationHistory(prev => [...prev, {
+        role: "assistant",
+        message: validated.travel_validation_status === "validated"
+          ? "Travel-aware validation is complete with accurate route timing."
+          : "I rechecked travel timing. Some route timing still needs attention, so I marked it in the draft.",
+        status: validated.schedule_status === "route_conflict" ? "conflict" : validated.travel_validation_status === "fallback_used" ? "warning" : "success",
+      }]);
+    } catch (error) {
+      setConversationHistory(prev => [...prev, {
+        role: "assistant",
+        message: error instanceof Error ? error.message : "I couldn't complete travel validation.",
+        status: "warning",
+      }]);
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const mapDialogExistingCandidate = (() => {
+    if (!mapPickerRequest || !previewSchedule) return null;
+    const source = [
+      ...(previewSchedule.activities || []),
+      ...(previewSchedule.schedule_blocks || []),
+    ].find(item => matchesLocationRequest(item, mapPickerRequest));
+    const resolved = source?.resolved_location;
+    if (!resolved) return null;
+    return {
+      display_name: resolved.display_name || source?.location_label || source?.location || mapPickerRequest.title,
+      address: resolved.address || resolved.display_name || source?.location_label || mapPickerRequest.title,
+      latitude: resolved.latitude,
+      longitude: resolved.longitude,
+      source: resolved.source || "event_confirmed",
+    } satisfies GeocodeCandidate;
+  })();
+
+  const mapDialogCandidates = (() => {
+    if (!mapPickerRequest) return [];
+    const all = [
+      ...(mapPickerCandidate ? [mapPickerCandidate] : []),
+      ...(mapDialogExistingCandidate ? [mapDialogExistingCandidate] : []),
+      ...(locationCandidates[mapPickerRequest.activity_id] || []),
+      ...(mapPickerRequest.geocode_candidates || []),
+    ];
+    const seen = new Set<string>();
+    return all.filter(candidate => {
+      const key = `${candidate.latitude.toFixed(6)}:${candidate.longitude.toFixed(6)}:${candidate.display_name || candidate.address || ""}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  })();
+  const mapDialogInitialCenter: MapPoint | null = candidateToMapPoint(mapPickerCandidate || mapDialogExistingCandidate);
+  const mapDialogSavedLocations = (() => {
+    if (!mapPickerRequest) return savedLocationsForPicker;
+    const seen = new Set<string>();
+    const combined = [
+      ...savedLocationsForPicker,
+      ...(mapPickerRequest.saved_matches || []),
+    ];
+    return combined.filter((location) => {
+      const key = `${location.label || ""}:${location.display_name || ""}:${location.address || ""}:${location.latitude}:${location.longitude}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  })();
 
   return (
     <div className="min-h-screen bg-gradient-to-b from-background to-secondary/10">
@@ -477,6 +742,26 @@ export function PlanningInputPage({
               </div>
             </div>
 
+            <div className="flex items-center justify-between rounded-2xl border border-border bg-card px-4 py-3 shadow-sm">
+              <div>
+                <p className="text-sm font-medium">Accurate travel time</p>
+                <p className="text-xs text-muted-foreground">
+                  {accurateTravelTime
+                    ? "On: confirm exact locations before final route validation."
+                    : "Off: use fast heuristic travel estimates."}
+                </p>
+              </div>
+              <div className="flex items-center gap-3">
+                <span className="text-xs text-muted-foreground">Accurate</span>
+                <Switch
+                  checked={accurateTravelTime}
+                  onCheckedChange={setAccurateTravelTime}
+                  disabled={isProcessing}
+                  aria-label="Accurate travel time"
+                />
+              </div>
+            </div>
+
             {/* Dynamic Content Area */}
             <div className="bg-card rounded-2xl border border-border shadow-sm flex flex-col overflow-hidden" style={{ height: "380px" }}>
               {activeMode === "assistant" ? (
@@ -485,12 +770,94 @@ export function PlanningInputPage({
                   <div className="flex-1 overflow-y-auto p-4 space-y-4">
                     {conversationHistory.map((msg, i) => (
                       <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                        <div className={`max-w-[85%] p-3 rounded-2xl text-sm ${msg.role === 'user' ? 'bg-primary text-primary-foreground' : msg.status === 'conflict' ? 'bg-destructive/10 text-destructive border border-destructive/20' : msg.status === 'partial' || msg.status === 'warning' ? 'bg-yellow-50 text-yellow-900 border border-yellow-200' : 'bg-secondary'
+                        <div className={`max-w-[85%] p-3 rounded-2xl text-sm ${msg.role === 'user' ? 'bg-primary text-primary-foreground' : msg.status === 'conflict' ? 'bg-destructive/10 text-destructive border border-destructive/20' : msg.status === 'partial' || msg.status === 'warning' || msg.status === 'location_pending' ? 'bg-yellow-50 text-yellow-900 border border-yellow-200' : 'bg-secondary'
                           }`}>
                           {msg.message}
                         </div>
                       </div>
                     ))}
+                    {pendingLocationRequests.length > 0 && (
+                      <div className="space-y-3">
+                        {pendingLocationRequests.map((request) => {
+                          const savedMatches = request.saved_matches || [];
+                          return (
+                            <div key={request.activity_id} className="rounded-2xl border border-yellow-200 bg-yellow-50 p-3 text-sm text-yellow-950">
+                              <div className="flex items-start gap-2">
+                                <MapPin size={16} className="mt-0.5 shrink-0" />
+                                <div className="min-w-0 flex-1">
+                                  <p className="font-medium">Select location for {request.title}</p>
+                                  <p className="text-xs text-yellow-800">{request.reason}</p>
+                                  {request.affected_transitions?.length ? (
+                                    <p className="mt-1 text-xs text-yellow-800">
+                                      Affects: {request.affected_transitions.map(t => `${t.from_activity || "Previous"} → ${t.to_activity || "Next"}`).join(", ")}
+                                    </p>
+                                  ) : null}
+                                </div>
+                              </div>
+
+                              {savedMatches.length > 0 && (
+                                <div className="mt-3 space-y-1">
+                                  <p className="text-xs font-medium">Saved places</p>
+                                  {savedMatches.map((candidate, index) => (
+                                    <Button
+                                      key={`${candidate.display_name}-${index}`}
+                                      variant="outline"
+                                      size="sm"
+                                      className="mr-2 mt-1 rounded-xl bg-white"
+                                      disabled={resolvingLocationId === request.activity_id}
+                                      onClick={() => handleConfirmLocation(request, candidate)}
+                                    >
+                                      {candidate.label || candidate.display_name || candidate.address || "Saved location"}
+                                    </Button>
+                                  ))}
+                                </div>
+                              )}
+
+                              <div className="mt-3 flex gap-2">
+                                <Input
+                                  value={locationInputs[request.activity_id] ?? request.current_guess ?? ""}
+                                  onChange={(event) => setLocationInputs(prev => ({ ...prev, [request.activity_id]: event.target.value }))}
+                                  placeholder="Search address or place name"
+                                  className="h-9 rounded-xl bg-white"
+                                />
+                                <Button
+                                  size="sm"
+                                  variant="outline"
+                                  className="rounded-xl bg-white"
+                                  disabled={resolvingLocationId === request.activity_id}
+                                  onClick={() => handleSearchLocation(request)}
+                                >
+                                  Search / pick on map
+                                </Button>
+                              </div>
+                            </div>
+                          );
+                        })}
+                        <Button
+                          variant="default"
+                          className="w-full rounded-xl"
+                          disabled={isProcessing || pendingLocationRequests.length > 0}
+                          onClick={handleCompleteTravelValidation}
+                        >
+                          Complete travel-aware schedule
+                        </Button>
+                        {pendingLocationRequests.length > 0 && (
+                          <p className="text-xs text-muted-foreground">
+                            Confirm all pending locations first, then complete accurate travel validation.
+                          </p>
+                        )}
+                      </div>
+                    )}
+                    {isLocationPending && pendingLocationRequests.length === 0 && (
+                      <Button
+                        variant="default"
+                        className="w-full rounded-xl"
+                        disabled={isProcessing}
+                        onClick={handleCompleteTravelValidation}
+                      >
+                        Complete travel-aware schedule
+                      </Button>
+                    )}
                     {isProcessing && (
                       <div className="flex justify-start">
                         <div className="bg-secondary p-3 rounded-2xl animate-pulse text-xs italic">AI is thinking...</div>
@@ -639,12 +1006,18 @@ export function PlanningInputPage({
                 const finalSchedule = {
                   ...(previewSchedule || { date: isoDateStr, activities: [] }),
                   allow_clash: allowClash,
+                  accurate_travel_time: accurateTravelTime,
+                  preferences: {
+                    ...((previewSchedule || {}) as DailySchedule).preferences,
+                    allow_clash: allowClash,
+                    accurate_travel_time: accurateTravelTime,
+                  },
                   planning_mode: allowClash ? "clash_allowed" : "feasibility_first",
                 };
                 onScheduleGenerated(finalSchedule);
               }}
               className="w-full rounded-xl py-6 text-lg font-semibold shadow-lg hover:shadow-xl transition-all"
-              disabled={!previewSchedule || previewSchedule.activities.length === 0 || isProcessing}
+              disabled={!previewSchedule || previewSchedule.activities.length === 0 || isProcessing || isLocationPending}
             >
               {isProcessing ? (
                 <>
@@ -656,7 +1029,7 @@ export function PlanningInputPage({
               ) : (
                 <>
                   <CheckCircle className="mr-2 h-5 w-5" />
-                  Save & Implement Plan
+                  {isLocationPending ? "Resolve locations before saving" : "Save & Implement Plan"}
                 </>
               )}
             </Button>
@@ -733,6 +1106,31 @@ export function PlanningInputPage({
           </div>
         </div>
       ) : null}
+
+      <LocationPickerDialog
+        open={Boolean(mapPickerRequest)}
+        onOpenChange={(open) => {
+          if (!open) {
+            setMapPickerRequest(null);
+            setMapPickerCandidate(null);
+          }
+        }}
+        title={mapPickerRequest ? `Pick location for ${mapPickerRequest.title}` : "Pick location on map"}
+        description={mapPickerRequest ? `Search nearby or click the exact place for ${mapPickerRequest.title}. This point stays attached to the current draft event.` : undefined}
+        label={mapPickerRequest?.title || "this event"}
+        initialCenter={mapDialogInitialCenter}
+        candidates={mapDialogCandidates}
+        savedLocations={mapDialogSavedLocations}
+        initialSearchQuery={
+          mapPickerRequest
+            ? (locationInputs[mapPickerRequest.activity_id] || mapPickerRequest.current_guess || mapPickerRequest.title)
+            : ""
+        }
+        searchCategory={mapPickerRequest?.category}
+        confirmLabel="Use this point for this event"
+        saving={isSavingMapPin}
+        onConfirm={handleConfirmMapLocation}
+      />
     </div >
   );
 }

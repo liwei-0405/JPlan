@@ -1,9 +1,18 @@
 import { useState, useEffect } from "react";
 import { Button } from "./ui/button";
 import { Label } from "./ui/label";
-import { ArrowLeft, Bell, Calendar, Check, Trash2, Plus } from "lucide-react";
+import { AlertCircle, ArrowLeft, Bell, Calendar, Check, Loader2, MapPin, Search, Trash2 } from "lucide-react";
 import { Switch } from "./ui/switch";
 import { useAuth } from "../context/AuthContext";
+import { LocationPickerDialog } from "./LocationPickerDialog";
+import {
+  deleteSavedLocation,
+  geocodeLocation,
+  getSavedLocations,
+  resolveLocation,
+  type GeocodeCandidate,
+  type SavedLocation,
+} from "../services/planService";
 
 type PreferencesPageProps = {
   onBack: () => void;
@@ -22,9 +31,16 @@ export function PreferencesPage({ onBack }: PreferencesPageProps) {
   const [calendarConnected, setCalendarConnected] = useState(true);
 
   // --- Location Management State ---
-  const [savedLocations, setSavedLocations] = useState<any[]>([]);
+  const [savedLocations, setSavedLocations] = useState<SavedLocation[]>([]);
   const [newLocLabel, setNewLocLabel] = useState("");
   const [newLocAddress, setNewLocAddress] = useState("");
+  const [locationCandidates, setLocationCandidates] = useState<GeocodeCandidate[]>([]);
+  const [locationNotice, setLocationNotice] = useState<string | null>(null);
+  const [locationError, setLocationError] = useState<string | null>(null);
+  const [isSearchingLocation, setIsSearchingLocation] = useState(false);
+  const [savingCandidateKey, setSavingCandidateKey] = useState<string | null>(null);
+  const [isMapPickerOpen, setIsMapPickerOpen] = useState(false);
+  const [isSavingMapPin, setIsSavingMapPin] = useState(false);
 
   useEffect(() => {
     if (user) {
@@ -33,39 +49,115 @@ export function PreferencesPage({ onBack }: PreferencesPageProps) {
   }, [user]);
 
   const fetchLocations = async () => {
+    if (!user?.id) return;
     try {
-      const response = await fetch(`http://127.0.0.1:8000/api/locations?user_id=${user?.id}`);
-      if (response.ok) {
-        const data = await response.json();
-        setSavedLocations(data);
-      }
+      const data = await getSavedLocations(user.id);
+      setSavedLocations(data);
     } catch (err) {
       console.error("Failed to fetch locations:", err);
     }
   };
 
-  const handleAddLocation = async () => {
-    if (!user || !newLocLabel || !newLocAddress) return;
+  const handleSearchLocation = async () => {
+    if (!newLocLabel.trim() || !newLocAddress.trim()) return;
+
+    setIsSearchingLocation(true);
+    setLocationCandidates([]);
+    setLocationError(null);
+    setLocationNotice(null);
+
     try {
-      const response = await fetch(`http://127.0.0.1:8000/api/locations?user_id=${user.id}&label=${encodeURIComponent(newLocLabel)}&address=${encodeURIComponent(newLocAddress)}`, {
-        method: "POST"
-      });
-      if (response.ok) {
-        setNewLocLabel("");
-        setNewLocAddress("");
-        fetchLocations();
+      const result = await geocodeLocation(newLocAddress.trim());
+      setLocationCandidates(result.candidates || []);
+      const warningText = result.warnings?.length ? result.warnings.join(" ") : result.warning;
+      if (warningText && result.candidates?.length) {
+        setLocationNotice(warningText);
+      } else if (warningText) {
+        setLocationError(warningText);
+      } else if (!result.candidates?.length) {
+        setLocationError("No location candidates found. Try a more specific place name or address.");
+      } else if (result.expanded_query && result.expanded_query !== newLocAddress.trim()) {
+        setLocationNotice(`Searched as: ${result.expanded_query}`);
       }
     } catch (err) {
-      console.error("Failed to add location:", err);
+      console.error("Failed to search location:", err);
+      setLocationError("Location search failed. Please check the backend ORS configuration.");
+    } finally {
+      setIsSearchingLocation(false);
+    }
+  };
+
+  const handleConfirmCandidate = async (candidate: GeocodeCandidate, index: number) => {
+    if (!user?.id || !newLocLabel.trim()) return;
+    const key = `${candidate.latitude}-${candidate.longitude}-${index}`;
+    setSavingCandidateKey(key);
+    setLocationError(null);
+
+    try {
+      await resolveLocation({
+        user_id: user.id,
+        label: newLocLabel.trim(),
+        address: candidate.address || candidate.display_name || newLocAddress.trim(),
+        display_name: candidate.display_name || candidate.address || newLocLabel.trim(),
+        latitude: candidate.latitude,
+        longitude: candidate.longitude,
+        source: candidate.source || "ors_geocoded",
+        confirmed_by_user: true,
+      });
+      setNewLocLabel("");
+      setNewLocAddress("");
+      setLocationCandidates([]);
+      setLocationNotice("Location saved with a confirmed map point.");
+      await fetchLocations();
+    } catch (err) {
+      console.error("Failed to confirm location:", err);
+      setLocationError("Failed to save this location. Please try another candidate.");
+    } finally {
+      setSavingCandidateKey(null);
+    }
+  };
+
+  const handleOpenMapPicker = () => {
+    setLocationError(null);
+    setLocationNotice(null);
+    setIsMapPickerOpen(true);
+  };
+
+  const handleSaveMapPin = async (candidate: GeocodeCandidate) => {
+    if (!user?.id || !newLocLabel.trim()) return;
+    setIsSavingMapPin(true);
+    setLocationError(null);
+
+    try {
+      const label = newLocLabel.trim();
+      await resolveLocation({
+        user_id: user.id,
+        label,
+        address: candidate.address || candidate.display_name || newLocAddress.trim() || "Pinned map point",
+        display_name: candidate.display_name || candidate.address || newLocAddress.trim() || `${label} map point`,
+        latitude: candidate.latitude,
+        longitude: candidate.longitude,
+        source: candidate.source || "manual_map_pin",
+        confirmed_by_user: true,
+      });
+      setNewLocLabel("");
+      setNewLocAddress("");
+      setLocationCandidates([]);
+      setLocationNotice("Location saved from your map selection.");
+      setIsMapPickerOpen(false);
+      await fetchLocations();
+    } catch (err) {
+      console.error("Failed to save map pin:", err);
+      setLocationError("Failed to save this map point. Please try again.");
+    } finally {
+      setIsSavingMapPin(false);
     }
   };
 
   const handleDeleteLocation = async (label: string) => {
-    if (!user) return;
+    if (!user?.id) return;
     try {
-      await fetch(`http://127.0.0.1:8000/api/locations?user_id=${user.id}&label=${encodeURIComponent(label)}`, {
-        method: "DELETE"
-      });
+      await deleteSavedLocation(user.id, label);
       fetchLocations();
     } catch (err) {
       console.error("Failed to delete location:", err);
@@ -75,6 +167,24 @@ export function PreferencesPage({ onBack }: PreferencesPageProps) {
   const handleSave = () => {
     // In a real app, this would save to backend/local storage
     onBack();
+  };
+
+  const hasCoordinates = (loc: SavedLocation) => (
+    loc.latitude !== null &&
+    loc.latitude !== undefined &&
+    loc.longitude !== null &&
+    loc.longitude !== undefined
+  );
+
+  const mapEmbedUrl = (lat: number, lng: number) => {
+    const delta = 0.006;
+    const bbox = [
+      lng - delta,
+      lat - delta,
+      lng + delta,
+      lat + delta,
+    ].join(",");
+    return `https://www.openstreetmap.org/export/embed.html?bbox=${encodeURIComponent(bbox)}&layer=mapnik&marker=${encodeURIComponent(`${lat},${lng}`)}`;
   };
 
   return (
@@ -266,26 +376,42 @@ export function PreferencesPage({ onBack }: PreferencesPageProps) {
           {/* Saved Locations Section */}
           <div className="bg-card rounded-2xl border border-border p-5 shadow-sm">
             <div className="flex items-center gap-3 mb-4">
-              <Check className="h-5 w-5 text-primary" />
+              <MapPin className="h-5 w-5 text-primary" />
               <h3>Saved Locations</h3>
             </div>
             
             <p className="text-xs text-muted-foreground mb-4">
-              Save places like "Home" or "Campus" to help JPlan calculate travel times.
+              Search and confirm exact places so Accurate Travel Time can reuse the right map point later.
             </p>
 
             {/* Location List */}
-            <div className="space-y-2 mb-4">
+            <div className="space-y-2 mb-5">
               {savedLocations.map((loc) => (
-                <div key={loc.label} className="flex items-center justify-between p-3 bg-secondary/20 rounded-xl border border-border/50 group">
-                  <div className="overflow-hidden">
-                    <p className="text-sm font-medium">{loc.label}</p>
-                    <p className="text-xs text-muted-foreground truncate">{loc.address}</p>
+                <div key={loc.label} className="flex items-start justify-between gap-3 p-3 bg-secondary/20 rounded-xl border border-border/50 group">
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2 mb-1">
+                      <p className="text-sm font-medium">{loc.label}</p>
+                      <span className={`text-[10px] px-2 py-0.5 rounded-full border ${
+                        hasCoordinates(loc)
+                          ? "bg-emerald-500/10 text-emerald-700 border-emerald-500/20"
+                          : "bg-amber-500/10 text-amber-700 border-amber-500/20"
+                      }`}>
+                        {hasCoordinates(loc) ? "Confirmed map point" : "Address only"}
+                      </span>
+                    </div>
+                    <p className="text-xs text-muted-foreground truncate">
+                      {loc.display_name || loc.address || "No address saved"}
+                    </p>
+                    <p className="text-[11px] text-muted-foreground/80 mt-1">
+                      {hasCoordinates(loc) ? "Map point saved" : "No map point saved"}
+                      {loc.source ? ` | ${loc.source}` : ""}
+                      {loc.confirmed_by_user ? " | confirmed" : ""}
+                    </p>
                   </div>
                   <Button 
                     variant="ghost" 
                     size="sm" 
-                    className="h-8 w-8 p-0 opacity-0 group-hover:opacity-100 text-destructive hover:text-destructive hover:bg-destructive/10"
+                    className="h-8 w-8 p-0 shrink-0 opacity-0 group-hover:opacity-100 text-destructive hover:text-destructive hover:bg-destructive/10"
                     onClick={() => handleDeleteLocation(loc.label)}
                   >
                     <Trash2 className="h-4 w-4" />
@@ -300,29 +426,135 @@ export function PreferencesPage({ onBack }: PreferencesPageProps) {
             </div>
 
             {/* Add Location Form */}
-            <div className="grid grid-cols-2 gap-2 mb-2">
-              <input 
-                placeholder="Label (e.g. Home)"
-                value={newLocLabel}
-                onChange={(e) => setNewLocLabel(e.target.value)}
-                className="bg-background border border-border rounded-xl px-3 py-2 text-sm focus:ring-1 focus:ring-primary outline-none"
-              />
-              <input 
-                placeholder="Address / Area"
-                value={newLocAddress}
-                onChange={(e) => setNewLocAddress(e.target.value)}
-                className="bg-background border border-border rounded-xl px-3 py-2 text-sm focus:ring-1 focus:ring-primary outline-none"
-              />
+            <div className="rounded-2xl border border-dashed border-border bg-background/60 p-4">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 mb-3">
+                <div>
+                  <Label htmlFor="location-label" className="text-xs mb-1.5 block">
+                    Label
+                  </Label>
+                  <input
+                    id="location-label"
+                    placeholder="home, campus, gym"
+                    value={newLocLabel}
+                    onChange={(e) => setNewLocLabel(e.target.value)}
+                    className="w-full bg-background border border-border rounded-xl px-3 py-2 text-sm focus:ring-1 focus:ring-primary outline-none"
+                  />
+                </div>
+                <div>
+                  <Label htmlFor="location-search" className="text-xs mb-1.5 block">
+                    Place / Address
+                  </Label>
+                  <input
+                    id="location-search"
+                    placeholder="MMU Cyberjaya, Library..."
+                    value={newLocAddress}
+                    onChange={(e) => {
+                      setNewLocAddress(e.target.value);
+                      setLocationCandidates([]);
+                      setLocationError(null);
+                      setLocationNotice(null);
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        handleSearchLocation();
+                      }
+                    }}
+                    className="w-full bg-background border border-border rounded-xl px-3 py-2 text-sm focus:ring-1 focus:ring-primary outline-none"
+                  />
+                </div>
+              </div>
+
+              <Button
+                variant="outline"
+                className="w-full rounded-xl border-dashed hover:bg-primary/5 hover:border-primary/50"
+                onClick={handleSearchLocation}
+                disabled={!newLocLabel.trim() || !newLocAddress.trim() || isSearchingLocation}
+              >
+                {isSearchingLocation ? (
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                ) : (
+                  <Search className="mr-2 h-4 w-4" />
+                )}
+                Search Location
+              </Button>
+
+              <Button
+                type="button"
+                variant="ghost"
+                className="mt-2 w-full rounded-xl text-primary hover:bg-primary/5"
+                onClick={handleOpenMapPicker}
+                disabled={!newLocLabel.trim()}
+              >
+                <MapPin className="mr-2 h-4 w-4" />
+                Not found? Pick on map
+              </Button>
+
+              <p className="mt-2 text-[11px] text-muted-foreground">
+                Search and map data from OpenRouteService and OpenStreetMap contributors.
+              </p>
+
+              {locationNotice && (
+                <div className="mt-3 rounded-xl border border-emerald-500/20 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-700">
+                  {locationNotice}
+                </div>
+              )}
+
+              {locationError && (
+                <div className="mt-3 flex items-start gap-2 rounded-xl border border-destructive/20 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+                  <AlertCircle className="h-4 w-4 shrink-0 mt-0.5" />
+                  <span>{locationError}</span>
+                </div>
+              )}
+
+              {locationCandidates.length > 0 && (
+                <div className="mt-4 space-y-2">
+                  <p className="text-xs text-muted-foreground">
+                    Choose the correct result by checking the map preview.
+                  </p>
+                  {locationCandidates.map((candidate, index) => {
+                    const key = `${candidate.latitude}-${candidate.longitude}-${index}`;
+                    return (
+                      <div key={key} className="rounded-xl border border-border bg-card p-3">
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="min-w-0">
+                            <p className="text-sm font-medium leading-snug">
+                              {candidate.display_name || candidate.address || "Unnamed location"}
+                            </p>
+                            {candidate.address && candidate.address !== candidate.display_name && (
+                              <p className="text-xs text-muted-foreground mt-1 truncate">
+                                {candidate.address}
+                              </p>
+                            )}
+                            <div className="mt-3 overflow-hidden rounded-xl border border-border">
+                              <iframe
+                                title={`Map preview for ${candidate.display_name || candidate.address || "location candidate"}`}
+                                src={mapEmbedUrl(candidate.latitude, candidate.longitude)}
+                                className="h-32 w-full border-0"
+                                loading="lazy"
+                              />
+                            </div>
+                          </div>
+                          <Button
+                            size="sm"
+                            className="rounded-xl shrink-0"
+                            onClick={() => handleConfirmCandidate(candidate, index)}
+                            disabled={savingCandidateKey !== null}
+                          >
+                            {savingCandidateKey === key ? (
+                              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                            ) : (
+                              <Check className="mr-2 h-4 w-4" />
+                            )}
+                            Save
+                          </Button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
-            <Button 
-              variant="outline" 
-              className="w-full rounded-xl border-dashed hover:bg-primary/5 hover:border-primary/50"
-              onClick={handleAddLocation}
-              disabled={!newLocLabel || !newLocAddress}
-            >
-              <Plus className="mr-2 h-4 w-4" />
-              Add Location
-            </Button>
           </div>
 
           {/* Planning Options */}
@@ -382,6 +614,20 @@ export function PreferencesPage({ onBack }: PreferencesPageProps) {
           </p>
         </div>
       </div>
+
+      <LocationPickerDialog
+        open={isMapPickerOpen}
+        onOpenChange={setIsMapPickerOpen}
+        title="Pick saved location on map"
+        description={`Search nearby or click the exact place for ${newLocLabel.trim() || "this saved location"}.`}
+        label={newLocLabel.trim() || "saved location"}
+        candidates={locationCandidates}
+        savedLocations={savedLocations.filter(hasCoordinates)}
+        initialSearchQuery={newLocAddress}
+        confirmLabel="Save this map point"
+        saving={isSavingMapPin}
+        onConfirm={handleSaveMapPin}
+      />
     </div>
   );
 }

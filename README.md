@@ -8,6 +8,7 @@ JPlan is a modern daily planning interface designed to help users manage their s
 - **AI-Powered Planning**: Integration with Google Gemini AI for intelligent scheduling assistance.
 - **Real-time Sync**: Uses Supabase for robust and fast data persistence.
 - **FastAPI Backend**: A high-performance Python backend for handling logic and API integrations.
+- **Accurate Travel Time Mode**: Optional OpenRouteService-based route validation with confirmed saved locations.
 
 ## 🛠️ Tech Stack
 
@@ -15,6 +16,7 @@ JPlan is a modern daily planning interface designed to help users manage their s
 - **Backend**: FastAPI, Pydantic, Uvicorn, Python.
 - **Database/Auth**: Supabase (PostgreSQL).
 - **AI**: Google GenAI SDK (Gemini).
+- **Travel Routing**: OpenRouteService (optional, only when Accurate Travel Time is enabled).
 
 ---
 
@@ -26,6 +28,7 @@ JPlan is a modern daily planning interface designed to help users manage their s
 - **Python**: Version 3.10 or later.
 - **Supabase Account**: A project set up on Supabase.
 - **Google AI API Key**: For Gemini AI features.
+- **OpenRouteService API Key**: Optional, only required for Accurate Travel Time routing/geocoding.
 
 ### 1. Clone the Repository
 
@@ -84,9 +87,37 @@ source venv/bin/activate
 pip install -r requirements.txt
 
 # Setup backend environment variables
-cp ../.env.example .env
-# Edit .env and fill in the "Backend" & "Google AI" sections
+cp .env.example .env
+# Edit .env and fill in the backend, Google AI, Supabase, and optional ORS sections
 ```
+
+### 4.1 Accurate Travel Time Setup (Optional)
+
+JPlan works without OpenRouteService by using the built-in heuristic travel estimates. When **Accurate Travel Time** is enabled, the backend first builds a fast draft schedule, then validates travel using confirmed coordinates and OpenRouteService routing.
+
+Add these values to `backend/.env` when using location search or accurate routing:
+
+```env
+OPENROUTESERVICE_API_KEY=your_openrouteservice_api_key_here
+JPLAN_NOMINATIM_USER_AGENT=JPlan-FYP/1.0 (location search; contact: your-email@example.com)
+ENABLE_NOMINATIM_FALLBACK=true
+NOMINATIM_MIN_INTERVAL_SECONDS=1.0
+GEOCODE_CACHE_TTL_DAYS=30
+```
+
+Location resolution follows this order:
+
+1. Reuse confirmed saved locations from Supabase.
+2. Expand common aliases such as `MMU`, `campus`, `school`, `Main Office`, and `gym`.
+3. Search OpenRouteService geocoding first.
+4. Use Nominatim/OpenStreetMap only as a low-volume fallback when ORS results are missing or clearly unrelated.
+5. Let the user confirm a candidate, or use the manual map pin fallback when search is still wrong.
+
+When Accurate Travel Time is off, JPlan keeps using the fast heuristic travel-time matrix. When it is on, missing or ambiguous coordinates create a `location_pending` draft until the user confirms locations. ORS route validation runs after draft construction; if ORS is unavailable but coordinates already exist, JPlan falls back to heuristic travel estimates with a warning instead of silently claiming accurate routing.
+
+Public Nominatim usage is intentionally limited for FYP/beta testing: it is never used for autocomplete, only runs after an explicit search/resolve action, is throttled to at least one request per second per backend process, and repeated queries are cached in Supabase `geocode_cache` when available. Search/map UI should show OpenStreetMap attribution, for example: `Search results © OpenStreetMap contributors`.
+
+For a small beta of around 20 users, this setup is acceptable because Nominatim is fallback-only, user-triggered, throttled, and cached. For production/global scale, replace public Nominatim with a paid geocoder or a self-hosted geocoder. Route cache is currently in-memory only; move it to Supabase/Redis before larger public release.
 
 ---
 

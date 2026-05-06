@@ -33,6 +33,30 @@ export type ActivityBlock = {
   start?: string; // Backend compat
   end?: string;   // Backend compat
   location?: string;
+  location_label?: string;
+  location_category?: string;
+  location_status?: string;
+  location_source?: string;
+  location_confidence?: number;
+  location_warning?: string;
+  saved_location_label?: string;
+  resolved_location?: {
+    label?: string;
+    display_name?: string;
+    address?: string;
+    category?: string;
+    latitude: number;
+    longitude: number;
+    source?: string;
+    confirmed_by_user?: boolean;
+    resolved_for_activity_id?: string;
+    saved_location_label?: string;
+  };
+  travel_estimate_source?: "heuristic" | "routing_service" | "fallback" | string;
+  travel_validation_status?: string;
+  route_duration_minutes?: number;
+  from_coordinate?: { latitude: number; longitude: number };
+  to_coordinate?: { latitude: number; longitude: number };
   duration?: string;
   duration_minutes?: number;
   priority?: "low" | "medium" | "high";
@@ -56,8 +80,12 @@ export type DailySchedule = {
   version?: number;
   schema_version?: number;
   status?: "ok" | "partial" | "conflict" | "infeasible" | string;
+  schedule_status?: "ok" | "warning" | "partial" | "conflict" | "location_pending" | "route_conflict" | "infeasible" | string;
+  travel_validation_status?: "not_requested" | "pending_locations" | "validated" | "fallback_used" | "route_conflict" | string;
   planning_mode?: "feasibility_first" | "clash_allowed" | string;
   allow_clash?: boolean;
+  accurate_travel_time?: boolean;
+  preferences?: Record<string, unknown>;
   activities: ActivityBlock[];
   schedule_blocks?: ActivityBlock[];
   explanations?: string[];
@@ -75,6 +103,9 @@ export type DailySchedule = {
     suggested_resolution?: string[];
   }>;
   conflict?: Record<string, unknown> | null;
+  warnings?: Array<Record<string, unknown>>;
+  location_resolution_requests?: Array<Record<string, any>>;
+  route_conflicts?: Array<Record<string, unknown>>;
   unmet_items?: Array<Record<string, unknown>>;
   validation_issues?: string[];
   unscheduled_activities?: Array<{

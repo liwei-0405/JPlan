@@ -27,7 +27,7 @@ export type PatchResponse = {
 
 export type ChatResponse = {
     reply: string;
-    reply_status?: 'success' | 'partial' | 'warning' | 'conflict' | 'error';
+    reply_status?: 'success' | 'partial' | 'warning' | 'location_pending' | 'conflict' | 'error';
     recommend_allow_clash?: boolean;
     reply_reason?: string | null;
     patch?: PatchResponse;
@@ -44,6 +44,7 @@ export async function chatWithLLM(
     currentSchedule: DailySchedule | null,
     history: any[] = [],
     allowClash: boolean = false,
+    accurateTravelTime: boolean = false,
 ): Promise<ChatResponse> {
     try {
         const response = await fetch(`${API_BASE_URL}/chat`, {
@@ -55,6 +56,7 @@ export async function chatWithLLM(
                 current_schedule: currentSchedule,
                 history,
                 allow_clash: allowClash,
+                accurate_travel_time: accurateTravelTime,
             }),
         });
 
@@ -124,6 +126,12 @@ export async function savePlan(schedule: DailySchedule, userId: string): Promise
                 status: schedule.status || "ok",
                 planning_mode: schedule.planning_mode || "feasibility_first",
                 allow_clash: Boolean(schedule.allow_clash),
+                accurate_travel_time: Boolean(schedule.accurate_travel_time),
+                schedule_status: schedule.schedule_status || schedule.status || "ok",
+                travel_validation_status: schedule.travel_validation_status || "not_requested",
+                warnings: schedule.warnings || [],
+                location_resolution_requests: schedule.location_resolution_requests || [],
+                route_conflicts: schedule.route_conflicts || [],
                 conflicts: schedule.conflicts || [],
                 conflict: schedule.conflict || null,
                 unmet_items: schedule.unmet_items || [],
@@ -142,6 +150,97 @@ export async function savePlan(schedule: DailySchedule, userId: string): Promise
         console.error('Exception saving plan:', err);
         return { success: false, error: 'Failed to connect to backend' };
     }
+}
+
+export type GeocodeCandidate = {
+    label?: string;
+    display_name?: string;
+    address?: string;
+    latitude: number;
+    longitude: number;
+    confidence?: number;
+    source?: string;
+    confirmed_by_user?: boolean;
+};
+
+export type SavedLocation = {
+    user_id?: string;
+    label: string;
+    display_name?: string;
+    address?: string;
+    latitude?: number | null;
+    longitude?: number | null;
+    source?: string;
+    confirmed_by_user?: boolean;
+    updated_at?: string;
+};
+
+export async function getSavedLocations(userId: string): Promise<SavedLocation[]> {
+    const response = await fetch(`${API_BASE_URL}/api/locations?user_id=${encodeURIComponent(userId)}`);
+    if (!response.ok) return [];
+    return await response.json();
+}
+
+export async function deleteSavedLocation(userId: string, label: string): Promise<{ success: boolean }> {
+    const response = await fetch(
+        `${API_BASE_URL}/api/locations?user_id=${encodeURIComponent(userId)}&label=${encodeURIComponent(label)}`,
+        { method: 'DELETE' },
+    );
+    if (!response.ok) return { success: false };
+    return await response.json();
+}
+
+export type GeocodeResponse = {
+    candidates: GeocodeCandidate[];
+    warning?: string;
+    warnings?: string[];
+    expanded_query?: string;
+    geocode_status?: 'ok' | 'partial' | 'fallback_unavailable' | 'rate_limited';
+    providers_used?: string[];
+};
+
+export async function geocodeLocation(query: string, category?: string): Promise<GeocodeResponse> {
+    const params = new URLSearchParams({ query });
+    if (category) params.set('category', category);
+    const response = await fetch(`${API_BASE_URL}/api/locations/geocode?${params.toString()}`);
+    if (!response.ok) return { candidates: [], warning: 'Geocoding failed', warnings: ['Geocoding failed'], geocode_status: 'fallback_unavailable' };
+    return await response.json();
+}
+
+export async function resolveLocation(payload: {
+    user_id: string;
+    label: string;
+    address: string;
+    display_name?: string;
+    category?: string;
+    latitude?: number;
+    longitude?: number;
+    source?: string;
+    confirmed_by_user?: boolean;
+}): Promise<any> {
+    const response = await fetch(`${API_BASE_URL}/api/locations/resolve`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+    });
+    if (!response.ok) {
+        const error = await response.json().catch(() => ({ detail: 'Location resolution failed' }));
+        throw new Error(error.detail || 'Location resolution failed');
+    }
+    return await response.json();
+}
+
+export async function completeTravelValidation(schedule: DailySchedule, userId: string): Promise<DailySchedule> {
+    const response = await fetch(`${API_BASE_URL}/api/travel/complete`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ user_id: userId, schedule }),
+    });
+    if (!response.ok) {
+        const error = await response.json().catch(() => ({ detail: 'Travel validation failed' }));
+        throw new Error(error.detail || 'Travel validation failed');
+    }
+    return await response.json();
 }
 
 /**
