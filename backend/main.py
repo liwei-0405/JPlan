@@ -46,7 +46,15 @@ class ScheduleItem(BaseModel):
     start: Optional[str] = None      # Backend V3 compat
     end: Optional[str] = None        # Backend V3 compat
     location: Optional[str] = None
+    location_label: Optional[str] = None
+    location_category: Optional[str] = None
+    location_status: Optional[str] = None
+    location_source: Optional[str] = None
+    location_confidence: Optional[float] = None
     location_normalized: Optional[str] = None
+    raw_llm_location: Optional[str] = None
+    explicit_user_location: Optional[bool] = False
+    location_warning: Optional[str] = None
     duration: Optional[str] = None
     duration_minutes: Optional[int] = None
     priority: Optional[str] = "medium"

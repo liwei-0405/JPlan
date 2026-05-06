@@ -1,5 +1,6 @@
 import json
 import re
+import time
 from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -35,6 +36,35 @@ PRIORITY_WEIGHT = {
 
 PLANNING_MODE_FEASIBILITY = "feasibility_first"
 PLANNING_MODE_CLASH = "clash_allowed"
+WARNING_TIGHT_TRANSITION = "TIGHT_TRANSITION"
+PARSER_RETRY_DELAYS_SECONDS = (0.4, 0.8)
+
+MONTH_NAME_TO_NUMBER = {
+    "jan": 1,
+    "january": 1,
+    "feb": 2,
+    "february": 2,
+    "mar": 3,
+    "march": 3,
+    "apr": 4,
+    "april": 4,
+    "may": 5,
+    "jun": 6,
+    "june": 6,
+    "jul": 7,
+    "july": 7,
+    "aug": 8,
+    "august": 8,
+    "sep": 9,
+    "sept": 9,
+    "september": 9,
+    "oct": 10,
+    "october": 10,
+    "nov": 11,
+    "november": 11,
+    "dec": 12,
+    "december": 12,
+}
 
 CONFLICT_SEVERITY_RULES = {
     "fixed-vs-fixed": "critical",
@@ -87,6 +117,32 @@ SOCIAL_OR_BOOKED_KEYWORDS = {
     "team",
     "trainer",
     "with",
+}
+
+NULL_TEXT_VALUES = {"", "null", "none", "n/a", "na", "nil", "undefined"}
+
+GENERIC_SYSTEM_ACTIVITY_TITLES = {
+    "buffer",
+    "commute",
+    "commuting",
+    "free time",
+    "idle",
+    "prep",
+    "prep buffer",
+    "prep / buffer",
+    "transit",
+    "transition",
+    "travel",
+    "travel time",
+}
+
+GENERIC_SYSTEM_ACTIVITY_TYPES = {
+    "buffer",
+    "free time",
+    "idle",
+    "transit",
+    "transition",
+    "travel",
 }
 
 PARSER_PROMPT = """
@@ -156,6 +212,8 @@ STRICT RULES:
 4. DURATIONS: Use reasonable defaults if not mentioned (e.g. Lunch = 60).
 5. If intent is "chat", leave operations empty.
 6. If the user wants to move the whole plan to another date, use op="shift_plan_date" with from_date, to_date, and scope="all_active_activities".
+7. Do NOT create operations for generic travel, transit, prep, buffer, free-time, or idle blocks. If the user says to account for travel time, keep only the real activities and their locations; the scheduler will add travel blocks automatically.
+8. Keep real travel activities only when they are concrete user commitments, such as "Flight to KL", "Train Ride", "Road Trip", or "Airport Transfer".
 """
 
 
@@ -225,6 +283,14 @@ def parse_duration_minutes(value: Any, minimum: int = 15) -> int:
 def clean_title(title: str) -> str:
     return re.sub(r"\s+", " ", title.strip()).lower()
 
+def clean_optional_text(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if clean_title(text) in NULL_TEXT_VALUES:
+        return None
+    return text
+
 
 # [Module B/C Knowledge] Mock Database for Locations and Travel Times
 LOCATION_ALIASES = {
@@ -233,10 +299,16 @@ LOCATION_ALIASES = {
     "office": "Main Office",
     "main office": "Main Office",
     "campus": "MMU",
+    "school": "MMU",
+    "near campus": "MMU",
+    "campus area": "MMU",
     "mmu": "MMU",
     "university": "MMU",
     "gym": "Fitness Center",
     "fitness center": "Fitness Center",
+    "store": "Store",
+    "supermarket": "Store",
+    "market": "Store",
 }
 
 # Distance matrix (in minutes) between normalized location names
@@ -259,11 +331,19 @@ MOCK_DISTANCE_MATRIX = {
     "Fitness Center": {
         "Home": 15,
         "Main Office": 20,
-        "MMU": 30
+        "MMU": 30,
+        "Store": 15
+    },
+    "Store": {
+        "Home": 20,
+        "Main Office": 20,
+        "MMU": 20,
+        "Fitness Center": 15
     }
 }
 
 def _normalize_location(raw_name: Optional[str]) -> Optional[str]:
+    raw_name = clean_optional_text(raw_name)
     if not raw_name: return None
     clean = clean_title(raw_name)
     return LOCATION_ALIASES.get(clean, raw_name.strip())
@@ -290,15 +370,6 @@ def estimate_travel_minutes(previous_location: Optional[str], next_location: Opt
     
     # Fallback to default travel time
     return 20
-
-
-# Utility functions for location and travel
-
-
-def normalize_optional_text(value: Any) -> str:
-    if value is None:
-        return ""
-    return clean_title(str(value))
 
 
 class SchedulingEngine:
@@ -352,6 +423,7 @@ class SchedulingEngine:
         current_schedule: Optional[Dict[str, Any]],
         latest_request: str,
     ) -> Dict[str, Any]:
+        parsed = self._normalize_parsed_locations(parsed, latest_request, [])
         reply = self._resolve_user_reply(parsed, latest_request)
         transcription = parsed.get("transcription") or latest_request
         intent = parsed.get("intent", "schedule")
@@ -377,6 +449,7 @@ class SchedulingEngine:
         requested_operations = list(parsed.get("operations") or [])
         if not requested_operations:
             requested_operations = [{**activity, "op": "add"} for activity in (parsed.get("activities") or [])]
+        requested_operations = self._sanitize_operations(requested_operations)
 
         for raw_op in requested_operations:
             raw_op = {**raw_op, "_user_message": latest_request}
@@ -403,7 +476,10 @@ class SchedulingEngine:
         active_set = [item for item in canonical_activities if item.get("status") == "active"]
         planned_result = self._plan_schedule(schedule_date, active_set, preferences)
         conflicts = self._build_conflicts(planned_result["activities"], set())
-        status = "partial" if conflicts else "ok"
+        warnings = self._collect_schedule_warnings(planned_result["activities"], planned_result["schedule_blocks"])
+        formatted_activities = [self._format_activity(item) for item in planned_result["activities"]]
+        formatted_unscheduled = [self._format_activity(item) for item in planned_result.get("unscheduled_activities", [])]
+        status = "partial" if conflicts else ("warning" if warnings else "ok")
 
         schedule_data = {
             "schema_version": 4,
@@ -414,11 +490,15 @@ class SchedulingEngine:
             "allow_clash": allow_clash,
             "version": max(1, source_turn),
             "preferences": preferences,
-            "activities": [self._format_activity(item) for item in planned_result["activities"]],
+            "activities": formatted_activities,
             "schedule_blocks": planned_result["schedule_blocks"],
-            "unscheduled_activities": [self._format_activity(item) for item in planned_result.get("unscheduled_activities", [])],
+            "unscheduled_activities": formatted_unscheduled,
             "explanations": self._merge_explanations(parsed.get("explanations", []), planned_result.get("explanations", [])),
             "conflicts": conflicts,
+            "warnings": warnings,
+            "applied_changes": formatted_activities,
+            "accepted_with_warnings": warnings,
+            "rejected_changes": formatted_unscheduled,
             "unmet_items": [],
             "validation_issues": [],
         }
@@ -550,11 +630,7 @@ class SchedulingEngine:
         raw_response_text: Optional[str] = None
 
         try:
-            response = self.client.models.generate_content(
-                model="gemini-3.1-flash-lite-preview",
-                contents=contents,
-                config={"response_mime_type": "application/json"},
-            )
+            response = self._generate_parser_content_with_retry(contents)
             raw_response_text = response.text or ""
             # print(f"\n[JPLAN][LLM_PARSER] --- RAW RESPONSE FROM LLM ---\n{raw_response_text}\n------------------------------------------\n")
             
@@ -574,6 +650,10 @@ class SchedulingEngine:
                 raw_llm_reply = str(parsed.get("reply") or "").strip() or None
         except json.JSONDecodeError as exc:
             self._debug(f"LLM parse exception | type={type(exc).__name__} | message={str(exc)}")
+            fallback = self._deterministic_fallback_parse(latest_request, current_schedule)
+            if fallback:
+                self._debug_json("Deterministic fallback parse result", fallback)
+                return fallback
             invalid = self._invalid_llm_parse(
                 latest_request=latest_request,
                 current_schedule=current_schedule,
@@ -586,6 +666,10 @@ class SchedulingEngine:
             return invalid
         except Exception as exc:
             self._debug(f"LLM call exception | type={type(exc).__name__} | message={str(exc)}")
+            fallback = self._deterministic_fallback_parse(latest_request, current_schedule)
+            if fallback:
+                self._debug_json("Deterministic fallback parse result", fallback)
+                return fallback
             invalid = self._invalid_llm_parse(
                 latest_request=latest_request,
                 current_schedule=current_schedule,
@@ -598,6 +682,10 @@ class SchedulingEngine:
             return invalid
 
         if not isinstance(parsed, dict):
+            fallback = self._deterministic_fallback_parse(latest_request, current_schedule)
+            if fallback:
+                self._debug_json("Deterministic fallback parse result", fallback)
+                return fallback
             invalid = self._invalid_llm_parse(
                 latest_request=latest_request,
                 current_schedule=current_schedule,
@@ -620,11 +708,59 @@ class SchedulingEngine:
         if token_usage:
             parsed["_token_usage"] = token_usage
         parsed = self._normalize_plan_level_operations(parsed, latest_request, current_schedule)
+        parsed = self._normalize_parsed_locations(parsed, latest_request, saved_locations)
         self._debug_json("LLM parsed request", parsed)
         self._debug(
             f"Parsed request | intent={parsed.get('intent')} | parsed_date={parsed.get('date')} | activities={len(parsed.get('activities', []))} | operations={len(parsed.get('operations', []))}"
         )
         return parsed
+
+    def _generate_parser_content_with_retry(self, contents: Any) -> Any:
+        for retry_index in range(len(PARSER_RETRY_DELAYS_SECONDS) + 1):
+            try:
+                response = self.client.models.generate_content(
+                    model="gemini-3.1-flash-lite-preview",
+                    contents=contents,
+                    config={"response_mime_type": "application/json"},
+                )
+                if retry_index > 0:
+                    print("[JPLAN][LLM_RETRY] success on retry")
+                return response
+            except Exception as exc:
+                if self._is_transient_llm_error(exc) and retry_index < len(PARSER_RETRY_DELAYS_SECONDS):
+                    reason = self._transient_error_label(exc)
+                    print(
+                        f"[JPLAN][LLM_RETRY] attempt {retry_index + 1}/{len(PARSER_RETRY_DELAYS_SECONDS)} after {reason}"
+                    )
+                    time.sleep(PARSER_RETRY_DELAYS_SECONDS[retry_index])
+                    continue
+                raise
+
+    def _is_transient_llm_error(self, exc: Exception) -> bool:
+        message = str(exc).lower()
+        transient_markers = (
+            "503",
+            "unavailable",
+            "deadline exceeded",
+            "timeout",
+            "timed out",
+            "temporarily overloaded",
+            "temporary",
+            "high demand",
+        )
+        return any(marker in message for marker in transient_markers)
+
+    def _transient_error_label(self, exc: Exception) -> str:
+        message = str(exc)
+        if "503" in message:
+            return "503"
+        if "UNAVAILABLE" in message.upper():
+            return "UNAVAILABLE"
+        if "deadline" in message.lower():
+            return "deadline exceeded"
+        if "timeout" in message.lower() or "timed out" in message.lower():
+            return "timeout"
+        return "transient error"
 
     def _build_parser_prompt(
         self,
@@ -699,34 +835,236 @@ class SchedulingEngine:
             "_raw_response_text": raw_response_text,
         }
 
-    def _request_implies_whole_plan_shift(
+    def _base_year_for_date_parse(self, current_schedule: Optional[Dict[str, Any]]) -> int:
+        schedule_date = (current_schedule or {}).get("date")
+        if schedule_date:
+            try:
+                return int(str(schedule_date).split("-", 1)[0])
+            except Exception:
+                pass
+        return self._local_now().year
+
+    def _extract_explicit_absolute_date(
+        self,
+        request_text: str,
+        current_schedule: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        matches = self._extract_explicit_absolute_dates(request_text, current_schedule)
+        return matches[-1] if matches else None
+
+    def _extract_explicit_absolute_dates(
+        self,
+        request_text: str,
+        current_schedule: Optional[Dict[str, Any]] = None,
+    ) -> List[str]:
+        text = request_text or ""
+        month_pattern = "|".join(sorted(MONTH_NAME_TO_NUMBER.keys(), key=len, reverse=True))
+        patterns = [
+            re.compile(
+                rf"\b(?P<day>\d{{1,2}})(?:st|nd|rd|th)?\s+(?:of\s+)?(?P<month>{month_pattern})(?:\s*,?\s*(?P<year>\d{{4}}))?\b",
+                re.IGNORECASE,
+            ),
+            re.compile(
+                rf"\b(?P<month>{month_pattern})\s+(?P<day>\d{{1,2}})(?:st|nd|rd|th)?(?:\s*,?\s*(?P<year>\d{{4}}))?\b",
+                re.IGNORECASE,
+            ),
+        ]
+        matches: List[Tuple[int, str]] = []
+        base_year = self._base_year_for_date_parse(current_schedule)
+        for pattern in patterns:
+            for match in pattern.finditer(text):
+                month = MONTH_NAME_TO_NUMBER.get(match.group("month").lower())
+                day = int(match.group("day"))
+                year = int(match.group("year") or base_year)
+                try:
+                    parsed_date = date(year, month, day).isoformat()
+                except Exception:
+                    continue
+                matches.append((match.start(), parsed_date))
+        if not matches:
+            return []
+        matches.sort(key=lambda item: item[0])
+        return [item[1] for item in matches]
+
+    def _apply_deterministic_shift_date_override(
+        self,
+        parsed: Dict[str, Any],
+        latest_request: str,
+        current_schedule: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        target_date = self._extract_explicit_absolute_date(latest_request, current_schedule)
+        if not target_date:
+            return parsed
+
+        candidate = deepcopy(parsed)
+        candidate["date"] = target_date
+        if not self._request_implies_whole_plan_shift(latest_request, current_schedule, candidate):
+            return parsed
+
+        previous_date = parsed.get("date")
+        if previous_date and previous_date != target_date:
+            self._debug(f"[DATE_NORMALIZE] Deterministic shift date override: {previous_date} -> {target_date}")
+        candidate["date"] = target_date
+        for operation in candidate.get("operations") or []:
+            if clean_title(operation.get("op") or "") == "shift_plan_date":
+                previous_to_date = operation.get("to_date")
+                if previous_to_date and previous_to_date != target_date:
+                    self._debug(f"[DATE_NORMALIZE] Deterministic shift operation override: {previous_to_date} -> {target_date}")
+                operation["to_date"] = target_date
+        return candidate
+
+    def _deterministic_fallback_parse(
         self,
         latest_request: str,
         current_schedule: Optional[Dict[str, Any]],
-        parsed: Dict[str, Any],
-    ) -> bool:
-        if not current_schedule or not parsed.get("date"):
-            return False
+    ) -> Optional[Dict[str, Any]]:
+        request = re.sub(r"\s+", " ", latest_request or "").strip()
+        clean_request = clean_title(request)
+        schedule_date = (current_schedule or {}).get("date") or self._local_today_iso()
+        parsed: Optional[Dict[str, Any]] = None
 
-        request_text = clean_title(latest_request)
-        current_date = (current_schedule or {}).get("date")
-        parsed_date = parsed.get("date")
-        if not current_date or not parsed_date or parsed_date == current_date:
-            return False
+        target_date = self._extract_explicit_absolute_date(request, current_schedule)
+        if target_date and self._request_text_implies_whole_plan_shift(clean_request):
+            parsed = {
+                "intent": "edit",
+                "reply": f"I found the target date and will move the whole plan to {target_date}.",
+                "transcription": request,
+                "date": target_date,
+                "operations": [],
+                "activities": [],
+                "preferences": {},
+            }
 
+        if parsed is None:
+            parsed = self._fallback_parse_relative_add(request, schedule_date)
+
+        if parsed is None:
+            parsed = self._fallback_parse_fixed_time_update(request, schedule_date)
+
+        if parsed is None:
+            return None
+
+        parsed["_reply_source"] = "deterministic_fallback"
+        parsed["_llm_reply"] = None
+        parsed["_failure_type"] = "llm_fallback_parse"
+        print("[JPLAN][LLM_FALLBACK_PARSE] Used deterministic fallback parser for simple request")
+        parsed = self._normalize_plan_level_operations(parsed, latest_request, current_schedule)
+        parsed = self._normalize_parsed_locations(parsed, latest_request, [])
+        return parsed
+
+    def _fallback_parse_relative_add(self, request: str, schedule_date: str) -> Optional[Dict[str, Any]]:
+        text = clean_title(request)
+        duration_minutes: Optional[int] = None
+        duration_match = re.search(r"\b(?P<duration>\d{1,3})[-\s]*minute\b", text)
+        if duration_match:
+            duration_minutes = int(duration_match.group("duration"))
+
+        patterns = [
+            re.compile(
+                r"\badd\s+(?:a\s+|an\s+)?(?:quick\s+)?(?:(?P<duration>\d{1,3})[-\s]*minute\s+)?(?P<title>.+?)\s+(?P<kind>right\s+after|right\s+before|after|before)\s+(?:the\s+|my\s+)?(?P<anchor>.+?)(?:\.|$)",
+                re.IGNORECASE,
+            ),
+            re.compile(
+                r"\b(?P<kind>after|before)\s+(?:the\s+|my\s+)?(?P<anchor>.+?)\s+add\s+(?:a\s+|an\s+)?(?P<title>.+?)(?:\.|$)",
+                re.IGNORECASE,
+            ),
+        ]
+        match = next((pattern.search(request) for pattern in patterns if pattern.search(request)), None)
+        if not match:
+            return None
+
+        title = self._clean_fallback_activity_title(match.group("title"))
+        anchor = self._clean_fallback_activity_title(match.group("anchor"))
+        if not title or not anchor:
+            return None
+        if match.groupdict().get("duration"):
+            duration_minutes = int(match.group("duration"))
+
+        kind = clean_title(match.group("kind")).replace("right ", "")
+        operation = {
+            "op": "add",
+            "title": title,
+            "timing_mode": TimingMode.RELATIVE,
+            "anchor_relation": {"kind": kind, "target_title": anchor},
+        }
+        if duration_minutes:
+            operation["duration_minutes"] = duration_minutes
+
+        return {
+            "intent": "edit",
+            "reply": f"I understood this as adding {title} {kind} {anchor}.",
+            "transcription": request,
+            "date": schedule_date,
+            "operations": [operation],
+            "activities": [],
+            "preferences": {},
+        }
+
+    def _fallback_parse_fixed_time_update(self, request: str, schedule_date: str) -> Optional[Dict[str, Any]]:
+        match = re.search(
+            r"\b(?:move|update|change|shift)\s+(?:my\s+|the\s+)?(?P<title>.+?)\s+to\s+(?P<time>\d{1,2}(?::\d{2})?\s*(?:am|pm))\b",
+            request,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return None
+        fixed_start = parse_clock(match.group("time"))
+        if fixed_start is None:
+            return None
+        title = self._clean_fallback_activity_title(match.group("title"))
+        if not title:
+            return None
+        return {
+            "intent": "edit",
+            "reply": f"I understood this as moving {title} to {format_clock(fixed_start)}.",
+            "transcription": request,
+            "date": schedule_date,
+            "operations": [{
+                "op": "update",
+                "title": title,
+                "timing_mode": TimingMode.FIXED,
+                "fixed_start": format_clock(fixed_start),
+            }],
+            "activities": [],
+            "preferences": {},
+        }
+
+    def _clean_fallback_activity_title(self, value: str) -> str:
+        text = re.sub(r"\b(right|quick|my|the)\b", " ", value or "", flags=re.IGNORECASE)
+        text = re.sub(r"\s+", " ", text).strip(" .")
+        return text.title() if text else ""
+
+    def _request_text_implies_whole_plan_shift(self, request_text: str) -> bool:
         whole_plan_patterns = [
-            r"\bmove (this|the|these)? ?(plan|schedule|day)\b",
-            r"\bshift (this|the|whole|entire)? ?(plan|schedule|day)\b",
+            r"\bmove (this|the|these|my)? ?(whole|entire)? ?(plan|schedule|day)\b",
+            r"\bshift (this|the|whole|entire|my)? ?(plan|schedule|day)\b",
             r"\bmove everything\b",
             r"\bmove all\b",
             r"\bwhole plan\b",
             r"\bentire plan\b",
             r"\bwrong date\b",
             r"\bi said wrong about the date\b",
+            r"\bnot\s+\d{1,2}(?:st|nd|rd|th)?\s+(?:it'?s|its)\s+\d{1,2}(?:st|nd|rd|th)?",
             r"\bnot .* make it\b",
         ]
+        return any(re.search(pattern, request_text) for pattern in whole_plan_patterns)
 
-        if any(re.search(pattern, request_text) for pattern in whole_plan_patterns):
+    def _request_implies_whole_plan_shift(
+        self,
+        latest_request: str,
+        current_schedule: Optional[Dict[str, Any]],
+        parsed: Dict[str, Any],
+    ) -> bool:
+        if not current_schedule:
+            return False
+
+        request_text = clean_title(latest_request)
+        current_date = (current_schedule or {}).get("date")
+        parsed_date = parsed.get("date") or self._extract_explicit_absolute_date(latest_request, current_schedule)
+        if not current_date or not parsed_date or parsed_date == current_date:
+            return False
+
+        if self._request_text_implies_whole_plan_shift(request_text):
             return True
 
         for operation in parsed.get("operations") or []:
@@ -745,12 +1083,16 @@ class SchedulingEngine:
         latest_request: str,
         current_schedule: Optional[Dict[str, Any]],
     ) -> Dict[str, Any]:
-        normalized = deepcopy(parsed)
+        normalized = self._apply_deterministic_shift_date_override(
+            deepcopy(parsed),
+            latest_request,
+            current_schedule,
+        )
         if not self._request_implies_whole_plan_shift(latest_request, current_schedule, normalized):
             return normalized
 
         from_date = (current_schedule or {}).get("date")
-        to_date = normalized.get("date")
+        to_date = self._extract_explicit_absolute_date(latest_request, current_schedule) or normalized.get("date")
         if not from_date or not to_date:
             return normalized
 
@@ -765,6 +1107,281 @@ class SchedulingEngine:
         }]
         self._debug(f"[STATE] Normalized whole-plan shift request from {from_date} to {to_date}")
         return normalized
+
+    def _is_generic_system_activity_payload(self, item: Dict[str, Any]) -> bool:
+        title = clean_title(str(item.get("title") or item.get("target_title") or ""))
+        item_type = clean_title(str(item.get("type") or item.get("block_type") or item.get("entity_type") or ""))
+
+        if title in GENERIC_SYSTEM_ACTIVITY_TITLES:
+            return True
+        if item_type in GENERIC_SYSTEM_ACTIVITY_TYPES and title in GENERIC_SYSTEM_ACTIVITY_TITLES:
+            return True
+        return False
+
+    def _sanitize_operation_payload(self, raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        operation = deepcopy(raw)
+        if "location" in operation:
+            operation["location"] = clean_optional_text(operation.get("location"))
+        if "location_normalized" in operation:
+            operation["location_normalized"] = clean_optional_text(operation.get("location_normalized"))
+
+        if self._is_generic_system_activity_payload(operation):
+            self._debug(
+                f"[STATE] Ignored generic system block from parser/current plan: {operation.get('title') or operation.get('type')}"
+            )
+            return None
+        return operation
+
+    def _sanitize_operations(self, operations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        sanitized: List[Dict[str, Any]] = []
+        for raw in operations or []:
+            if not isinstance(raw, dict):
+                continue
+            operation = self._sanitize_operation_payload(raw)
+            if operation:
+                sanitized.append(operation)
+        return sanitized
+
+    def _normalize_parsed_locations(
+        self,
+        parsed: Dict[str, Any],
+        latest_request: str,
+        saved_locations: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        normalized = deepcopy(parsed)
+        transcription = normalized.get("transcription") or latest_request
+        request_text = latest_request or transcription or ""
+        normalized["operations"] = self._normalize_operation_locations(
+            normalized.get("operations") or [],
+            request_text,
+            transcription,
+            saved_locations or [],
+        )
+        normalized["activities"] = self._normalize_operation_locations(
+            normalized.get("activities") or [],
+            request_text,
+            transcription,
+            saved_locations or [],
+        )
+        return normalized
+
+    def _normalize_operation_locations(
+        self,
+        operations: List[Dict[str, Any]],
+        request_text: str,
+        transcription: str,
+        saved_locations: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        normalized: List[Dict[str, Any]] = []
+        for raw in operations:
+            if not isinstance(raw, dict):
+                continue
+            operation = deepcopy(raw)
+            if clean_title(operation.get("op") or "") in {"remove", "shift_plan_date"}:
+                normalized.append(operation)
+                continue
+            if operation.get("location_status") and "raw_llm_location" in operation:
+                normalized.append(operation)
+                continue
+            location_payload = self._resolve_operation_location(
+                operation,
+                request_text=request_text,
+                transcription=transcription,
+                saved_locations=saved_locations,
+            )
+            operation.update(location_payload)
+            normalized.append(operation)
+        return normalized
+
+    def _resolve_operation_location(
+        self,
+        operation: Dict[str, Any],
+        request_text: str,
+        transcription: str,
+        saved_locations: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        title = str(operation.get("title") or operation.get("target_title") or "").strip()
+        raw_location = clean_optional_text(operation.get("location"))
+        evidence = " ".join(value for value in [request_text, transcription, operation.get("notes") or ""] if value)
+        explicit_evidence = self._activity_location_context(evidence, title)
+        explicit_location = self._detect_explicit_location(explicit_evidence, title, raw_location)
+        category = self._infer_location_category(title, evidence)
+
+        if explicit_location:
+            label = explicit_location["label"]
+            category = explicit_location.get("category") or category
+            source = "explicit_user"
+            status = "resolved"
+            confidence = 0.95
+        else:
+            saved = self._match_saved_location_for_category(category, saved_locations)
+            if saved:
+                label = saved["label"]
+                source = "saved_profile"
+                status = "resolved"
+                confidence = 0.9
+            else:
+                label, status, source, confidence = self._deterministic_location_default(
+                    title,
+                    raw_location,
+                    category,
+                    evidence,
+                )
+
+        label = clean_optional_text(label)
+        normalized_location = _normalize_location(label)
+        payload = {
+            "location": label,
+            "location_label": label,
+            "location_category": category or "unknown",
+            "location_status": status,
+            "location_source": source,
+            "location_confidence": confidence,
+            "location_normalized": normalized_location,
+            "raw_llm_location": raw_location,
+            "explicit_user_location": bool(explicit_location),
+        }
+        if status in {"needs_resolution", "fallback_used", "resolved_default"}:
+            payload["location_warning"] = (
+                f"{title or 'Activity'} location was estimated as {label or category} because no exact place was provided."
+            )
+        self._log_location_resolution(title, raw_location, payload)
+        return payload
+
+    def _infer_location_category(self, title: str, evidence: str) -> str:
+        title_text = clean_title(title or "")
+        if self._contains_any_keyword(title_text, {"grocery", "groceries", "shopping", "supermarket", "buy food", "buy groceries"}):
+            return "supermarket"
+        if self._contains_any_keyword(title_text, {"gym", "workout", "exercise"}):
+            return "fitness_center"
+        if self._contains_any_keyword(title_text, {"lunch", "dinner", "meal", "breakfast", "restaurant", "cafe", "coffee"}):
+            return "meal_place"
+        if self._contains_any_keyword(title_text, {"meeting", "seminar", "class", "lecture", "office", "library", "campus"}):
+            return "institution"
+        if self._contains_any_keyword(title_text, {"study", "fyp", "implementation", "coding"}):
+            return "workplace"
+
+        text = clean_title(evidence or "")
+        if self._contains_any_keyword(text, {"grocery", "groceries", "shopping", "supermarket", "buy food", "buy groceries"}):
+            return "supermarket"
+        if self._contains_any_keyword(text, {"gym", "workout", "exercise"}):
+            return "fitness_center"
+        if self._contains_any_keyword(text, {"lunch", "dinner", "meal", "breakfast", "restaurant", "cafe", "coffee"}):
+            return "meal_place"
+        if self._contains_any_keyword(text, {"meeting", "seminar", "class", "lecture", "office", "library", "campus"}):
+            return "institution"
+        if self._contains_any_keyword(text, {"study", "fyp", "implementation", "coding"}):
+            return "workplace"
+        return "unknown"
+
+    def _activity_location_context(self, evidence: str, title: str) -> str:
+        text = re.sub(r"\s+", " ", evidence or "").strip()
+        clean_text = clean_title(text)
+        tokens = [token for token in re.split(r"[^a-z0-9]+", clean_title(title or "")) if token]
+        stop_words = {"quick", "the", "my", "a", "an"}
+        tokens = [token for token in tokens if token not in stop_words]
+        if not tokens:
+            return text
+
+        positions = [clean_text.find(token) for token in tokens if clean_text.find(token) >= 0]
+        if not positions:
+            return text
+        start = max(0, min(positions) - 60)
+        end = min(len(text), max(positions) + 140)
+        return text[start:end]
+
+    def _detect_explicit_location(
+        self,
+        evidence: str,
+        title: str,
+        raw_location: Optional[str],
+    ) -> Optional[Dict[str, str]]:
+        text = clean_title(evidence)
+        explicit_patterns = [
+            (r"\b(?:at|in|from)\s+(?:my\s+|the\s+)?home\b", "home", "home"),
+            (r"\bgo home\b", "home", "home"),
+            (r"\bat\s+(?:the\s+)?library\b", "library", "library"),
+            (r"\bat\s+(?:the\s+)?gym\b", "gym", "fitness_center"),
+            (r"\bnear\s+(?:the\s+)?campus\b", "school", "campus_area"),
+            (r"\bat\s+(?:the\s+)?campus\b", "school", "campus_area"),
+            (r"\bat\s+(?:the\s+)?school\b", "school", "campus_area"),
+            (r"\bat\s+(?:the\s+)?main office\b", "office", "office"),
+            (r"\bat\s+(?:a\s+|the\s+)?(?:cafe|restaurant)\b", "restaurant", "meal_place"),
+            (r"\bonline\b|\bdelivery\b|\bhome delivery\b", "home", "home"),
+        ]
+        for pattern, label, category in explicit_patterns:
+            if re.search(pattern, text):
+                return {"label": label, "category": category}
+
+        raw_clean = clean_title(raw_location or "")
+        if raw_clean and raw_clean not in {"home", "school", "campus", "gym", "office", "library"}:
+            location_pattern = rf"\b(?:at|in|near)\s+(?:the\s+)?{re.escape(raw_clean)}\b"
+            if re.search(location_pattern, text):
+                return {"label": raw_location or raw_clean, "category": self._infer_location_category(title, evidence)}
+        return None
+
+    def _match_saved_location_for_category(
+        self,
+        category: str,
+        saved_locations: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        category_keywords = {
+            "supermarket": {"supermarket", "grocery", "groceries", "market", "store"},
+            "fitness_center": {"gym", "fitness", "workout"},
+            "meal_place": {"restaurant", "cafe", "food", "meal", "lunch", "dinner"},
+            "campus_area": {"campus", "school", "university", "mmu"},
+            "office": {"office", "work"},
+            "library": {"library"},
+            "home": {"home", "house"},
+        }
+        keywords = category_keywords.get(category, set())
+        for saved in saved_locations or []:
+            haystack = clean_title(" ".join(str(saved.get(field) or "") for field in ("label", "address", "category", "type")))
+            if any(keyword in haystack for keyword in keywords):
+                return {"label": saved.get("label") or saved.get("address") or next(iter(keywords))}
+        return None
+
+    def _deterministic_location_default(
+        self,
+        title: str,
+        raw_location: Optional[str],
+        category: str,
+        evidence: str,
+    ) -> Tuple[Optional[str], str, str, float]:
+        text = clean_title(f"{title} {evidence}")
+        raw_clean = clean_title(raw_location or "")
+        if category == "supermarket":
+            return "store", "needs_resolution", "deterministic_default", 0.65
+        if category == "fitness_center":
+            label = raw_location if raw_clean in {"gym", "fitness center"} else "gym"
+            return label, "resolved_default", "deterministic_default", 0.75
+        if category == "meal_place":
+            return None, "needs_resolution", "unresolved", 0.35
+        if category == "institution" and raw_location:
+            return raw_location, "fallback_used", "llm_inferred", 0.55
+        if category == "workplace":
+            if raw_location:
+                return raw_location, "resolved_default", "deterministic_default", 0.6
+            return None, "needs_resolution", "unresolved", 0.3
+        if raw_location:
+            return raw_location, "fallback_used", "llm_inferred", 0.45
+        return None, "needs_resolution", "unresolved", 0.2
+
+    def _log_location_resolution(
+        self,
+        title: str,
+        raw_location: Optional[str],
+        payload: Dict[str, Any],
+    ) -> None:
+        print(
+            "[JPLAN][LOCATION] "
+            f"{title or 'Untitled'} | raw_llm_location={raw_location} | "
+            f"explicit_user_location={str(payload.get('explicit_user_location')).lower()} | "
+            f"normalized={payload.get('location_label')} | "
+            f"category={payload.get('location_category')} | "
+            f"source={payload.get('location_source')} | "
+            f"status={payload.get('location_status')}"
+        )
 
     def _materialize_blocks(
         self, 
@@ -847,6 +1464,8 @@ class SchedulingEngine:
                         "duration_minutes": gap_dur,
                         "from_location": last_loc,
                         "to_location": current_loc,
+                        "is_tight": True,
+                        "warning_code": WARNING_TIGHT_TRANSITION,
                         "reason": "Immediate departure required due to tight schedule"
                     })
 
@@ -862,6 +1481,11 @@ class SchedulingEngine:
                 "endTime": format_clock(end_min),
                 "duration_minutes": end_min - start_min,
                 "location": current_loc,
+                "location_label": act.get("location_label") or current_loc,
+                "location_category": act.get("location_category"),
+                "location_status": act.get("location_status"),
+                "location_source": act.get("location_source"),
+                "location_confidence": act.get("location_confidence"),
                 "notes": act.get("notes"),
                 "is_conflict": act.get("is_conflict", False),
                 "is_conflicting": act.get("is_conflict", False),
@@ -874,65 +1498,59 @@ class SchedulingEngine:
 
         return blocks
 
-    def _build_response(
+    def _find_final_activity_block(
         self,
-        parsed: Dict[str, Any],
-        current_schedule: Optional[Dict[str, Any]],
-        latest_request: str,
-    ) -> Dict[str, Any]:
-        reply = parsed.get("reply") or "I've updated your schedule."
-        transcription = parsed.get("transcription") or latest_request
-        intent = parsed.get("intent", "edit")
+        schedule_blocks: List[Dict[str, Any]],
+        activity: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        activity_id = activity.get("stable_activity_id") or activity.get("id")
+        activity_title = clean_title(activity.get("title") or "")
+        for block in schedule_blocks:
+            if block.get("block_type") != "activity":
+                continue
+            if activity_id and str(block.get("stable_activity_id") or block.get("id")) == str(activity_id):
+                return block
+            if activity_title and clean_title(block.get("title") or "") == activity_title:
+                return block
+        return None
 
-        if intent == "chat" and not parsed.get("operations"):
-            return {
-                "reply": reply,
-                "transcription": transcription,
-                "schedule_data": None,
+    def _collect_schedule_warnings(
+        self,
+        activities: List[Dict[str, Any]],
+        schedule_blocks: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        warnings: List[Dict[str, Any]] = []
+        for activity in activities:
+            if not activity.get("accepted_with_warning") and not activity.get("warning_code"):
+                continue
+            block = self._find_final_activity_block(schedule_blocks, activity)
+            block_index = schedule_blocks.index(block) if block in schedule_blocks else -1
+            tight_transition = None
+            if block_index >= 0 and block_index + 1 < len(schedule_blocks):
+                next_block = schedule_blocks[block_index + 1]
+                if next_block.get("block_type") == "transition" and next_block.get("is_tight"):
+                    tight_transition = next_block
+
+            base_warning = (activity.get("warnings") or [{}])[0]
+            warning = {
+                "warning_code": activity.get("warning_code") or base_warning.get("warning_code") or WARNING_TIGHT_TRANSITION,
+                "activity_id": activity.get("stable_activity_id") or activity.get("id"),
+                "activity_title": activity.get("title"),
+                "anchor_title": base_warning.get("anchor_title"),
+                "start": (block or {}).get("start") or base_warning.get("start"),
+                "end": (block or {}).get("end") or base_warning.get("end"),
+                "explanation": base_warning.get("explanation") or f"{activity.get('title')} was accepted with a scheduling warning.",
             }
-
-        # For "edit" intent, we continue to generate the materialized schedule
-        date = parsed.get("date") or self._local_today_iso()
-        all_activities = self._get_base_activities(current_schedule)
-        
-        # After apply_operations and other logic, we usually get the finalized activities
-        # Note: In a real flow, apply_operations is called BEFORE build_schedule_response
-        blocks = self._materialize_blocks(all_activities, DEFAULT_DAY_START, 0)
-        
-        return {
-            "date": date,
-            "reply": reply,
-            "transcription": transcription,
-            "intent": intent,
-            "activities": all_activities,
-            "schedule_blocks": blocks,
-            "explanations": parsed.get("explanations", []),
-            "version": (current_schedule.get("version", 1) if current_schedule else 1) + 1
-        }
-
-        schedule_date = self._resolve_schedule_date(
-            parsed=parsed,
-            current_schedule=current_schedule,
-            latest_request=latest_request,
-        )
-        self._debug(
-            f"Building schedule response | intent={intent} | resolved_date={schedule_date} | merged_activity_count={len(merged_activities)}"
-        )
-        preferences = parsed.get("preferences") or {}
-        planned_schedule = self._plan_schedule(schedule_date, merged_activities, preferences)
-        if (current_schedule or {}).get("activities"):
-            planned_schedule.setdefault("explanations", [])
-            planned_schedule["explanations"].insert(0, f"Merged into existing plan for {schedule_date}.")
-
-        if planned_schedule["unscheduled_activities"]:
-            skipped = ", ".join(item["title"] for item in planned_schedule["unscheduled_activities"][:3])
-            reply = f"{reply} I kept the plan feasible and could not fit: {skipped}."
-
-        return {
-            "reply": reply,
-            "transcription": transcription,
-            "schedule_data": planned_schedule,
-        }
+            if tight_transition:
+                warning["transition"] = {
+                    "title": tight_transition.get("title"),
+                    "start": tight_transition.get("start"),
+                    "end": tight_transition.get("end"),
+                    "from_location": tight_transition.get("from_location"),
+                    "to_location": tight_transition.get("to_location"),
+                }
+            warnings.append(warning)
+        return warnings
 
     def _resolve_user_reply(self, parsed: Dict[str, Any], latest_request: str) -> str:
         llm_reply = str(parsed.get("_llm_reply") or "").strip()
@@ -992,352 +1610,6 @@ class SchedulingEngine:
             r"\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2}(st|nd|rd|th)?\b",
         ]
         return any(re.search(pattern, text) for pattern in explicit_patterns)
-
-    def _merge_with_current_schedule(
-        self,
-        parsed: Dict[str, Any],
-        current_schedule: Optional[Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
-        existing_map: Dict[str, Dict[str, Any]] = {}
-        title_buckets: Dict[str, List[Dict[str, Any]]] = {}
-        for item in (current_schedule or {}).get("activities", []):
-            if item.get("type") != "activity":
-                continue
-            normalized = self._normalized_existing_activity(item)
-            existing_map[self._activity_identity(normalized)] = normalized
-            title_buckets.setdefault(clean_title(normalized["title"]), []).append(normalized)
-
-        incoming = []
-        for raw in self._collect_requested_items(parsed, current_schedule):
-            normalized = self._normalize_requested_activity(raw)
-            if normalized:
-                incoming.append(normalized)
-        self._debug(
-            f"Merging schedules | existing={len(existing_map)} | incoming={len(incoming)} | intent={parsed.get('intent')}"
-        )
-
-        if not existing_map:
-            return incoming
-
-        if parsed.get("intent") not in {"edit", "schedule"}:
-            return list(existing_map.values()) + incoming if existing_map else incoming
-
-        merged = existing_map
-        for item in incoming:
-            existing = self._find_existing_match(item, merged, title_buckets)
-            if item.get("remove"):
-                if existing:
-                    self._debug(f"Removing existing activity | title={existing.get('title')} | id={existing.get('id')}")
-                    merged.pop(self._activity_identity(existing), None)
-                    title_key = clean_title(existing["title"])
-                    title_buckets[title_key] = [
-                        candidate for candidate in title_buckets.get(title_key, [])
-                        if candidate.get("id") != existing.get("id")
-                    ]
-                continue
-
-            if existing:
-                self._debug(
-                    f"Merging onto existing activity | incoming={item.get('title')} | existing_id={existing.get('id')}"
-                )
-                updated = self._merge_activity(existing, item)
-                old_key = self._activity_identity(existing)
-                new_key = self._activity_identity(updated)
-                merged.pop(old_key, None)
-                merged[new_key] = updated
-
-                title_key = clean_title(existing["title"])
-                title_buckets[title_key] = [
-                    updated if candidate.get("id") == existing.get("id") else candidate
-                    for candidate in title_buckets.get(title_key, [])
-                ]
-            else:
-                self._debug(f"Adding new activity from request | title={item.get('title')} | id={item.get('id')}")
-                merged[self._activity_identity(item)] = item
-                title_buckets.setdefault(clean_title(item["title"]), []).append(item)
-        return list(merged.values())
-
-    def _collect_requested_items(
-        self,
-        parsed: Dict[str, Any],
-        current_schedule: Optional[Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
-        items = list(parsed.get("activities") or [])
-        operations = parsed.get("operations") or []
-        if not operations:
-            return items
-        items.extend(self._operations_to_activities(operations, current_schedule))
-        return items
-
-    def _operations_to_activities(
-        self,
-        operations: List[Dict[str, Any]],
-        current_schedule: Optional[Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
-        translated: List[Dict[str, Any]] = []
-        for operation in operations:
-            if not isinstance(operation, dict):
-                continue
-            op = clean_title(operation.get("op") or "")
-            if op == "shift_plan_date":
-                continue
-            target = self._find_existing_schedule_activity(
-                current_schedule,
-                operation.get("target_id"),
-                operation.get("target_title"),
-            )
-            target_title = operation.get("target_title") or (target or {}).get("title")
-            base_title = operation.get("title") or target_title or "Activity"
-
-            if op == "remove":
-                translated.append({
-                    "target_id": operation.get("target_id") or (target or {}).get("id"),
-                    "title": target_title or base_title,
-                    "duration_minutes": operation.get("duration_minutes") or parse_duration_minutes((target or {}).get("duration")),
-                    "fixed_start": operation.get("fixed_start") or (target or {}).get("startTime"),
-                    "fixed_end": operation.get("fixed_end") or (target or {}).get("endTime"),
-                    "location": operation.get("location") if operation.get("location") is not None else (target or {}).get("location"),
-                    "priority": operation.get("priority") or (target or {}).get("priority") or "medium",
-                    "is_mandatory": operation.get("is_mandatory") if operation.get("is_mandatory") is not None else (target or {}).get("isMandatory", True),
-                    "remove": True,
-                    "notes": operation.get("notes") or "Removed based on the parsed user request.",
-                })
-                continue
-
-            if op == "replace" and target_title:
-                translated.append({
-                    "target_id": operation.get("target_id") or (target or {}).get("id"),
-                    "title": target_title,
-                    "duration_minutes": parse_duration_minutes((target or {}).get("duration")),
-                    "fixed_start": (target or {}).get("startTime"),
-                    "fixed_end": (target or {}).get("endTime"),
-                    "location": (target or {}).get("location"),
-                    "priority": (target or {}).get("priority") or "medium",
-                    "is_mandatory": (target or {}).get("isMandatory", True),
-                    "remove": True,
-                    "notes": operation.get("notes") or f"Replaced {target_title} based on the parsed user request.",
-                })
-
-            translated.append({
-                "target_id": operation.get("target_id") if op in {"update", "move", "update_priority"} else None,
-                "title": base_title,
-                "duration_minutes": operation.get("duration_minutes") or parse_duration_minutes((target or {}).get("duration")),
-                "fixed_start": operation.get("fixed_start"),
-                "fixed_end": operation.get("fixed_end"),
-                "earliest_start": operation.get("earliest_start"),
-                "latest_end": operation.get("latest_end"),
-                "location": operation.get("location") if operation.get("location") is not None else (target or {}).get("location"),
-                "priority": operation.get("priority") or (target or {}).get("priority") or "medium",
-                "is_mandatory": operation.get("is_mandatory") if operation.get("is_mandatory") is not None else (target or {}).get("isMandatory", True),
-                "remove": False,
-                "notes": operation.get("notes") or f"{op or 'update'} operation translated from parsed user request.",
-            })
-        self._debug_json("Translated operations", translated)
-        return translated
-
-    def _find_existing_schedule_activity(
-        self,
-        current_schedule: Optional[Dict[str, Any]],
-        target_id: Any,
-        target_title: Any,
-    ) -> Optional[Dict[str, Any]]:
-        normalized_target_id = normalize_optional_text(target_id)
-        normalized_target_title = normalize_optional_text(target_title)
-        for item in (current_schedule or {}).get("activities", []):
-            if item.get("type") != "activity":
-                continue
-            if normalized_target_id and normalize_optional_text(item.get("id")) == normalized_target_id:
-                return item
-            if normalized_target_title and clean_title(item.get("title", "")) == normalized_target_title:
-                return item
-        return None
-
-    def _activity_identity(self, activity: Dict[str, Any]) -> str:
-        source = normalize_optional_text(activity.get("source"))
-        act_id = normalize_optional_text(activity.get("id"))
-        if source and act_id:
-            return f"id:{source}:{act_id}"
-
-        title = clean_title(activity.get("title", ""))
-        location = normalize_optional_text(activity.get("location"))
-        start = activity.get("fixed_start")
-        if start is None:
-            start = activity.get("scheduled_start")
-        end = activity.get("fixed_end")
-        if end is None:
-            end = activity.get("scheduled_end")
-        return f"fp:{title}|{start}|{end}|{location}"
-
-    def _find_existing_match(
-        self,
-        incoming: Dict[str, Any],
-        merged: Dict[str, Dict[str, Any]],
-        title_buckets: Dict[str, List[Dict[str, Any]]],
-    ) -> Optional[Dict[str, Any]]:
-        target_id = normalize_optional_text(incoming.get("target_id"))
-        if target_id:
-            for candidate in merged.values():
-                if normalize_optional_text(candidate.get("id")) == target_id:
-                    return candidate
-
-        identity = self._activity_identity(incoming)
-        if identity in merged:
-            return merged[identity]
-
-        candidates = title_buckets.get(clean_title(incoming["title"]), [])
-        if not candidates:
-            return None
-
-        incoming_start = incoming.get("fixed_start") or incoming.get("scheduled_start")
-        incoming_location = normalize_optional_text(incoming.get("location"))
-
-        exact_time_candidates = []
-        for candidate in candidates:
-            candidate_start = candidate.get("fixed_start") or candidate.get("scheduled_start")
-            candidate_location = normalize_optional_text(candidate.get("location"))
-            if incoming_start is not None and candidate_start == incoming_start:
-                if not incoming_location or incoming_location == candidate_location:
-                    exact_time_candidates.append(candidate)
-
-        if len(exact_time_candidates) == 1:
-            return exact_time_candidates[0]
-
-        if len(candidates) == 1:
-            candidate = candidates[0]
-            candidate_location = normalize_optional_text(candidate.get("location"))
-            if not incoming_location or incoming_location == candidate_location:
-                return candidate
-
-        if incoming.get("remove") and len(candidates) == 1:
-            return candidates[0]
-
-        return None
-
-    def _merge_activity(self, existing: Dict[str, Any], incoming: Dict[str, Any]) -> Dict[str, Any]:
-        merged = deepcopy(existing)
-        for field in (
-            "duration_minutes",
-            "location",
-            "priority",
-            "is_mandatory",
-            "earliest_start",
-            "latest_end",
-            "fixed_start",
-            "fixed_end",
-            "notes",
-        ):
-            if incoming.get(field) is not None:
-                merged[field] = incoming[field]
-
-        merged["source"] = "edited_request"
-        merged["trace"] = existing.get("trace", []) + [
-            incoming.get("notes") or "Adjusted from the latest user instruction."
-        ]
-        merged["is_conflict"] = False
-        merged["conflict_with"] = []
-        merged["conflict_reason"] = None
-        merged["conflict_priority"] = None
-        merged["conflict_severity"] = None
-
-        if incoming.get("fixed_start") is not None:
-            # FORCE CAST to int to prevent 'str + int' errors
-            try:
-                fs_val = incoming.get("fixed_start")
-                fs = parse_clock(fs_val) if isinstance(fs_val, str) else int(fs_val)
-                
-                fe_val = incoming.get("fixed_end")
-                fe = parse_clock(fe_val) if isinstance(fe_val, str) else (int(fe_val) if fe_val is not None else None)
-                
-                duration = int(merged.get("duration_minutes", 60))
-                
-                if fs is not None:
-                    merged["fixed_start"] = fs
-                    merged["scheduled_start"] = fs
-                    merged["scheduled_end"] = fe or (fs + duration)
-                if fe is not None:
-                    merged["fixed_end"] = fe
-            except (ValueError, TypeError):
-                pass
-        else:
-            merged.pop("scheduled_start", None)
-            merged.pop("scheduled_end", None)
-        
-        # Ensure duration_minutes is always present in merged
-        if "duration_minutes" not in merged:
-            merged["duration_minutes"] = (merged.get("scheduled_end") or 0) - (merged.get("scheduled_start") or 0)
-            if merged["duration_minutes"] <= 0:
-                merged["duration_minutes"] = 60
-        return merged
-
-    def _normalized_existing_activity(self, item: Dict[str, Any]) -> Dict[str, Any]:
-        start = parse_clock(item.get("startTime"))
-        end = parse_clock(item.get("endTime"))
-        if start is None:
-            start = DEFAULT_DAY_START
-        if end is None:
-            end = start + parse_duration_minutes(item.get("duration"))
-        if end <= start:
-            end += 24 * 60
-
-        return {
-            "id": item.get("id") or self._make_id(item.get("title", "activity")),
-            "title": item.get("title", "Untitled Activity"),
-            "duration_minutes": end - start,
-            "location": item.get("location"),
-            "priority": item.get("priority", "medium"),
-            "is_mandatory": bool(item.get("isMandatory", True)),
-            "earliest_start": start,
-            "latest_end": end,
-            "fixed_start": start,
-            "fixed_end": end,
-            "prep_buffer": DEFAULT_PREP_BUFFER,
-            "notes": "Existing activity preserved from the current schedule.",
-            "source": "current_schedule",
-            "trace": ["Started from the current confirmed schedule."],
-            "is_conflict": False,
-            "conflict_with": [],
-            "conflict_reason": None,
-            "conflict_priority": None,
-            "conflict_severity": None,
-        }
-
-    def _normalize_requested_activity(self, raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        title = str(raw.get("title") or raw.get("target_title") or "").strip()
-
-        fixed_start = parse_clock(raw.get("fixed_start"))
-        fixed_end = parse_clock(raw.get("fixed_end"))
-        earliest_start = parse_clock(raw.get("earliest_start"))
-        latest_end = parse_clock(raw.get("latest_end"))
-        duration_minutes = parse_duration_minutes(raw.get("duration_minutes"))
-
-        # Detect block type based on title
-        item_type = "activity"
-        lower_title = title.lower()
-        if "travel" in lower_title:
-            item_type = "travel"
-        elif "buffer" in lower_title:
-            item_type = "buffer"
-
-        if fixed_start is not None and fixed_end is None:
-            fixed_end = fixed_start + duration_minutes
-        if fixed_end is not None and fixed_start is None:
-            fixed_start = fixed_end - duration_minutes
-        if fixed_end is not None and fixed_start is not None and fixed_end <= fixed_start:
-            fixed_end += 24 * 60
-
-        return {
-            "id": self._make_id(title),
-            "title": title,
-            "notes": raw.get("notes") or "Derived from the latest user request.",
-            "remove": bool(raw.get("remove")),
-            "source": "llm_parse",
-            "trace": [raw.get("notes") or "Added from the parsed user request."],
-            "is_conflict": bool(raw.get("isConflict")),
-            "conflict_with": list(raw.get("conflictWith") or []),
-            "conflict_reason": raw.get("conflictReason"),
-            "conflict_priority": raw.get("conflictPriority"),
-            "conflict_severity": raw.get("conflictSeverity"),
-        }
 
     def _plan_schedule(
         self,
@@ -1455,14 +1727,26 @@ class SchedulingEngine:
                 timeline = inserted
                 item["trace"].append(f"Placed near anchor '{target_title}' to respect sequence.")
             else:
-                print(f"[JPLAN][MODULE_C] [REJECT_REL] '{item['title']}' - No feasible slot in narrative window.")
-                conflict_timeline = self._insert_as_conflict(
+                tight_inserted = self._insert_tight_relative_position(
                     item,
                     timeline,
-                    search_start if relation_kind == "before" else search_start,
-                    reason or "No space in narrative window.",
+                    search_start,
+                    search_end,
+                    relation_kind,
+                    target_title,
                 )
-                timeline = conflict_timeline or timeline
+                if tight_inserted:
+                    print(f"[JPLAN][MODULE_C] [ACCEPTED_TIGHT_TRANSITION] '{item['title']}' - Fits activity window but transition is tight.")
+                    timeline = tight_inserted
+                else:
+                    print(f"[JPLAN][MODULE_C] [REJECT_REL] '{item['title']}' - No feasible slot in narrative window.")
+                    conflict_timeline = self._insert_as_conflict(
+                        item,
+                        timeline,
+                        search_start if relation_kind == "before" else search_start,
+                        reason or "No space in narrative window.",
+                    )
+                    timeline = conflict_timeline or timeline
 
         # 3. Place FLEXIBLE items
         flexible.sort(key=self._calculate_activity_base_score, reverse=True)
@@ -1488,6 +1772,60 @@ class SchedulingEngine:
             "day_start": format_clock(day_start),
             "day_end": format_clock(day_end)
         }
+
+    def _insert_tight_relative_position(
+        self,
+        item: Dict[str, Any],
+        timeline: List[Dict[str, Any]],
+        search_start: int,
+        search_end: int,
+        relation_kind: str,
+        target_title: Optional[str],
+    ) -> Optional[List[Dict[str, Any]]]:
+        duration = int(item.get("duration_minutes") or 60)
+        if search_end - search_start < duration:
+            return None
+
+        if relation_kind == "before":
+            candidate_start = search_end - duration
+        else:
+            candidate_start = search_start
+        candidate_end = candidate_start + duration
+
+        if candidate_start < search_start or candidate_end > search_end:
+            return None
+
+        candidate = deepcopy(item)
+        candidate["scheduled_start"] = candidate_start
+        candidate["scheduled_end"] = candidate_end
+        if self._find_overlaps(candidate, timeline):
+            return None
+
+        next_item = next(
+            (entry for entry in sorted(timeline, key=lambda value: value.get("scheduled_start") or 0)
+             if (entry.get("scheduled_start") or 0) >= candidate_end),
+            None,
+        )
+        warning = {
+            "warning_code": WARNING_TIGHT_TRANSITION,
+            "activity_id": candidate.get("stable_activity_id") or candidate.get("id"),
+            "activity_title": candidate.get("title"),
+            "anchor_title": target_title,
+            "start": format_clock(candidate_start),
+            "end": format_clock(candidate_end),
+            "explanation": (
+                f"{candidate.get('title')} was added, but the transition"
+                f"{f' to {next_item.get('title')}' if next_item else ''} is tight."
+            ),
+        }
+        candidate["accepted_with_warning"] = True
+        candidate["warning_code"] = WARNING_TIGHT_TRANSITION
+        candidate.setdefault("warnings", [])
+        candidate["warnings"].append(warning)
+        candidate.setdefault("trace", [])
+        candidate["trace"].append(warning["explanation"])
+        return sorted(timeline + [candidate], key=lambda entry: entry["scheduled_start"])
+
     def _insert_as_conflict(
         self,
         item: Dict[str, Any],
@@ -1729,78 +2067,6 @@ class SchedulingEngine:
             return best_timeline, ""
         return None, failure_reason
 
-    def _refine_timeline(
-        self,
-        timeline: List[Dict[str, Any]],
-        day_start: int,
-        day_end: int,
-        min_travel: Optional[int],
-    ) -> List[Dict[str, Any]]:
-        print("\n" + "~"*60)
-        print(" [JPLAN] STARTING MODULE D - ANSA REFINEMENT")
-        print("~"*60)
-        best = deepcopy(sorted(timeline, key=lambda item: item["scheduled_start"]))
-        best_score = self._objective_score(best, day_start, day_end, min_travel)
-        print(f"[MODULE_D] Initial Obj Score: {best_score:.2f}")
-
-        for _ in range(2):
-            changed = False
-            for index, item in enumerate(list(best)):
-                if item.get("fixed_start") is not None:
-                    continue
-
-                reduced = deepcopy(best[:index] + best[index + 1 :])
-                candidate_timeline, _ = self._insert_best_position(
-                    {k: v for k, v in item.items() if k not in {"scheduled_start", "scheduled_end"}},
-                    reduced,
-                    day_start,
-                    day_end,
-                    min_travel,
-                )
-                if candidate_timeline is None:
-                    continue
-                candidate_score = self._objective_score(candidate_timeline, day_start, day_end, min_travel)
-                if candidate_score + 1e-6 < best_score:
-                    relocated = next(entry for entry in candidate_timeline if entry["id"] == item["id"])
-                    print(f"[MODULE_D] [IMPROVED] {best_score:.2f} -> {candidate_score:.2f} | Action: Relocate '{item['title']}'")
-                    relocated["trace"].append("Relocated during local refinement to reduce idle time or transition cost.")
-                    best = candidate_timeline
-                    best_score = candidate_score
-                    changed = True
-            if not changed:
-                break
-
-        print(f"[MODULE_D] Refinement Complete | Final Score: {best_score:.2f}")
-        print("~"*60 + "\n")
-        return best
-
-    def _objective_score(
-        self,
-        timeline: List[Dict[str, Any]],
-        day_start: int,
-        day_end: int,
-        min_travel: Optional[int],
-    ) -> float:
-        if not timeline:
-            return 0.0
-
-        ordered = sorted(timeline, key=lambda item: item["scheduled_start"])
-        total_travel = 0
-        total_idle = max(0, ordered[0]["scheduled_start"] - day_start)
-        tight_penalty = 0
-
-        for previous, current in zip(ordered, ordered[1:]):
-            transition = self._transition_minutes(previous, current, min_travel)
-            idle = max(0, current["scheduled_start"] - previous["scheduled_end"] - transition)
-            total_travel += transition
-            total_idle += idle
-            if idle < 10:
-                tight_penalty += 3
-
-        total_idle += max(0, day_end - ordered[-1]["scheduled_end"])
-        utility = sum(activity_score(item) for item in ordered)
-        return total_travel * 1.8 + total_idle * 0.3 + tight_penalty * 5 - utility * 0.4
-
     def _transition_minutes(
         self,
         left: Optional[Dict[str, Any]],
@@ -1816,60 +2082,6 @@ class SchedulingEngine:
             right.get("prep_buffer", DEFAULT_PREP_BUFFER),
         )
         return travel + prep
-
-    def _normalize_requested_activity(self, op: Dict[str, Any]) -> Dict[str, Any]:
-        title = op.get("title") or op.get("target_title") or "Untitled"
-        raw_dur = op.get("duration_minutes") or op.get("duration")
-        trace = []
-
-        # [PART C] Default duration policy
-        duration = parse_duration_minutes(raw_dur, -1)
-        if duration == -1:
-            ct = clean_title(title)
-            if "lunch" in ct or "dinner" in ct or "gym" in ct or "workout" in ct:
-                duration = 60
-                trace.append(f"Inferred default 60m duration for '{title}'.")
-            else:
-                duration = DEFAULT_DURATION
-        
-        # [PART A] Rich Timing Support
-        timing_mode = op.get("timing_mode") or TimingMode.UNSPECIFIED
-        fixed_start_str = op.get("fixed_start")
-        fixed_start_min = parse_clock(fixed_start_str) if isinstance(fixed_start_str, str) else fixed_start_str
-        
-        if fixed_start_min is not None:
-            timing_mode = TimingMode.FIXED
-
-        # [PART D] Location Normalization & Inference
-        loc = op.get("location")
-        if loc is not None:
-            loc = str(loc).strip()
-            if not loc: loc = None
-        
-        # Inference fallback:
-        if loc is None:
-            ct = clean_title(title)
-            if "lunch" in ct or "home" in ct: loc = "home"
-            elif "gym" in ct or "workout" in ct: loc = "gym"
-            elif "campus" in ct or "school" in ct: loc = "school"
-            if loc: trace.append(f"Inferred location '{loc}' from title.")
-
-        return {
-            "id": self._make_id(title),
-            "title": title,
-            "type": "activity",
-            "timing_mode": timing_mode,
-            "anchor_relation": op.get("anchor_relation"),
-            "sequence_index": op.get("sequence_index"),
-            "fixed_start": fixed_start_min,
-            "duration_minutes": duration,
-            "priority": op.get("priority", "medium").lower(),
-            "location": loc,
-            "notes": op.get("notes", ""),
-            "is_mandatory": True,
-            "is_conflict": False,
-            "trace": trace + [f"Mode={timing_mode}, Seq={op.get('sequence_index')}"]
-        }
 
     def _now_iso(self) -> str:
         return datetime.now(timezone.utc).isoformat()
@@ -2123,10 +2335,13 @@ class SchedulingEngine:
         if scheduled_start is not None and scheduled_end is None:
             scheduled_end = scheduled_start + duration_minutes
 
-        location = raw.get("location")
-        if location is not None:
-            location = str(location).strip() or None
+        location = clean_optional_text(raw.get("location"))
         location_normalized = raw.get("location_normalized") or _normalize_location(location)
+        location_label = clean_optional_text(raw.get("location_label")) or location
+        location_category = clean_optional_text(raw.get("location_category"))
+        location_status = clean_optional_text(raw.get("location_status"))
+        location_source = clean_optional_text(raw.get("location_source"))
+        location_confidence = raw.get("location_confidence")
 
         is_mandatory = bool(
             raw.get("is_mandatory")
@@ -2160,7 +2375,15 @@ class SchedulingEngine:
             "duration_minutes": duration_minutes,
             "priority": str(raw.get("priority") or "medium").lower(),
             "location": location,
+            "location_label": location_label,
+            "location_category": location_category,
+            "location_status": location_status,
+            "location_source": location_source,
+            "location_confidence": location_confidence,
             "location_normalized": location_normalized,
+            "raw_llm_location": raw.get("raw_llm_location"),
+            "explicit_user_location": bool(raw.get("explicit_user_location", False)),
+            "location_warning": raw.get("location_warning"),
             "status": raw.get("status") or "active",
             "source_turn": raw.get("source_turn") if raw.get("source_turn") is not None else (source_turn or 0),
             "created_at": raw.get("created_at") or now_iso,
@@ -2179,13 +2402,16 @@ class SchedulingEngine:
             "conflict_reason": raw.get("conflict_reason") or raw.get("conflictReason"),
             "conflict_priority": raw.get("conflict_priority") or raw.get("conflictPriority"),
             "conflict_severity": raw.get("conflict_severity") or raw.get("conflictSeverity"),
+            "accepted_with_warning": bool(raw.get("accepted_with_warning")),
+            "warning_code": raw.get("warning_code"),
+            "warnings": list(raw.get("warnings") or []),
         }
 
     def _load_canonical_activities(self, envelope: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
         canonical: List[Dict[str, Any]] = []
         excluded = 0
         for raw in list((envelope or {}).get("activities") or (envelope or {}).get("items") or []):
-            if not self._is_activity_entry(raw):
+            if not self._is_activity_entry(raw) or self._is_generic_system_activity_payload(raw):
                 excluded += 1
                 continue
             canonical.append(self._canonicalize_activity(raw))
@@ -2331,6 +2557,7 @@ class SchedulingEngine:
         target_date_envelope: Optional[Dict[str, Any]],
         source_date: Optional[str],
         target_date: Optional[str],
+        is_explicit_shift: bool = False,
     ) -> List[Dict[str, Any]]:
         target_context = self._load_canonical_activities(target_date_envelope)
         existing_active = [item for item in target_context if item.get("status") == "active"]
@@ -2344,14 +2571,19 @@ class SchedulingEngine:
             merged.append(activity)
         if source_date:
             target_label = target_date or (target_date_envelope.get("date") if target_date_envelope else source_date)
-            self._debug(f"[STATE] Applying bulk date shift from {source_date} to {target_label}")
-            self._debug(f"[STATE] Shifted {len(shifted_activities)} active activities to target date")
+            if is_explicit_shift:
+                self._debug(f"[STATE] Applying bulk date shift from {source_date} to {target_label}")
+                self._debug(f"[STATE] Shifted {len(shifted_activities)} active activities to target date")
+            else:
+                self._debug(f"[STATE] Assigning plan date to {target_label}")
         return merged
 
     def _normalize_operation(self, raw: Dict[str, Any]) -> Dict[str, Any]:
         op = clean_title(raw.get("op") or "add") or "add"
         normalized = deepcopy(raw)
         normalized["op"] = op
+        if "location" in normalized:
+            normalized["location"] = clean_optional_text(normalized.get("location"))
         normalized["fixed_start"] = raw.get("fixed_start") or raw.get("startTime")
         normalized["fixed_end"] = raw.get("fixed_end") or raw.get("endTime")
         normalized["target_id"] = raw.get("target_id") or raw.get("stable_activity_id") or raw.get("id")
@@ -2568,6 +2800,10 @@ class SchedulingEngine:
         envelope["conflicts"] = [conflict_payload]
         envelope["version"] = current_version
         envelope["validation_issues"] = list(envelope.get("validation_issues") or []) + [reason]
+        envelope["warnings"] = []
+        envelope["applied_changes"] = []
+        envelope["accepted_with_warnings"] = []
+        envelope["rejected_changes"] = [conflict_payload]
         return {
             "status": "conflict",
             "applied": False,
@@ -2578,6 +2814,10 @@ class SchedulingEngine:
             "deletedItemIds": [],
             "conflict": conflict_payload,
             "postcondition_results": failures,
+            "applied_changes": [],
+            "accepted_with_warnings": [],
+            "rejected_changes": [conflict_payload],
+            "warnings": [],
         }
 
     def _find_activity_by_stable_id(
@@ -2813,6 +3053,10 @@ class SchedulingEngine:
             envelope.get("explanations", []),
             [reason],
         )
+        envelope["warnings"] = []
+        envelope["applied_changes"] = []
+        envelope["accepted_with_warnings"] = []
+        envelope["rejected_changes"] = [conflict_payload]
         return {
             "status": "conflict",
             "applied": False,
@@ -2822,6 +3066,10 @@ class SchedulingEngine:
             "updatedActivities": [],
             "deletedItemIds": [],
             "conflict": conflict_payload,
+            "applied_changes": [],
+            "accepted_with_warnings": [],
+            "rejected_changes": [conflict_payload],
+            "warnings": [],
         }
 
     def apply_operations(
@@ -2854,8 +3102,12 @@ class SchedulingEngine:
         existing_conflict_identities = self._existing_conflict_identities(working_envelope)
         postconditions: List[Dict[str, Any]] = []
         operations_to_apply = self._prepare_operations_for_apply(
-            operations,
+            self._sanitize_operations(operations),
             [item for item in canonical_activities if item.get("status") == "active"],
+        )
+        explicit_shift_requested = any(
+            operation.get("op") == "shift_plan_date"
+            for operation in operations_to_apply
         )
 
         for operation in operations_to_apply:
@@ -2985,7 +3237,13 @@ class SchedulingEngine:
                 )
 
         if source_plan_date != schedule_date:
-            active_set = self._merge_target_date_context(active_set, target_date_envelope, source_plan_date, schedule_date)
+            active_set = self._merge_target_date_context(
+                active_set,
+                target_date_envelope,
+                source_plan_date,
+                schedule_date,
+                is_explicit_shift=explicit_shift_requested,
+            )
 
         print("\n" + "!" * 60)
         print(f" [JPLAN] STARTING MODULE 9 - REPLANNING ({schedule_date})")
@@ -3027,21 +3285,39 @@ class SchedulingEngine:
                     ]
                     return self._build_conflict_response(working_envelope, current_version, planned_activity, blockers, allow_clash=allow_clash)
 
+        warnings = self._collect_schedule_warnings(planned_result["activities"], planned_result["schedule_blocks"])
+        final_updated_activities = [
+            self._format_activity(planned_by_id[activity_id])
+            for activity_id in mutated_ids
+            if activity_id in planned_by_id
+        ]
+        formatted_activities = [self._format_activity(item) for item in planned_result["activities"]]
+        formatted_unscheduled = [
+            self._format_activity(item) for item in planned_result.get("unscheduled_activities", [])
+        ]
+        envelope_status = "partial" if (conflicts or postcondition_failures) else ("warning" if warnings else "ok")
+        result_status = "warning" if envelope_status == "warning" else "success"
+
         updated_envelope = deepcopy(working_envelope)
         updated_envelope["schema_version"] = 4
         updated_envelope["date"] = schedule_date
-        updated_envelope["status"] = "partial" if (conflicts or postcondition_failures) else "ok"
+        updated_envelope["status"] = envelope_status
         updated_envelope["planning_mode"] = planning_mode
         updated_envelope["allow_clash"] = allow_clash
         updated_envelope["preferences"] = preferences
-        updated_envelope["activities"] = [self._format_activity(item) for item in planned_result["activities"]]
+        updated_envelope["activities"] = formatted_activities
         updated_envelope["schedule_blocks"] = planned_result["schedule_blocks"]
-        updated_envelope["unscheduled_activities"] = [
-            self._format_activity(item) for item in planned_result.get("unscheduled_activities", [])
-        ]
+        updated_envelope["unscheduled_activities"] = formatted_unscheduled
         updated_envelope["version"] = current_version + 1
         updated_envelope["explanations"] = planned_result.get("explanations", [])
         updated_envelope["conflicts"] = conflicts
+        updated_envelope["warnings"] = warnings
+        updated_envelope["applied_changes"] = final_updated_activities
+        updated_envelope["accepted_with_warnings"] = [
+            warning for warning in warnings
+            if str(warning.get("activity_id")) in {str(activity_id) for activity_id in mutated_ids}
+        ]
+        updated_envelope["rejected_changes"] = []
         updated_envelope["unmet_items"] = []
         updated_envelope["validation_issues"] = [failure.get("reason") for failure in postcondition_failures if failure.get("reason")]
         updated_envelope["conflict"] = conflicts[0] if conflicts else ({"type": "postcondition_failed", **postcondition_failures[0]} if postcondition_failures else None)
@@ -3065,159 +3341,291 @@ class SchedulingEngine:
         updated_envelope["final_schedule_summary"] = "\n".join(summary_lines)
 
         return {
-            "status": "success",
+            "status": result_status,
             "applied": True,
             "envelope": updated_envelope,
             "planned_result": planned_result,
             "version": updated_envelope["version"],
             "activities": updated_envelope["activities"],
-            "updatedActivities": [self._format_activity(activity) for activity in updated_activities if activity.get("status") == "active"],
+            "updatedActivities": final_updated_activities,
             "deletedItemIds": deleted_activity_ids,
+            "applied_changes": final_updated_activities,
+            "accepted_with_warnings": updated_envelope["accepted_with_warnings"],
+            "rejected_changes": [],
+            "warnings": warnings,
         }
-        print(f"[JPLAN][ENGINE_LOGIC] Incoming Ops: {json.dumps(operations, indent=2, ensure_ascii=False)}")
-        
-        # ... (rest of return logic)
-        
-        print(f"[JPLAN][ENGINE_LOGIC] Final Schedule Summary:")
-        for a in activities:
-            print(f"  - [{a.get('scheduled_start')} - {a.get('scheduled_end')}] {a.get('title')} (ID: {a.get('id')})")
-        print(f"[JPLAN][ENGINE_LOGIC] ---------------------------\n")
-
-        return {
-            "envelope": envelope,
-            "updatedActivities": formatted_updated,
-            "deletedItemIds": [tid for tid in deleted_activity_ids if tid],
-            "version": envelope["version"],
-            "advisor_suggestion": advisor_suggestion
-        }
-
-    def _materialize_schedule(self, date_str: str, activities: List[Dict[str, Any]], unscheduled: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Full envelope builder that also injects buffers."""
-        injected = self._inject_buffer_slots(activities)
-        return {
-            "date": date_str,
-            "version": 1,
-            "activities": [self._format_activity(a) for a in injected],
-            "unscheduled_activities": unscheduled,
-            "explanations": []
-        }
-
-    def _inject_buffer_slots(self, activities: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Sort activities and fill gaps with buffers (> 10 mins)."""
-        if not activities: return []
-        
-        # Sort by start time
-        sorted_acts = sorted(activities, key=lambda x: x.get("scheduled_start") or 0)
-        final_list = []
-        
-        for i, current in enumerate(sorted_acts):
-            final_list.append(current)
-            
-            if i < len(sorted_acts) - 1:
-                next_act = sorted_acts[i+1]
-                current_end = current.get("scheduled_end") or 0
-                next_start = next_act.get("scheduled_start") or 0
-                
-                gap = next_start - current_end
-                
-                # Only insert buffer if gap is significant (> 10 mins)
-                if gap >= 10:
-                    # [FIX] Check if this gap is already covered by ANY other activity (clash)
-                    # This prevents ghost buffers between 1pm-3pm when a 12pm-3pm activity exists
-                    is_covered = False
-                    for other in activities:
-                        if other.get("type") == "buffer": continue
-                        o_start = other.get("scheduled_start") or 0
-                        o_end = other.get("scheduled_end") or 0
-                        # If an activity covers at least 50% of the gap, skip the buffer
-                        if o_start <= current_end and o_end >= next_start:
-                            is_covered = True
-                            break
-                    
-                    if not is_covered:
-                        buffer_id = f"buffer-{current.get('id')}-{next_act.get('id')}"
-                        final_list.append({
-                            "id": buffer_id,
-                            "type": "buffer",
-                            "title": "Buffer",
-                            "scheduled_start": current_end,
-                            "scheduled_end": next_start,
-                            "duration_minutes": gap,
-                            "is_mandatory": False,
-                            "priority": "low"
-                        })
-        
-        return final_list
-
-    def _get_conflict_advice(self, conflicted_activities: List[Dict[str, Any]]) -> str:
-        """[Module 8] Second-pass LLM call for human-like advice."""
-        print("\n" + "#"*60)
-        print(" [JPLAN] STARTING MODULE 8 - EXPLAINABILITY (ADVISOR)")
-        print("#"*60)
-        conflict_details = []
-        for act in conflicted_activities:
-            conflict_details.append(f"- {act['title']} ({format_clock(act['scheduled_start'])} - {format_clock(act['scheduled_end'])}): {act.get('conflict_reason')}")
-        
-        prompt = f"""
-        You are the Schedule Advisor for JPlan. 
-        The user's latest update caused the following schedule conflicts:
-        {chr(10).join(conflict_details)}
-
-        Please provide a VERY SHORT, human-like suggestion (max 2 sentences) in the user's language. 
-        Suggest how they might fix the overlap (e.g., move one activity or shorten another).
-        Be empathetic but professional.
-        """
-        
-        print(f"\n[JPLAN][LLM_ADVISOR] --- FULL PROMPT SENT TO LLM ---\n{prompt}\n------------------------------------------\n")
-        try:
-            response = self.client.models.generate_content(
-                model="gemini-3.1-flash-lite-preview",
-                contents=prompt
-            )
-            adv_text = response.text.strip()
-            print(f"\n[JPLAN][LLM_ADVISOR] --- RAW RESPONSE FROM LLM ---\n{adv_text}\n------------------------------------------\n")
-            
-            # Print Token Usage
-            usage = getattr(response, "usage_metadata", None)
-            if usage:
-                print(f"[JPLAN][LLM_ADVISOR] Token Usage: Prompt={usage.prompt_token_count}, Candidates={usage.candidates_token_count}, Total={usage.total_token_count}")
-                
-            return adv_text
-        except Exception as e:
-            print(f"[JPLAN][LLM_ADVISOR] Advisor call failed: {e}")
-            return "Note: This change creates some overlaps in your schedule."
 
     def _compact_result_summary(
         self,
         result: Dict[str, Any],
         allow_clash: bool,
+        parsed: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         envelope = result.get("envelope") or result.get("schedule_data") or {}
         conflict = result.get("conflict") or envelope.get("conflict")
         conflicts = envelope.get("conflicts") or result.get("conflicts") or []
+        warnings = envelope.get("accepted_with_warnings") or result.get("accepted_with_warnings") or envelope.get("warnings") or result.get("warnings") or []
         postcondition_results = result.get("postcondition_results") or envelope.get("postcondition_results") or []
-        changed = result.get("updatedActivities") or []
-        if not changed and envelope.get("activities"):
-            changed = envelope.get("activities", [])[:8]
+        requested_titles = self._requested_titles_from_parsed(parsed or {})
+        primary_operation = self._primary_reply_operation(parsed or {})
+        shift_operation = self._shift_reply_operation(parsed or {})
+        schedule_blocks = list(envelope.get("schedule_blocks") or [])
+        changed = result.get("updatedActivities") or envelope.get("applied_changes") or []
+        referenced_blocks = self._referenced_activity_blocks(schedule_blocks, requested_titles, changed)
+        if not referenced_blocks and envelope.get("activities"):
+            referenced_blocks = self._referenced_activity_blocks(schedule_blocks, [], envelope.get("activities", [])[:8])
+
+        status = result.get("status") or envelope.get("status") or ("partial" if conflicts else "success")
+        if status == "success" and envelope.get("status") == "warning":
+            status = "warning"
 
         return {
-            "status": result.get("status") or envelope.get("status") or ("partial" if conflicts else "success"),
+            "status": status,
+            "envelope_status": envelope.get("status"),
             "applied": bool(result.get("applied", result.get("status") != "conflict")),
             "allow_clash": allow_clash,
+            "date": envelope.get("date"),
+            "shift_operation": shift_operation,
+            "primary_operation": primary_operation,
             "conflict": conflict or (conflicts[0] if conflicts else None),
             "conflicts": conflicts[:3],
+            "warnings": warnings[:4],
             "postcondition_results": postcondition_results[:3],
+            "requested_titles": requested_titles,
+            "referenced_blocks": referenced_blocks[:8],
+            "allowed_times": self._allowed_reply_times(referenced_blocks, warnings),
+            "allowed_dates": self._allowed_reply_dates(envelope, shift_operation),
             "changed": [
                 {
-                    "title": item.get("title"),
-                    "start": item.get("startTime") or item.get("start"),
-                    "end": item.get("endTime") or item.get("end"),
-                    "is_conflict": bool(item.get("is_conflict") or item.get("isConflict") or item.get("is_conflicting")),
+                    "title": block.get("title"),
+                    "start": block.get("start"),
+                    "end": block.get("end"),
+                    "duration_minutes": block.get("duration_minutes"),
+                    "is_conflict": bool(block.get("is_conflict") or block.get("isConflict") or block.get("is_conflicting")),
                 }
-                for item in changed[:8]
-                if isinstance(item, dict)
+                for block in referenced_blocks[:8]
+                if isinstance(block, dict)
             ],
         }
+
+    def _primary_reply_operation(self, parsed: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        for operation in parsed.get("operations") or []:
+            if not isinstance(operation, dict):
+                continue
+            op_type = clean_title(operation.get("op") or "")
+            if op_type == "remove":
+                continue
+            anchor = operation.get("anchor_relation") or {}
+            return {
+                "op": op_type or "update",
+                "title": operation.get("title") or operation.get("target_title"),
+                "anchor_kind": clean_title(anchor.get("kind") or ""),
+                "anchor_title": anchor.get("target_title"),
+                "from_date": operation.get("from_date"),
+                "to_date": operation.get("to_date"),
+            }
+        return None
+
+    def _shift_reply_operation(self, parsed: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        for operation in parsed.get("operations") or []:
+            if not isinstance(operation, dict):
+                continue
+            if clean_title(operation.get("op") or "") == "shift_plan_date":
+                return {
+                    "from_date": operation.get("from_date"),
+                    "to_date": operation.get("to_date") or parsed.get("date"),
+                }
+        return None
+
+    def _requested_titles_from_parsed(self, parsed: Dict[str, Any]) -> List[str]:
+        titles: List[str] = []
+        for item in list(parsed.get("operations") or []) + list(parsed.get("activities") or []):
+            if not isinstance(item, dict):
+                continue
+            title = clean_optional_text(item.get("title") or item.get("target_title"))
+            if title and item.get("op") != "remove":
+                titles.append(title)
+        seen: set[str] = set()
+        unique: List[str] = []
+        for title in titles:
+            key = clean_title(title)
+            if key and key not in seen:
+                seen.add(key)
+                unique.append(title)
+        return unique
+
+    def _referenced_activity_blocks(
+        self,
+        schedule_blocks: List[Dict[str, Any]],
+        requested_titles: List[str],
+        changed: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        requested_keys = {clean_title(title) for title in requested_titles if title}
+        changed_ids = {
+            str(item.get("stable_activity_id") or item.get("id"))
+            for item in changed
+            if isinstance(item, dict) and (item.get("stable_activity_id") or item.get("id"))
+        }
+        changed_titles = {
+            clean_title(item.get("title") or "")
+            for item in changed
+            if isinstance(item, dict) and item.get("title")
+        }
+        blocks: List[Dict[str, Any]] = []
+        for index, block in enumerate(schedule_blocks):
+            if block.get("block_type") != "activity":
+                continue
+            block_id = str(block.get("stable_activity_id") or block.get("id") or "")
+            block_title = clean_title(block.get("title") or "")
+            if block_id in changed_ids or block_title in requested_keys or block_title in changed_titles:
+                enriched = dict(block)
+                previous_activity = next(
+                    (
+                        schedule_blocks[previous_index]
+                        for previous_index in range(index - 1, -1, -1)
+                        if schedule_blocks[previous_index].get("block_type") == "activity"
+                    ),
+                    None,
+                )
+                next_activity = next(
+                    (
+                        schedule_blocks[next_index]
+                        for next_index in range(index + 1, len(schedule_blocks))
+                        if schedule_blocks[next_index].get("block_type") == "activity"
+                    ),
+                    None,
+                )
+                if previous_activity:
+                    enriched["previous_activity_title"] = previous_activity.get("title")
+                if next_activity:
+                    enriched["next_activity_title"] = next_activity.get("title")
+                if index > 0 and schedule_blocks[index - 1].get("is_tight"):
+                    enriched["previous_tight_transition"] = schedule_blocks[index - 1]
+                if index + 1 < len(schedule_blocks) and schedule_blocks[index + 1].get("is_tight"):
+                    enriched["next_tight_transition"] = schedule_blocks[index + 1]
+                blocks.append(enriched)
+        return blocks
+
+    def _allowed_reply_times(
+        self,
+        referenced_blocks: List[Dict[str, Any]],
+        warnings: List[Dict[str, Any]],
+    ) -> List[str]:
+        allowed: set[str] = set()
+        for block in referenced_blocks:
+            for value in (block.get("start"), block.get("end")):
+                parsed = parse_clock(value)
+                if parsed is not None:
+                    allowed.add(format_clock(parsed))
+            for transition_key in ("previous_tight_transition", "next_tight_transition"):
+                transition = block.get(transition_key) or {}
+                for value in (transition.get("start"), transition.get("end")):
+                    parsed = parse_clock(value)
+                    if parsed is not None:
+                        allowed.add(format_clock(parsed))
+        for warning in warnings:
+            for value in (warning.get("start"), warning.get("end")):
+                parsed = parse_clock(value)
+                if parsed is not None:
+                    allowed.add(format_clock(parsed))
+            transition = warning.get("transition") or {}
+            for value in (transition.get("start"), transition.get("end")):
+                parsed = parse_clock(value)
+                if parsed is not None:
+                    allowed.add(format_clock(parsed))
+        return sorted(allowed)
+
+    def _allowed_reply_dates(
+        self,
+        envelope: Dict[str, Any],
+        shift_operation: Optional[Dict[str, Any]],
+    ) -> List[str]:
+        allowed = {value for value in [envelope.get("date")] if value}
+        if shift_operation:
+            allowed.update(
+                value for value in [shift_operation.get("from_date"), shift_operation.get("to_date")]
+                if value
+            )
+        return sorted(allowed)
+
+    def _format_date_for_reply(self, iso_date: Optional[str]) -> str:
+        if not iso_date:
+            return "the selected date"
+        try:
+            parsed_date = date.fromisoformat(str(iso_date))
+            return f"{parsed_date.strftime('%B')} {parsed_date.day}"
+        except Exception:
+            return str(iso_date)
+
+    def _success_reply_sentence(self, summary: Dict[str, Any]) -> Optional[str]:
+        shift = summary.get("shift_operation") or {}
+        if shift.get("to_date"):
+            from_text = self._format_date_for_reply(shift.get("from_date"))
+            to_text = self._format_date_for_reply(shift.get("to_date"))
+            return f"I've moved the whole plan from {from_text} to {to_text}."
+
+        blocks = summary.get("referenced_blocks") or []
+        changed = summary.get("changed") or []
+        if not blocks and not changed:
+            return None
+
+        if len(changed) > 1:
+            titles = [item.get("title") for item in changed if item.get("title")]
+            if titles:
+                date_text = f" for {summary.get('date')}" if summary.get("date") else ""
+                return f"I generated your schedule{date_text}, including {', '.join(titles)}."
+
+        block = blocks[0] if blocks else changed[0]
+        operation = summary.get("primary_operation") or {}
+        op_type = clean_title(operation.get("op") or "")
+        verb = {
+            "add": "added",
+            "move": "moved",
+            "update": "updated",
+            "replace": "updated",
+        }.get(op_type, "updated")
+        title = block.get("title") or operation.get("title") or "the activity"
+        start = block.get("start")
+        end = block.get("end")
+        if not start or not end:
+            return f"I've {verb} {title}."
+
+        anchor_text = ""
+        anchor_kind = clean_title(operation.get("anchor_kind") or "")
+        if anchor_kind == "after":
+            anchor = block.get("previous_activity_title") or operation.get("anchor_title")
+            if anchor:
+                anchor_text = f" after {anchor}"
+        elif anchor_kind == "before":
+            anchor = block.get("next_activity_title") or operation.get("anchor_title")
+            if anchor:
+                anchor_text = f" before {anchor}"
+
+        return f"I've {verb} {title} from {start} to {end}{anchor_text}."
+
+    def _existing_conflict_sentence(self, summary: Dict[str, Any]) -> Optional[str]:
+        existing_conflicts = [
+            item for item in (summary.get("conflicts") or [])
+            if item.get("conflict_lifecycle") == "existing"
+        ]
+        if not existing_conflicts:
+            return None
+        existing = existing_conflicts[0]
+        names = "/".join(str(item) for item in (existing.get("activities") or [])[:2])
+        if names:
+            return f"Your existing {names} clash is still marked."
+        return "An existing clash is still marked."
+
+    def _warning_sentence(self, summary: Dict[str, Any]) -> Optional[str]:
+        warning = (summary.get("warnings") or [{}])[0]
+        if not warning:
+            return None
+        activity_title = warning.get("activity_title") or "This activity"
+        transition = warning.get("transition") or {}
+        target = transition.get("to_location") or warning.get("anchor_title") or "the next activity"
+        if warning.get("warning_code") == WARNING_TIGHT_TRANSITION:
+            return f"{activity_title} still has a tight transition to {target}."
+        return warning.get("explanation") or "There is still a warning marked on the schedule."
 
     def _fallback_result_reply(
         self,
@@ -3242,16 +3650,6 @@ class SchedulingEngine:
             item for item in (summary.get("conflicts") or [])
             if item.get("conflict_lifecycle") == "existing"
         ]
-        if applied and existing_conflicts and not allow_clash:
-            existing = existing_conflicts[0]
-            names = ", ".join(str(item) for item in (existing.get("activities") or [])[:2])
-            existing_text = f" Your existing {names} clash is still marked." if names else " An existing clash is still marked."
-            return {
-                "reply": f"I updated the new request.{existing_text}",
-                "reply_status": "partial",
-                "recommend_allow_clash": False,
-                "reply_reason": existing.get("explanation") or existing.get("conflict_reason"),
-            }
 
         if status == "conflict" and not applied and not allow_clash:
             suggestion_text = f" A possible option is: {suggestions[0]}." if suggestions else ""
@@ -3264,6 +3662,34 @@ class SchedulingEngine:
                 "reply_status": "conflict",
                 "recommend_allow_clash": True,
                 "reply_reason": reason,
+            }
+
+        success_sentence = self._success_reply_sentence(summary)
+        if applied and success_sentence:
+            followups: List[str] = []
+            existing_sentence = self._existing_conflict_sentence(summary)
+            warning_sentence = self._warning_sentence(summary)
+            if existing_sentence:
+                followups.append(existing_sentence)
+            if warning_sentence:
+                followups.append(warning_sentence)
+            if summary.get("conflicts") and not existing_sentence:
+                followups.append(f"This creates a clash: {reason} I marked it so you can resolve it later.")
+
+            reply_status = "success"
+            if summary.get("conflicts") or existing_conflicts:
+                reply_status = "partial"
+            elif status == "warning" or summary.get("warnings"):
+                reply_status = "warning"
+
+            return {
+                "reply": " ".join([success_sentence] + followups),
+                "reply_status": reply_status,
+                "recommend_allow_clash": False,
+                "reply_reason": (
+                    (existing_conflicts[0].get("explanation") if existing_conflicts else None)
+                    or (summary.get("warnings") or [{}])[0].get("explanation")
+                ),
             }
 
         if (status in {"conflict", "partial"} or summary.get("conflicts")) and allow_clash:
@@ -3286,10 +3712,49 @@ class SchedulingEngine:
                 "reply_reason": reason if conflict else None,
             }
 
+        if status == "warning" or summary.get("warnings"):
+            first_block = (summary.get("referenced_blocks") or [{}])[0]
+            warning = (summary.get("warnings") or [{}])[0]
+            transition = warning.get("transition") or first_block.get("next_tight_transition") or {}
+            title = first_block.get("title") or warning.get("activity_title") or "the activity"
+            start = first_block.get("start") or warning.get("start")
+            end = first_block.get("end") or warning.get("end")
+            duration = first_block.get("duration_minutes")
+            duration_text = f"{duration}-minute " if duration else ""
+            anchor_text = f" after {warning.get('anchor_title')}" if warning.get("anchor_title") else ""
+            transition_text = ""
+            if transition:
+                destination = transition.get("to_location") or "the next activity"
+                transition_text = (
+                    f" The transition to {destination} is tight because travel starts at {transition.get('start')}."
+                )
+            return {
+                "reply": f"I've added your {duration_text}{title} from {start} to {end}{anchor_text}.{transition_text}",
+                "reply_status": "warning",
+                "recommend_allow_clash": False,
+                "reply_reason": warning.get("explanation"),
+            }
+
         changed_titles = [item.get("title") for item in summary.get("changed", []) if item.get("title")]
         if changed_titles:
+            if len(changed_titles) > 1:
+                date_text = f" for {summary.get('date')}" if summary.get("date") else ""
+                return {
+                    "reply": f"I generated your schedule{date_text}, including {', '.join(changed_titles)}.",
+                    "reply_status": "success",
+                    "recommend_allow_clash": False,
+                    "reply_reason": None,
+                }
+            first_change = (summary.get("changed") or [{}])[0]
+            if first_change.get("start") and first_change.get("end"):
+                return {
+                    "reply": f"I updated {first_change.get('title')} from {first_change.get('start')} to {first_change.get('end')}.",
+                    "reply_status": "success",
+                    "recommend_allow_clash": False,
+                    "reply_reason": None,
+                }
             return {
-                "reply": f"I updated your schedule for: {', '.join(changed_titles[:3])}.",
+                "reply": f"I updated your schedule for: {', '.join(changed_titles)}.",
                 "reply_status": "success",
                 "recommend_allow_clash": False,
                 "reply_reason": None,
@@ -3319,6 +3784,80 @@ class SchedulingEngine:
         )
         return any(phrase in clean_reply for phrase in failure_phrases)
 
+    def _reply_time_mentions(self, reply: str) -> List[str]:
+        mentions: List[str] = []
+        for match in re.finditer(r"\b(?:[01]?\d|2[0-3]):[0-5]\d\s*(?:AM|PM)?\b", reply, flags=re.IGNORECASE):
+            parsed = parse_clock(match.group(0))
+            if parsed is not None:
+                mentions.append(format_clock(parsed))
+        for match in re.finditer(r"\b(?:1[0-2]|0?[1-9])\s*(?:AM|PM)\b", reply, flags=re.IGNORECASE):
+            parsed = parse_clock(match.group(0))
+            if parsed is not None:
+                mentions.append(format_clock(parsed))
+        return list(dict.fromkeys(mentions))
+
+    def _reply_uses_only_allowed_times(self, reply: str, summary: Dict[str, Any]) -> bool:
+        mentions = self._reply_time_mentions(reply)
+        if not mentions:
+            return True
+        allowed = set(summary.get("allowed_times") or [])
+        return all(mention in allowed for mention in mentions)
+
+    def _reply_uses_only_allowed_dates(self, reply: str, summary: Dict[str, Any]) -> bool:
+        mentions = self._extract_explicit_absolute_dates(reply, {"date": summary.get("date") or self._local_today_iso()})
+        if not mentions:
+            return True
+        allowed = set(summary.get("allowed_dates") or [])
+        return all(mention in allowed for mention in mentions)
+
+    def _reply_mentions_required_range(self, reply: str, summary: Dict[str, Any]) -> bool:
+        blocks = summary.get("referenced_blocks") or []
+        if len(blocks) != 1:
+            return True
+        if len(summary.get("requested_titles") or []) != 1:
+            return True
+        clean_reply = clean_title(reply)
+        start = clean_title(blocks[0].get("start") or "")
+        end = clean_title(blocks[0].get("end") or "")
+        return bool(start and end and start in clean_reply and end in clean_reply)
+
+    def _reply_mentions_requested_titles(self, reply: str, summary: Dict[str, Any]) -> bool:
+        requested_titles = summary.get("requested_titles") or []
+        if len(requested_titles) <= 1:
+            return True
+        clean_reply = clean_title(reply)
+        return all(clean_title(title) in clean_reply for title in requested_titles)
+
+    def _module_8_reply_class(self, reply_status: str) -> str:
+        if reply_status == "warning":
+            return "WARNING"
+        if reply_status == "conflict":
+            return "CONFLICT"
+        if reply_status in {"error", "failure"}:
+            return "FAILURE"
+        return "SUCCESS"
+
+    def _log_module_8_final(
+        self,
+        reply_meta: Dict[str, Any],
+        summary: Dict[str, Any],
+        source: str,
+    ) -> None:
+        reply = reply_meta.get("reply") or ""
+        reply_status = reply_meta.get("reply_status") or "success"
+        referenced = [
+            {
+                "title": block.get("title"),
+                "start": block.get("start"),
+                "end": block.get("end"),
+            }
+            for block in summary.get("referenced_blocks") or []
+        ]
+        print(f"[JPLAN][MODULE_8] Reply class = {self._module_8_reply_class(reply_status)}")
+        print(f"[JPLAN][MODULE_8] Referenced blocks = {json.dumps(referenced, ensure_ascii=True)}")
+        print(f"[JPLAN][MODULE_8] Final reply = {json.dumps(reply, ensure_ascii=True)}")
+        print(f"[JPLAN][MODULE_8] Reply source = {source}")
+
     def compose_result_reply(
         self,
         latest_request: str,
@@ -3327,10 +3866,16 @@ class SchedulingEngine:
         allow_clash: bool,
     ) -> Dict[str, Any]:
         """Second-pass result-aware reply. The LLM phrases; deterministic checks decide truth."""
-        summary = self._compact_result_summary(result, allow_clash)
+        summary = self._compact_result_summary(result, allow_clash, parsed)
         fallback = self._fallback_result_reply(latest_request, summary)
 
+        print("\n" + "#" * 60)
+        print(" [JPLAN] STARTING MODULE 8 - RESULT-AWARE REPLY")
+        print("#" * 60)
+
         if not getattr(self.client, "models", None):
+            fallback = {**fallback, "reply_source": "template"}
+            self._log_module_8_final(fallback, summary, "template")
             return fallback
 
         prompt = f"""
@@ -3339,10 +3884,15 @@ Write naturally, like a helpful planning assistant, not a formal system notice.
 Keep it short: 1-3 sentences.
 If applied=false, clearly say the requested change was not applied as intended, but do not use all-caps.
 If RESULT_SUMMARY includes timing details, mention the concrete reason, such as the available window and required duration.
-If status is ok/success and applied=true, say the schedule was applied.
+If status is ok/success/warning and applied=true, say the schedule was applied.
+If status=warning, say the activity was added/updated and mention the warning naturally.
 If allow_clash=false and status=conflict, gently mention Allow Clash only as an option to force the overlap.
 Do not claim success unless applied=true.
 Do not invent reasons, times, blockers, or suggestions outside RESULT_SUMMARY.
+Use exact times from RESULT_SUMMARY.referenced_blocks only. Do not change, round, or guess times.
+Use exact dates from RESULT_SUMMARY.allowed_dates only. For shift_plan_date, use RESULT_SUMMARY.shift_operation.to_date.
+For a single requested activity, include that activity's exact start and end time.
+For a generated schedule, mention every title in RESULT_SUMMARY.requested_titles that appears in referenced_blocks.
 Do not mention unslotted or failed tasks unless RESULT_SUMMARY says there is a conflict or unmet item.
 
 USER_REQUEST:
@@ -3355,9 +3905,6 @@ RESULT_SUMMARY:
 {json.dumps(summary, ensure_ascii=True)[:1800]}
 """
         try:
-            print("\n" + "#" * 60)
-            print(" [JPLAN] STARTING MODULE 8 - RESULT-AWARE REPLY")
-            print("#" * 60)
             response = self.client.models.generate_content(
                 model="gemini-3.1-flash-lite-preview",
                 contents=prompt,
@@ -3373,86 +3920,62 @@ RESULT_SUMMARY:
                 print(
                     f"[JPLAN][LLM_REPLY] Token Usage: Prompt={token_usage['prompt']} | "
                     f"Candidates={token_usage['candidates']} | Total={token_usage['total']}"
-                )
+            )
             reply = (response.text or "").strip()
             if not reply:
-                return fallback
+                final = {**fallback, "token_usage": token_usage, "reply_source": "fallback-template"}
+                self._log_module_8_final(final, summary, "fallback-template")
+                return final
 
             if fallback["reply_status"] == "conflict":
                 if not self._reply_claims_failure(reply):
-                    return {**fallback, "token_usage": token_usage}
-            elif fallback["reply_status"] == "success" and self._reply_claims_failure(reply):
-                return {**fallback, "token_usage": token_usage}
+                    final = {**fallback, "token_usage": token_usage, "reply_source": "fallback-template"}
+                    self._log_module_8_final(final, summary, "fallback-template")
+                    return final
+            elif fallback["reply_status"] in {"success", "warning"} and self._reply_claims_failure(reply):
+                final = {**fallback, "token_usage": token_usage, "reply_source": "fallback-template"}
+                self._log_module_8_final(final, summary, "fallback-template")
+                return final
             elif fallback["reply_status"] == "partial" and summary.get("conflicts"):
                 clean_reply = clean_title(reply)
                 if "clash" not in clean_reply and "conflict" not in clean_reply and "overlap" not in clean_reply:
-                    return {**fallback, "token_usage": token_usage}
+                    final = {**fallback, "token_usage": token_usage, "reply_source": "fallback-template"}
+                    self._log_module_8_final(final, summary, "fallback-template")
+                    return final
 
-            return {
+            if not self._reply_uses_only_allowed_times(reply, summary):
+                final = {**fallback, "token_usage": token_usage, "reply_source": "fallback-template"}
+                self._log_module_8_final(final, summary, "fallback-template")
+                return final
+
+            if not self._reply_uses_only_allowed_dates(reply, summary):
+                final = {**fallback, "token_usage": token_usage, "reply_source": "fallback-template"}
+                self._log_module_8_final(final, summary, "fallback-template")
+                return final
+
+            if not self._reply_mentions_required_range(reply, summary):
+                final = {**fallback, "token_usage": token_usage, "reply_source": "fallback-template"}
+                self._log_module_8_final(final, summary, "fallback-template")
+                return final
+
+            if not self._reply_mentions_requested_titles(reply, summary):
+                final = {**fallback, "token_usage": token_usage, "reply_source": "fallback-template"}
+                self._log_module_8_final(final, summary, "fallback-template")
+                return final
+
+            final = {
                 **fallback,
                 "reply": reply,
                 "token_usage": token_usage,
+                "reply_source": "llm",
             }
+            self._log_module_8_final(final, summary, "llm")
+            return final
         except Exception as exc:
             print(f"[JPLAN][LLM_REPLY] Result-aware reply failed: {exc}")
-            return fallback
-
-    def _mark_activity_conflicts(self, activities: List[Dict[str, Any]]):
-        """Internal helper to mark conflicts among activities in place."""
-        for item in activities:
-            item["is_conflict"] = False
-            item["conflict_with"] = []
-            item["conflict_reason"] = None
-
-        valid_ids = {item["id"] for item in activities}
-        for item in activities:
-            item["is_conflict"] = False
-            item["conflict_with"] = []
-            item["conflict_reason"] = None
-
-        for i, item in enumerate(activities):
-            if item.get("type") not in [None, "activity"]: continue
-            
-            start = item.get("scheduled_start")
-            end = item.get("scheduled_end")
-            if start is None or end is None: continue
-            
-            clashes = []
-            for j, other in enumerate(activities):
-                if i == j: continue
-                if other.get("type") not in [None, "activity"]: continue
-                
-                o_start = other.get("scheduled_start")
-                o_end = other.get("scheduled_end")
-                if o_start is None or o_end is None: continue
-                
-                if start < o_end and end > o_start:
-                    clashes.append(other.get("id"))
-            
-            # Critical Fix: Only keep IDs that are actually in the current list
-            item["conflict_with"] = [cid for cid in clashes if cid in valid_ids]
-            if item["conflict_with"]:
-                item["is_conflict"] = True
-                item["conflict_reason"] = f"Overlaps with {len(item['conflict_with'])} events"
-
-    def get_local_window_activities(self, activities: List[Dict[str, Any]], target_time: Optional[int] = None, window_hours: int = 3) -> List[Dict[str, Any]]:
-        """Prune activities to a local time window for context-aware LLM requests."""
-        if not target_time:
-            # If no target time, return a reasonable midday window or first few activities
-            return activities[:10] 
-            
-        window_mins = window_hours * 60
-        start_bound = target_time - window_mins
-        end_bound = target_time + window_mins
-        
-        filtered = []
-        for item in activities:
-            s = item.get("scheduled_start")
-            e = item.get("scheduled_end")
-            if s is None or e is None: continue
-            if s < end_bound and e > start_bound:
-                filtered.append(item)
-        return filtered
+            final = {**fallback, "reply_source": "fallback-template"}
+            self._log_module_8_final(final, summary, "fallback-template")
+            return final
 
     def _format_activity(self, item: Dict[str, Any]) -> Dict[str, Any]:
         s_start = item.get("scheduled_start")
@@ -3481,6 +4004,7 @@ RESULT_SUMMARY:
         earliest_start = item.get("earliest_start")
         latest_end = item.get("latest_end")
         preferred_start = item.get("preferred_start")
+        location = clean_optional_text(item.get("location"))
 
         return {
             "id": stable_activity_id,
@@ -3492,8 +4016,16 @@ RESULT_SUMMARY:
             "normalized_title": item.get("normalized_title") or clean_title(item.get("title", "Untitled")),
             "startTime": format_clock(s_start_val),
             "endTime": format_clock(s_end_val),
-            "location": item.get("location"),
-            "location_normalized": item.get("location_normalized") or _normalize_location(item.get("location")),
+            "location": location,
+            "location_label": clean_optional_text(item.get("location_label")) or location,
+            "location_category": item.get("location_category"),
+            "location_status": item.get("location_status"),
+            "location_source": item.get("location_source"),
+            "location_confidence": item.get("location_confidence"),
+            "location_normalized": item.get("location_normalized") or _normalize_location(location),
+            "raw_llm_location": item.get("raw_llm_location"),
+            "explicit_user_location": bool(item.get("explicit_user_location", False)),
+            "location_warning": item.get("location_warning"),
             "duration": item.get("duration") or self._duration_label(item.get("duration_minutes") or (s_end_val - s_start_val)),
             "duration_minutes": int(item.get("duration_minutes") or (s_end_val - s_start_val)),
             "priority": item.get("priority", "medium"),
@@ -3522,6 +4054,9 @@ RESULT_SUMMARY:
             "conflictPriority": item.get("conflict_priority"),
             "conflictSeverity": item.get("conflict_severity"),
             "reason_codes": list(item.get("reason_codes") or []),
+            "accepted_with_warning": bool(item.get("accepted_with_warning")),
+            "warning_code": item.get("warning_code"),
+            "warnings": list(item.get("warnings") or []),
             "scheduled_start": s_start_val,
             "scheduled_end": s_end_val,
             "prep_buffer": item.get("prep_buffer", DEFAULT_PREP_BUFFER),

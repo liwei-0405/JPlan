@@ -111,7 +111,7 @@ export function PlanningInputPage({
   // Chat state
   const [chatInput, setChatInput] = useState("");
   const [isProcessing, setIsProcessing] = useState(false);
-  const [conversationHistory, setConversationHistory] = useState<Array<{ role: "user" | "assistant", message: string, status?: "success" | "partial" | "conflict" | "error" }>>([
+  const [conversationHistory, setConversationHistory] = useState<Array<{ role: "user" | "assistant", message: string, status?: "success" | "partial" | "warning" | "conflict" | "error" }>>([
     {
       role: "assistant",
       message: "Hi! I'm your planning assistant. I'll generate a draft schedule here first. Nothing is saved until you press Save & Implement Plan."
@@ -485,7 +485,7 @@ export function PlanningInputPage({
                   <div className="flex-1 overflow-y-auto p-4 space-y-4">
                     {conversationHistory.map((msg, i) => (
                       <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                        <div className={`max-w-[85%] p-3 rounded-2xl text-sm ${msg.role === 'user' ? 'bg-primary text-primary-foreground' : msg.status === 'conflict' ? 'bg-destructive/10 text-destructive border border-destructive/20' : msg.status === 'partial' ? 'bg-yellow-50 text-yellow-900 border border-yellow-200' : 'bg-secondary'
+                        <div className={`max-w-[85%] p-3 rounded-2xl text-sm ${msg.role === 'user' ? 'bg-primary text-primary-foreground' : msg.status === 'conflict' ? 'bg-destructive/10 text-destructive border border-destructive/20' : msg.status === 'partial' || msg.status === 'warning' ? 'bg-yellow-50 text-yellow-900 border border-yellow-200' : 'bg-secondary'
                           }`}>
                           {msg.message}
                         </div>

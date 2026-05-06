@@ -42,6 +42,81 @@ class NaturalConflictReplyClient:
             return response
 
 
+class BadCoffeeTimeReplyClient:
+    class models:
+        @staticmethod
+        def generate_content(*args, **kwargs):
+            response = FakeResponse()
+            response.text = "I've added your coffee break. It's now on your schedule from 12:00 AM to 1:00 AM."
+            return response
+
+
+class BadShiftDateReplyClient:
+    class models:
+        @staticmethod
+        def generate_content(*args, **kwargs):
+            response = FakeResponse()
+            response.text = "I've successfully updated your plan to May 6th."
+            return response
+
+
+class ParserJsonResponse:
+    def __init__(self, text):
+        self.text = text
+        self.usage_metadata = FakeUsage()
+
+
+class TransientOnceParserModels:
+    def __init__(self):
+        self.calls = 0
+
+    def generate_content(self, *args, **kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError("503 UNAVAILABLE. This model is currently experiencing high demand.")
+        return ParserJsonResponse(
+            """
+            {
+              "intent": "edit",
+              "reply": "I've added a coffee break.",
+              "transcription": "Add a quick 15-minute coffee break right after the meeting.",
+              "date": "2026-05-02",
+              "operations": [
+                {
+                  "op": "add",
+                  "title": "Coffee Break",
+                  "timing_mode": "relative",
+                  "anchor_relation": {"kind": "after", "target_title": "Project Meeting"},
+                  "duration_minutes": 15
+                }
+              ],
+              "activities": [],
+              "preferences": {},
+              "conflict_analysis": "No conflict."
+            }
+            """
+        )
+
+
+class TransientOnceParserClient:
+    def __init__(self):
+        self.models = TransientOnceParserModels()
+
+
+class Always503ParserModels:
+    def __init__(self):
+        self.calls = 0
+
+    def generate_content(self, *args, **kwargs):
+        self.calls += 1
+        raise RuntimeError("503 UNAVAILABLE. This model is currently experiencing high demand.")
+
+
+class Always503ParserClient:
+    def __init__(self):
+        self.models = Always503ParserModels()
+
+
 def _initial_parsed_request():
     return {
         "intent": "schedule",
@@ -119,6 +194,29 @@ def _with_allow_clash(envelope, allow_clash):
     updated["preferences"]["allow_clash"] = allow_clash
     updated["preferences"]["planning_mode"] = updated["planning_mode"]
     return updated
+
+
+def _build_single_activity_with_location(engine, request_text, title, raw_location=None):
+    operation = {
+        "op": "add",
+        "title": title,
+        "duration_minutes": 60,
+    }
+    if raw_location is not None:
+        operation["location"] = raw_location
+    result = engine.build_schedule_response(
+        parsed={
+            "intent": "add",
+            "reply": "Draft created.",
+            "transcription": request_text,
+            "date": "2026-05-02",
+            "preferences": {"allow_clash": False},
+            "operations": [operation],
+        },
+        current_schedule=None,
+        latest_request=request_text,
+    )
+    return _activity_by_title(result["schedule_data"], title)
 
 
 def test_multi_turn_plan_state_persists_canonical_activities():
@@ -285,6 +383,108 @@ def test_impossible_lunch_clash_allowed_commits_with_conflict_metadata():
     assert lunch_conflict["user_forced"] is True
 
 
+def test_generic_travel_operation_is_not_saved_as_activity():
+    engine = SchedulingEngine(DummyClient())
+    result = engine.build_schedule_response(
+        parsed={
+            "intent": "add",
+            "reply": "Draft created.",
+            "transcription": "Schedule meeting and seminar with travel time.",
+            "date": "2026-05-24",
+            "preferences": {"allow_clash": False},
+            "operations": [
+                {
+                    "op": "add",
+                    "title": "Project Meeting",
+                    "timing_mode": TimingMode.FIXED,
+                    "fixed_start": "09:00",
+                    "duration_minutes": 90,
+                    "location": "office",
+                },
+                {
+                    "op": "add",
+                    "title": "Travel",
+                    "timing_mode": TimingMode.RELATIVE,
+                    "anchor_relation": {"kind": "after", "target_title": "Project Meeting"},
+                    "duration_minutes": 30,
+                    "location": "null",
+                },
+                {
+                    "op": "add",
+                    "title": "Seminar",
+                    "timing_mode": TimingMode.FIXED,
+                    "fixed_start": "11:00",
+                    "duration_minutes": 90,
+                    "location": "library",
+                },
+            ],
+        },
+        current_schedule=None,
+        latest_request="Schedule meeting and seminar with travel time.",
+    )["schedule_data"]
+
+    assert _count_title(result, "Travel") == 0
+    assert any(block.get("block_type") == "transition" for block in result["schedule_blocks"])
+
+
+def test_existing_generic_travel_activity_is_dropped_on_reload():
+    engine = SchedulingEngine(DummyClient())
+    envelope = engine.build_schedule_response(
+        parsed=_initial_parsed_request(),
+        current_schedule=None,
+        latest_request="initial",
+    )["schedule_data"]
+    envelope["activities"].append(
+        {
+            "id": "bad-travel",
+            "type": "activity",
+            "title": "Travel",
+            "startTime": "10:30 AM",
+            "endTime": "11:00 AM",
+            "location": "null",
+        }
+    )
+
+    result = engine.apply_operations(
+        envelope=envelope,
+        operations=[
+            {"op": "add", "title": "Reading", "fixed_start": "20:00", "duration_minutes": 30, "location": "null"}
+        ],
+        base_version=envelope["version"],
+    )
+
+    assert result["status"] == "success"
+    assert _count_title(result["envelope"], "Travel") == 0
+    assert _activity_by_title(result["envelope"], "Reading")["location"] is None
+
+
+def test_real_travel_commitment_is_preserved():
+    engine = SchedulingEngine(DummyClient())
+    result = engine.build_schedule_response(
+        parsed={
+            "intent": "add",
+            "reply": "Draft created.",
+            "transcription": "I have a flight to KL at 8 AM.",
+            "date": "2026-05-24",
+            "preferences": {"allow_clash": False},
+            "operations": [
+                {
+                    "op": "add",
+                    "title": "Flight to KL",
+                    "timing_mode": TimingMode.FIXED,
+                    "fixed_start": "08:00",
+                    "duration_minutes": 90,
+                    "location": "airport",
+                }
+            ],
+        },
+        current_schedule=None,
+        latest_request="I have a flight to KL at 8 AM.",
+    )["schedule_data"]
+
+    assert _count_title(result, "Flight to KL") == 1
+
+
 def test_result_reply_is_truthful_for_rejected_conflict():
     engine = SchedulingEngine(DummyClient())
     envelope = engine.build_schedule_response(
@@ -367,6 +567,293 @@ def test_result_reply_rejects_false_failure_claim_for_successful_schedule():
     assert reply["reply_status"] == "success"
     assert "not applied" not in reply["reply"].lower()
     assert reply["token_usage"]["total"] == 12
+
+
+def test_warning_reply_uses_final_coffee_break_block_times():
+    engine = SchedulingEngine(BadCoffeeTimeReplyClient())
+    envelope = engine.build_schedule_response(
+        parsed=_initial_parsed_request(),
+        current_schedule=None,
+        latest_request="Generate my busy workday.",
+    )["schedule_data"]
+
+    result = engine.apply_operations(
+        envelope=envelope,
+        operations=[
+            {
+                "op": "add",
+                "title": "Coffee Break",
+                "timing_mode": TimingMode.RELATIVE,
+                "anchor_relation": {"kind": "after", "target_title": "Project Meeting"},
+                "duration_minutes": 15,
+                "notes": "Add a quick 15-minute coffee break right after the meeting.",
+            }
+        ],
+        base_version=envelope["version"],
+    )
+    reply = engine.compose_result_reply(
+        latest_request="Add a quick 15-minute coffee break right after the meeting.",
+        parsed={
+            "operations": [
+                {
+                    "op": "add",
+                    "title": "Coffee Break",
+                    "timing_mode": TimingMode.RELATIVE,
+                    "anchor_relation": {"kind": "after", "target_title": "Project Meeting"},
+                    "duration_minutes": 15,
+                }
+            ]
+        },
+        result=result,
+        allow_clash=False,
+    )
+
+    coffee_block = next(
+        block for block in result["envelope"]["schedule_blocks"]
+        if block.get("block_type") == "activity" and block.get("title") == "Coffee Break"
+    )
+    tight_travel = result["envelope"]["schedule_blocks"][
+        result["envelope"]["schedule_blocks"].index(coffee_block) + 1
+    ]
+
+    assert result["status"] == "warning"
+    assert result["envelope"]["status"] == "warning"
+    assert coffee_block["start"] == "10:30 AM"
+    assert coffee_block["end"] == "10:45 AM"
+    assert tight_travel["block_type"] == "transition"
+    assert tight_travel["is_tight"] is True
+    assert reply["reply_status"] == "warning"
+    assert "10:30 AM" in reply["reply"]
+    assert "10:45 AM" in reply["reply"]
+    assert "12:00 AM" not in reply["reply"]
+    assert "1:00 AM" not in reply["reply"]
+    assert reply["reply_source"] == "fallback-template"
+
+
+def test_coffee_break_tight_transition_is_warning_not_rejected(capsys):
+    engine = SchedulingEngine(DummyClient())
+    envelope = engine.build_schedule_response(
+        parsed=_initial_parsed_request(),
+        current_schedule=None,
+        latest_request="Generate my busy workday.",
+    )["schedule_data"]
+    capsys.readouterr()
+
+    result = engine.apply_operations(
+        envelope=envelope,
+        operations=[
+            {
+                "op": "add",
+                "title": "Coffee Break",
+                "timing_mode": TimingMode.RELATIVE,
+                "anchor_relation": {"kind": "after", "target_title": "Project Meeting"},
+                "duration_minutes": 15,
+            }
+        ],
+        base_version=envelope["version"],
+    )
+    captured = capsys.readouterr().out
+
+    assert "[ACCEPTED_TIGHT_TRANSITION] 'Coffee Break'" in captured
+    assert "[REJECT_REL] 'Coffee Break'" not in captured
+    assert result["status"] == "warning"
+    assert result["envelope"]["accepted_with_warnings"]
+    assert result["envelope"]["accepted_with_warnings"][0]["warning_code"] == "TIGHT_TRANSITION"
+    assert result["envelope"]["warnings"][0]["warning_code"] == "TIGHT_TRANSITION"
+    assert result["envelope"]["rejected_changes"] == []
+    assert result["envelope"]["applied_changes"][0]["title"] == "Coffee Break"
+
+
+def test_transient_503_parse_retries_and_applies_simple_request(capsys):
+    client = TransientOnceParserClient()
+    engine = SchedulingEngine(client)
+    envelope = engine.build_schedule_response(
+        parsed=_initial_parsed_request(),
+        current_schedule=None,
+        latest_request="Generate my busy workday.",
+    )["schedule_data"]
+    capsys.readouterr()
+
+    parsed = engine.parse_text_request(
+        "Add a quick 15-minute coffee break right after the meeting.",
+        current_schedule=envelope,
+    )
+    captured = capsys.readouterr().out
+    result = engine.apply_operations(
+        envelope=envelope,
+        operations=parsed["operations"],
+        base_version=envelope["version"],
+    )
+
+    assert client.models.calls == 2
+    assert "[LLM_RETRY] attempt 1/2 after 503" in captured
+    assert "[LLM_RETRY] success on retry" in captured
+    assert parsed["_reply_source"] == "llm"
+    assert _count_title(result["envelope"], "Coffee Break") == 1
+
+
+def test_503_parse_fallback_applies_simple_coffee_request(capsys):
+    client = Always503ParserClient()
+    engine = SchedulingEngine(client)
+    envelope = engine.build_schedule_response(
+        parsed=_initial_parsed_request(),
+        current_schedule=None,
+        latest_request="Generate my busy workday.",
+    )["schedule_data"]
+    capsys.readouterr()
+
+    parsed = engine.parse_text_request(
+        "Add a quick 15-minute coffee break right after the meeting.",
+        current_schedule=envelope,
+    )
+    captured = capsys.readouterr().out
+    result = engine.apply_operations(
+        envelope=envelope,
+        operations=parsed["operations"],
+        base_version=envelope["version"],
+    )
+
+    assert client.models.calls == 3
+    assert "[LLM_FALLBACK_PARSE] Used deterministic fallback parser for simple request" in captured
+    assert parsed["_reply_source"] == "deterministic_fallback"
+    assert parsed["operations"][0]["title"] == "Coffee Break"
+    assert _count_title(result["envelope"], "Coffee Break") == 1
+
+
+def test_initial_generation_reply_lists_all_scheduled_requested_activities():
+    engine = SchedulingEngine(DummyClient())
+    result = engine.build_schedule_response(
+        parsed=_initial_parsed_request(),
+        current_schedule=None,
+        latest_request="Generate my busy workday.",
+    )
+    reply = engine.compose_result_reply(
+        latest_request="Generate my busy workday.",
+        parsed={"operations": _initial_parsed_request()["operations"]},
+        result=result,
+        allow_clash=False,
+    )
+
+    assert reply["reply_status"] == "success"
+    for title in [
+        "Project Meeting",
+        "Seminar",
+        "Lunch",
+        "FYP Implementation",
+        "Grocery Shopping",
+        "Gym Workout",
+    ]:
+        assert title in reply["reply"]
+
+
+def test_normal_create_does_not_log_bulk_date_shift(capsys):
+    engine = SchedulingEngine(DummyClient())
+    engine.build_schedule_response(
+        parsed={**_initial_parsed_request(), "date": "2026-05-24"},
+        current_schedule=None,
+        latest_request="Generate a busy workday for 24th of May.",
+    )
+    captured = capsys.readouterr().out
+
+    assert "Applying bulk date shift" not in captured
+
+
+def test_whole_plan_shift_preserves_26th_may_from_user_text():
+    engine = SchedulingEngine(DummyClient())
+    parsed = engine._normalize_plan_level_operations(
+        {
+            "intent": "edit",
+            "date": "2026-05-06",
+            "operations": [{"op": "move", "title": "Whole Plan"}],
+            "activities": [],
+            "preferences": {},
+        },
+        "Move this whole plan to 26th May.",
+        {"date": "2026-05-24", "activities": [], "version": 1},
+    )
+
+    assert parsed["date"] == "2026-05-26"
+    assert parsed["operations"][0]["op"] == "shift_plan_date"
+    assert parsed["operations"][0]["to_date"] == "2026-05-26"
+    assert parsed["operations"][0]["to_date"] != "2026-05-06"
+
+
+def test_whole_plan_shift_correction_overrides_previous_wrong_day():
+    engine = SchedulingEngine(DummyClient())
+    parsed = engine._normalize_plan_level_operations(
+        {
+            "intent": "edit",
+            "date": "2026-05-06",
+            "operations": [],
+            "activities": [],
+            "preferences": {},
+        },
+        "not 6th its 26th may",
+        {"date": "2026-05-06", "activities": [], "version": 1},
+    )
+
+    assert parsed["date"] == "2026-05-26"
+    assert parsed["operations"][0]["op"] == "shift_plan_date"
+    assert parsed["operations"][0]["from_date"] == "2026-05-06"
+    assert parsed["operations"][0]["to_date"] == "2026-05-26"
+
+
+def test_explicit_shift_plan_date_still_logs_bulk_date_shift(capsys):
+    engine = SchedulingEngine(DummyClient())
+    source = engine.build_schedule_response(
+        parsed={**_initial_parsed_request(), "date": "2026-05-05"},
+        current_schedule=None,
+        latest_request="source",
+    )["schedule_data"]
+    capsys.readouterr()
+
+    engine.apply_operations(
+        envelope=source,
+        operations=[
+            {
+                "op": "shift_plan_date",
+                "from_date": "2026-05-05",
+                "to_date": "2026-05-06",
+                "scope": "all_active_activities",
+            }
+        ],
+        base_version=source["version"],
+    )
+    captured = capsys.readouterr().out
+
+    assert "Applying bulk date shift from 2026-05-05 to 2026-05-06" in captured
+
+
+def test_shift_reply_rejects_wrong_llm_date():
+    engine = SchedulingEngine(BadShiftDateReplyClient())
+    source = engine.build_schedule_response(
+        parsed={**_initial_parsed_request(), "date": "2026-05-24"},
+        current_schedule=None,
+        latest_request="source",
+    )["schedule_data"]
+    operation = {
+        "op": "shift_plan_date",
+        "from_date": "2026-05-24",
+        "to_date": "2026-05-26",
+        "scope": "all_active_activities",
+    }
+
+    shifted = engine.apply_operations(
+        envelope=source,
+        operations=[operation],
+        base_version=source["version"],
+    )
+    reply = engine.compose_result_reply(
+        latest_request="Move this whole plan to 26th May.",
+        parsed={"operations": [operation]},
+        result=shifted,
+        allow_clash=False,
+    )
+
+    assert shifted["status"] == "success"
+    assert "May 26" in reply["reply"]
+    assert "May 6" not in reply["reply"]
+    assert reply["reply_source"] == "fallback-template"
 
 
 def test_failed_anchor_postcondition_rejects_false_success_reply():
@@ -485,6 +972,51 @@ def test_existing_unrelated_clash_does_not_block_unrelated_edit_when_allow_clash
     assert reply["reply_status"] == "partial"
     assert "existing" in reply["reply"]
     assert "clash" in reply["reply"]
+
+
+def test_success_reply_mentions_added_dinner_before_retained_existing_clash():
+    engine = SchedulingEngine(DummyClient())
+    envelope = engine.build_schedule_response(
+        parsed=_initial_parsed_request(),
+        current_schedule=None,
+        latest_request="initial",
+    )["schedule_data"]
+    clashing = engine.apply_operations(
+        envelope=_with_allow_clash(envelope, True),
+        operations=[
+            {"op": "move", "title": "Lunch", "fixed_start": "12:00", "notes": "Move lunch to 12 PM."}
+        ],
+        base_version=envelope["version"],
+    )["envelope"]
+    feasibility_first = _with_allow_clash(clashing, False)
+    dinner_operation = {
+        "op": "add",
+        "title": "Dinner",
+        "timing_mode": TimingMode.RELATIVE,
+        "anchor_relation": {"kind": "after", "target_title": "Gym Workout"},
+        "duration_minutes": 60,
+        "location": "home",
+    }
+
+    result = engine.apply_operations(
+        envelope=feasibility_first,
+        operations=[dinner_operation],
+        base_version=feasibility_first["version"],
+    )
+    reply = engine.compose_result_reply(
+        latest_request="after gym add a dinner",
+        parsed={"operations": [dinner_operation]},
+        result=result,
+        allow_clash=False,
+    )
+
+    assert result["applied"] is True
+    assert result["status"] == "success"
+    assert reply["reply_status"] == "partial"
+    assert reply["reply"].startswith("I've added Dinner from ")
+    assert "after Gym Workout" in reply["reply"]
+    assert "Your existing" in reply["reply"]
+    assert "clash is still marked" in reply["reply"]
 
 
 def test_existing_clash_blocks_editing_clashing_activity_when_allow_clash_is_off():
@@ -676,3 +1208,129 @@ def test_whole_plan_shift_with_target_day_conflict_respects_allow_clash():
     assert accepted["status"] == "success"
     assert accepted["envelope"]["date"] == "2026-05-06"
     assert accepted["envelope"]["conflicts"]
+
+
+def test_location_normalizer_overrides_llm_home_for_grocery_without_explicit_home(capsys):
+    engine = SchedulingEngine(DummyClient())
+
+    grocery = _build_single_activity_with_location(
+        engine,
+        "fit in a 45-minute grocery shopping trip",
+        "Grocery Shopping",
+        raw_location="home",
+    )
+    captured = capsys.readouterr().out
+
+    assert grocery["location"] != "home"
+    assert grocery["location"] in {"store", "supermarket", "market"}
+    assert grocery["location_category"] == "supermarket"
+    assert grocery["location_source"] == "deterministic_default"
+    assert grocery["location_status"] == "needs_resolution"
+    assert grocery["raw_llm_location"] == "home"
+    assert grocery["explicit_user_location"] is False
+    assert "[JPLAN][LOCATION] Grocery Shopping" in captured
+    assert "raw_llm_location=home" in captured
+    assert "normalized=store" in captured
+
+
+def test_location_normalizer_keeps_explicit_grocery_at_home():
+    engine = SchedulingEngine(DummyClient())
+
+    grocery = _build_single_activity_with_location(
+        engine,
+        "fit in a 45-minute grocery shopping trip at home",
+        "Grocery Shopping",
+        raw_location="home",
+    )
+
+    assert grocery["location"] == "home"
+    assert grocery["location_category"] == "home"
+    assert grocery["location_source"] == "explicit_user"
+    assert grocery["location_status"] == "resolved"
+    assert grocery["explicit_user_location"] is True
+
+
+def test_location_normalizer_lunch_near_campus_is_explicit_campus_area():
+    engine = SchedulingEngine(DummyClient())
+
+    lunch = _build_single_activity_with_location(
+        engine,
+        "I need to have lunch near campus",
+        "Lunch",
+        raw_location="school",
+    )
+
+    assert lunch["location"] == "school"
+    assert lunch["location_category"] == "campus_area"
+    assert lunch["location_source"] == "explicit_user"
+    assert lunch["location_status"] == "resolved"
+    assert lunch["explicit_user_location"] is True
+
+
+def test_location_normalizer_go_home_for_lunch_is_explicit_home():
+    engine = SchedulingEngine(DummyClient())
+
+    lunch = _build_single_activity_with_location(
+        engine,
+        "I need to go home for lunch",
+        "Lunch",
+        raw_location="home",
+    )
+
+    assert lunch["location"] == "home"
+    assert lunch["location_category"] == "home"
+    assert lunch["location_source"] == "explicit_user"
+    assert lunch["location_status"] == "resolved"
+    assert lunch["explicit_user_location"] is True
+
+
+def test_location_normalizer_defaults_gym_to_fitness_center():
+    engine = SchedulingEngine(DummyClient())
+
+    gym = _build_single_activity_with_location(
+        engine,
+        "1-hour gym workout",
+        "Gym Workout",
+    )
+
+    assert gym["location"] == "gym"
+    assert gym["location_category"] == "fitness_center"
+    assert gym["location_source"] == "deterministic_default"
+    assert gym["location_status"] == "resolved_default"
+
+
+def test_busy_workday_grocery_location_is_store_not_llm_home():
+    engine = SchedulingEngine(DummyClient())
+    request_text = (
+        "Generate a busy workday for me, this is for 24th of May. At that day I have a "
+        "Project Meeting from 9:00 AM to 10:30 AM at the Main Office, followed by a Seminar "
+        "from 11:00 AM to 12:30 PM at the Library. I need to have Lunch with my Girl at "
+        "1:00 PM near the campus. In the afternoon, I must spend 3 hours on my FYP implementation. "
+        "Also, fit in a 45-minute grocery shopping trip and a 1-hour Gym workout."
+    )
+    parsed = {
+        **_initial_parsed_request(),
+        "date": "2026-05-24",
+        "transcription": request_text,
+    }
+    for operation in parsed["operations"]:
+        if operation["title"] == "Grocery Shopping":
+            operation["location"] = "home"
+
+    envelope = engine.build_schedule_response(
+        parsed=parsed,
+        current_schedule=None,
+        latest_request=request_text,
+    )["schedule_data"]
+    grocery = _activity_by_title(envelope, "Grocery Shopping")
+    grocery_block = next(
+        block
+        for block in envelope["schedule_blocks"]
+        if block.get("block_type") == "activity" and block.get("title") == "Grocery Shopping"
+    )
+
+    assert grocery["location"] != "home"
+    assert grocery["location"] in {"store", "supermarket", "market"}
+    assert grocery["location_category"] == "supermarket"
+    assert grocery_block["location"] != "home"
+    assert grocery_block["location_category"] == "supermarket"
