@@ -126,6 +126,29 @@ class Always503ParserClient:
         self.models = Always503ParserModels()
 
 
+class EmptyEditParserModels:
+    def generate_content(self, *args, **kwargs):
+        return ParserJsonResponse(
+            """
+            {
+              "intent": "edit",
+              "reply": "I cannot move lunch because it conflicts with Seminar.",
+              "transcription": "move the lunch to 12pm",
+              "date": "2026-05-02",
+              "operations": [],
+              "activities": [],
+              "preferences": {},
+              "conflict_analysis": "Lunch would overlap Seminar."
+            }
+            """
+        )
+
+
+class EmptyEditParserClient:
+    def __init__(self):
+        self.models = EmptyEditParserModels()
+
+
 class FakeTravelService:
     def __init__(self, route_minutes=12, route_error=None, geocode_candidates=None):
         self.route_minutes_value = route_minutes
@@ -716,6 +739,105 @@ def test_result_reply_reports_forced_clash_when_allow_clash_is_enabled():
     assert reply["reply_status"] == "partial"
     assert reply["recommend_allow_clash"] is False
     assert "creates a clash" in reply["reply"]
+
+
+def test_empty_edit_operations_uses_fallback_fixed_time_update():
+    engine = SchedulingEngine(EmptyEditParserClient())
+    current_schedule = {
+        "date": "2026-05-02",
+        "activities": [
+            {"title": "Seminar", "startTime": "11:00 AM", "endTime": "12:30 PM"},
+            {"title": "Lunch", "startTime": "01:00 PM", "endTime": "02:00 PM"},
+        ],
+    }
+
+    parsed = engine.parse_text_request(
+        "move the lunch to 12pm",
+        current_schedule=current_schedule,
+    )
+
+    assert parsed["_reply_source"] == "deterministic_fallback"
+    assert parsed["operations"]
+    assert parsed["operations"][0]["title"] == "Lunch"
+    assert parse_clock(parsed["operations"][0]["fixed_start"]) == parse_clock("12:00 PM")
+
+
+def test_pronoun_fixed_time_update_resolves_last_target_from_history():
+    engine = SchedulingEngine(Always503ParserClient())
+    current_schedule = {
+        "date": "2026-05-02",
+        "activities": [
+            {"title": "Seminar", "startTime": "11:00 AM", "endTime": "12:30 PM"},
+            {"title": "Lunch", "startTime": "01:00 PM", "endTime": "02:00 PM"},
+        ],
+    }
+
+    parsed = engine.parse_text_request(
+        "move it to 12pm",
+        history=[
+            {"role": "user", "message": "move lunch to 12pm"},
+            {"role": "assistant", "message": "I couldn't move Lunch because it overlaps Seminar."},
+        ],
+        current_schedule=current_schedule,
+    )
+
+    assert parsed["operations"][0]["title"] == "Lunch"
+    assert parse_clock(parsed["operations"][0]["fixed_start"]) == parse_clock("12:00 PM")
+
+
+def test_unrequested_fixed_event_mutation_is_ignored_not_applied():
+    engine = SchedulingEngine(DummyClient())
+    envelope = engine.build_schedule_response(
+        parsed=_initial_parsed_request(),
+        current_schedule=None,
+        latest_request="initial",
+    )["schedule_data"]
+
+    result = engine.apply_operations(
+        envelope=envelope,
+        operations=[
+            {
+                "op": "update",
+                "title": "Seminar",
+                "fixed_start": "12:30",
+                "_user_message": "move lunch to 12pm",
+            },
+            {
+                "op": "update",
+                "title": "Lunch",
+                "timing_mode": TimingMode.FIXED,
+                "fixed_start": "12:00",
+                "_user_message": "move lunch to 12pm",
+            },
+        ],
+        base_version=envelope["version"],
+    )
+
+    assert result["status"] == "conflict"
+    assert result["ignored_operations"]
+    assert result["ignored_operations"][0]["target"] == "Seminar"
+    assert _activity_by_title(result["envelope"], "Seminar")["fixed_start"] == parse_clock("11:00 AM")
+
+
+def test_no_operation_result_reply_is_not_success():
+    engine = SchedulingEngine(DummyClient())
+    result = {
+        "status": "no_operation",
+        "applied": False,
+        "envelope": {"date": "2026-05-02", "schedule_blocks": [], "activities": []},
+        "updatedActivities": [],
+        "ignored_operations": [],
+    }
+
+    reply = engine.compose_result_reply(
+        latest_request="move lunch to 12pm",
+        parsed={"intent": "no_operation", "operations": []},
+        result=result,
+        allow_clash=False,
+    )
+
+    assert reply["reply_status"] == "clarification_needed"
+    assert "could not" in reply["reply"].lower()
 
 
 def test_result_reply_rejects_false_failure_claim_for_successful_schedule():

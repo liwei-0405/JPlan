@@ -27,7 +27,7 @@ export type PatchResponse = {
 
 export type ChatResponse = {
     reply: string;
-    reply_status?: 'success' | 'partial' | 'warning' | 'location_pending' | 'conflict' | 'error';
+    reply_status?: 'success' | 'partial' | 'warning' | 'location_pending' | 'conflict' | 'error' | 'clarification_needed' | 'not_applied';
     recommend_allow_clash?: boolean;
     reply_reason?: string | null;
     patch?: PatchResponse;
@@ -47,6 +47,7 @@ export async function chatWithLLM(
     accurateTravelTime: boolean = false,
 ): Promise<ChatResponse> {
     try {
+        console.log('[JPLAN][CHAT_FLAGS]', { allow_clash: allowClash, accurate_travel_time: accurateTravelTime });
         const response = await fetch(`${API_BASE_URL}/chat`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },

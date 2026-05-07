@@ -259,6 +259,11 @@ def log_total_token_usage(parsed: Dict[str, Any], reply_meta: Optional[Dict[str,
 @app.post("/chat", response_model=ChatResponse)
 async def chat_with_llm(request: ChatRequest):
     debug_log(f"Received chat | user={request.user_id} | message={request.message!r}")
+    jlog(
+        "API",
+        f"allow_clash={bool(request.allow_clash)} accurate_travel_time={bool(request.accurate_travel_time)}",
+        "FLAGS",
+    )
     
     try:
         # Full envelope for internal processing
@@ -305,6 +310,15 @@ async def chat_with_llm(request: ChatRequest):
         
         intent = parsed.get("intent", "chat")
         reply = parsed.get("reply", "I've processed your request.")
+        if intent == "no_operation":
+            log_total_token_usage(parsed)
+            return ChatResponse(
+                reply=reply,
+                transcription=parsed.get("transcription"),
+                reply_status="clarification_needed",
+                recommend_allow_clash=False,
+                reply_reason=parsed.get("_failure_type") or "no_operation",
+            )
         
         if intent == "chat" and not parsed.get("operations") and not parsed.get("activities"):
             log_total_token_usage(parsed)

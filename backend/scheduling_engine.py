@@ -217,6 +217,9 @@ STRICT RULES:
 6. If the user wants to move the whole plan to another date, use op="shift_plan_date" with from_date, to_date, and scope="all_active_activities".
 7. Do NOT create operations for generic travel, transit, prep, buffer, free-time, or idle blocks. If the user says to account for travel time, keep only the real activities and their locations; the scheduler will add travel blocks automatically.
 8. Keep real travel activities only when they are concrete user commitments, such as "Flight to KL", "Train Ride", "Road Trip", or "Airport Transfer".
+9. You are ONLY the parser. Never reject a requested schedule change because of conflict. Always output the requested operation; the backend scheduler decides feasibility and Allow Clash behavior.
+10. For edit/add/move requests, operations must not be empty. If the user asks "move lunch to 12pm", output update Lunch fixed_start="12:00" even if it may overlap another event.
+11. Do not add extra operations that mutate fixed anchor/blocker events unless the user explicitly asks to move that event by name.
 """
 
 
@@ -692,7 +695,7 @@ class SchedulingEngine:
                 raw_llm_reply = str(parsed.get("reply") or "").strip() or None
         except json.JSONDecodeError as exc:
             self._debug(f"LLM parse exception | type={type(exc).__name__} | message={str(exc)}")
-            fallback = self._deterministic_fallback_parse(latest_request, current_schedule)
+            fallback = self._deterministic_fallback_parse(latest_request, current_schedule, history)
             if fallback:
                 self._debug_json("Deterministic fallback parse result", fallback)
                 return fallback
@@ -708,7 +711,7 @@ class SchedulingEngine:
             return invalid
         except Exception as exc:
             self._debug(f"LLM call exception | type={type(exc).__name__} | message={str(exc)}")
-            fallback = self._deterministic_fallback_parse(latest_request, current_schedule)
+            fallback = self._deterministic_fallback_parse(latest_request, current_schedule, history)
             if fallback:
                 self._debug_json("Deterministic fallback parse result", fallback)
                 return fallback
@@ -724,7 +727,7 @@ class SchedulingEngine:
             return invalid
 
         if not isinstance(parsed, dict):
-            fallback = self._deterministic_fallback_parse(latest_request, current_schedule)
+            fallback = self._deterministic_fallback_parse(latest_request, current_schedule, history)
             if fallback:
                 self._debug_json("Deterministic fallback parse result", fallback)
                 return fallback
@@ -751,6 +754,24 @@ class SchedulingEngine:
             parsed["_token_usage"] = token_usage
         parsed = self._normalize_plan_level_operations(parsed, latest_request, current_schedule)
         parsed = self._normalize_parsed_locations(parsed, latest_request, saved_locations)
+        if self._is_schedule_change_intent(parsed) and not parsed.get("operations") and not parsed.get("activities"):
+            jlog(
+                "MODULE_A",
+                "Empty operations for edit intent. Attempting deterministic fallback parse.",
+                "SAFETY",
+            )
+            fallback = self._deterministic_fallback_parse(latest_request, current_schedule, history)
+            if fallback:
+                self._debug_json("Deterministic fallback parse result", fallback)
+                return fallback
+            parsed["intent"] = "no_operation"
+            parsed["reply"] = "I could not understand or apply the requested change. Please try again with the activity name and time."
+            parsed["_failure_type"] = "empty_operations"
+        jlog(
+            "MODULE_A",
+            f"parser_rejected_request=false operations_count={len(parsed.get('operations') or [])}",
+            "SAFETY",
+        )
         self._debug_json("LLM parsed request", parsed)
         self._debug(
             f"Parsed request | intent={parsed.get('intent')} | parsed_date={parsed.get('date')} | activities={len(parsed.get('activities', []))} | operations={len(parsed.get('operations', []))}"
@@ -961,6 +982,7 @@ class SchedulingEngine:
         self,
         latest_request: str,
         current_schedule: Optional[Dict[str, Any]],
+        history: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[Dict[str, Any]]:
         request = re.sub(r"\s+", " ", latest_request or "").strip()
         clean_request = clean_title(request)
@@ -983,7 +1005,7 @@ class SchedulingEngine:
             parsed = self._fallback_parse_relative_add(request, schedule_date)
 
         if parsed is None:
-            parsed = self._fallback_parse_fixed_time_update(request, schedule_date)
+            parsed = self._fallback_parse_fixed_time_update(request, schedule_date, current_schedule, history or [])
 
         if parsed is None:
             return None
@@ -995,6 +1017,13 @@ class SchedulingEngine:
         parsed = self._normalize_plan_level_operations(parsed, latest_request, current_schedule)
         parsed = self._normalize_parsed_locations(parsed, latest_request, [])
         return parsed
+
+    def _is_schedule_change_intent(self, parsed: Dict[str, Any]) -> bool:
+        intent = clean_title(parsed.get("intent") or "")
+        if intent in {"edit", "add", "move", "schedule", "create", "update"}:
+            return True
+        request = clean_title(parsed.get("transcription") or "")
+        return bool(re.search(r"\b(move|shift|change|update|add|remove|delete|reschedule)\b", request))
 
     def _fallback_parse_relative_add(self, request: str, schedule_date: str) -> Optional[Dict[str, Any]]:
         text = clean_title(request)
@@ -1044,9 +1073,15 @@ class SchedulingEngine:
             "preferences": {},
         }
 
-    def _fallback_parse_fixed_time_update(self, request: str, schedule_date: str) -> Optional[Dict[str, Any]]:
+    def _fallback_parse_fixed_time_update(
+        self,
+        request: str,
+        schedule_date: str,
+        current_schedule: Optional[Dict[str, Any]] = None,
+        history: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[Dict[str, Any]]:
         match = re.search(
-            r"\b(?:move|update|change|shift)\s+(?:my\s+|the\s+)?(?P<title>.+?)\s+to\s+(?P<time>\d{1,2}(?::\d{2})?\s*(?:am|pm))\b",
+            r"\b(?:move|update|change|shift)\s+(?:my\s+|the\s+)?(?P<title>.+?)\s+to\s+(?P<time>\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\b",
             request,
             flags=re.IGNORECASE,
         )
@@ -1055,7 +1090,10 @@ class SchedulingEngine:
         fixed_start = parse_clock(match.group("time"))
         if fixed_start is None:
             return None
-        title = self._clean_fallback_activity_title(match.group("title"))
+        raw_title = self._clean_fallback_activity_title(match.group("title"))
+        title = raw_title
+        if clean_title(raw_title) in {"it", "this", "that"}:
+            title = self._resolve_pronoun_target_from_context(request, current_schedule, history or []) or raw_title
         if not title:
             return None
         return {
@@ -1072,6 +1110,36 @@ class SchedulingEngine:
             "activities": [],
             "preferences": {},
         }
+
+    def _resolve_pronoun_target_from_context(
+        self,
+        request: str,
+        current_schedule: Optional[Dict[str, Any]],
+        history: List[Dict[str, Any]],
+    ) -> Optional[str]:
+        activities = [
+            item for item in (current_schedule or {}).get("activities", [])
+            if isinstance(item, dict) and item.get("title")
+        ]
+        titles = [str(item.get("title")) for item in activities]
+        if not titles:
+            return None
+
+        user_messages = []
+        assistant_messages = []
+        for item in reversed(history or []):
+            text = str(item.get("message") or item.get("content") or "")
+            if text and text != request:
+                if item.get("role") == "user":
+                    user_messages.append(text)
+                else:
+                    assistant_messages.append(text)
+        for message in user_messages + assistant_messages:
+            clean_message = clean_title(message)
+            for title in titles:
+                if clean_title(title) in clean_message:
+                    return title
+        return None
 
     def _clean_fallback_activity_title(self, value: str) -> str:
         text = re.sub(r"\b(right|quick|my|the)\b", " ", value or "", flags=re.IGNORECASE)
@@ -3579,6 +3647,17 @@ class SchedulingEngine:
                     "suggested_resolution": self._conflict_suggestions(left, right),
                 }
                 conflicts.append(conflict)
+                if user_forced:
+                    jlog(
+                        "MODULE_C",
+                        f"Placing {left.get('title') if left_id in forced_ids else right.get('title')} despite overlap with {right.get('title') if left_id in forced_ids else left.get('title')}",
+                        "ALLOW_CLASH",
+                    )
+                    jlog(
+                        "MODULE_C",
+                        f"{left.get('title')} overlaps {right.get('title')} {format_clock(overlap_start)}-{format_clock(overlap_end)}",
+                        "CONFLICT_ALLOWED",
+                    )
                 for activity in (left, right):
                     activity["is_conflict"] = True
                     activity["is_conflicting"] = True
@@ -3708,8 +3787,9 @@ class SchedulingEngine:
         self,
         operations: List[Dict[str, Any]],
         active_pool: List[Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         prepared: List[Dict[str, Any]] = []
+        ignored: List[Dict[str, Any]] = []
 
         for raw_operation in operations:
             operation = self._normalize_operation(raw_operation)
@@ -3734,8 +3814,16 @@ class SchedulingEngine:
                 and message
                 and not self._message_explicitly_targets_activity(message, target.get("title", ""))
             ):
-                self._debug(
-                    f"[STATE] Ignored parser operation that tried to pin unrelated activity '{target.get('title')}'"
+                ignored_item = {
+                    "operation": operation,
+                    "target": target.get("title"),
+                    "reason": "unrequested_fixed_event_mutation",
+                }
+                ignored.append(ignored_item)
+                jlog(
+                    "STATE",
+                    f"Ignored unrequested operation target={target.get('title')} reason=unrequested_fixed_event_mutation",
+                    "OP_FILTER",
                 )
                 continue
 
@@ -3747,12 +3835,22 @@ class SchedulingEngine:
                 and message
                 and not self._message_explicitly_targets_activity(message, target.get("title", ""))
             ):
-                self._debug(f"[STATE] Ignored parser operation that tried to move fixed anchor '{target.get('title')}'")
+                ignored_item = {
+                    "operation": operation,
+                    "target": target.get("title"),
+                    "reason": "unrequested_fixed_event_mutation",
+                }
+                ignored.append(ignored_item)
+                jlog(
+                    "STATE",
+                    f"Ignored unrequested operation target={target.get('title')} reason=unrequested_fixed_event_mutation",
+                    "OP_FILTER",
+                )
                 continue
 
             prepared.append(operation)
 
-        return prepared
+        return prepared, ignored
 
     def _operation_postcondition(
         self,
@@ -4177,10 +4275,23 @@ class SchedulingEngine:
         source_plan_date = working_envelope.get("date")
         existing_conflict_identities = self._existing_conflict_identities(working_envelope)
         postconditions: List[Dict[str, Any]] = []
-        operations_to_apply = self._prepare_operations_for_apply(
+        operations_to_apply, ignored_operations = self._prepare_operations_for_apply(
             self._sanitize_operations(operations),
             [item for item in canonical_activities if item.get("status") == "active"],
         )
+        if not operations_to_apply and ignored_operations:
+            return {
+                "status": "no_operation",
+                "applied": False,
+                "envelope": working_envelope,
+                "version": current_version,
+                "activities": working_envelope.get("activities", []),
+                "updatedActivities": [],
+                "deletedItemIds": [],
+                "ignored_operations": ignored_operations,
+                "rejected_changes": [],
+                "reply_reason": "All parser operations were ignored because they targeted unrequested fixed events.",
+            }
         explicit_shift_requested = any(
             operation.get("op") == "shift_plan_date"
             for operation in operations_to_apply
@@ -4330,7 +4441,7 @@ class SchedulingEngine:
 
         jsection("MODULE_9", f"replanning date={schedule_date}", "REPLAN")
         planned_result = self._plan_schedule(schedule_date, active_set, preferences)
-        conflicts = self._build_conflicts(planned_result["activities"], mutated_ids)
+        conflicts = self._build_conflicts(planned_result["activities"], mutated_ids if allow_clash else set())
         for conflict in conflicts:
             identity = self._conflict_identity(conflict)
             conflict["conflict_lifecycle"] = "existing" if identity in existing_conflict_identities else "new"
@@ -4347,7 +4458,9 @@ class SchedulingEngine:
         )
         if postcondition_failures and not allow_clash:
             self._debug(f"[CONFLICT] Requested ordering was not satisfied: {postcondition_failures[0].get('reason')}")
-            return self._build_postcondition_response(working_envelope, current_version, postcondition_failures, allow_clash=allow_clash)
+            response = self._build_postcondition_response(working_envelope, current_version, postcondition_failures, allow_clash=allow_clash)
+            response["ignored_operations"] = ignored_operations
+            return response
 
         blocking_conflicts = [
             conflict for conflict in conflicts
@@ -4364,7 +4477,9 @@ class SchedulingEngine:
                         for blocker_id in planned_activity.get("conflict_with") or []
                         if planned_by_id.get(blocker_id)
                     ]
-                    return self._build_conflict_response(working_envelope, current_version, planned_activity, blockers, allow_clash=allow_clash)
+                    response = self._build_conflict_response(working_envelope, current_version, planned_activity, blockers, allow_clash=allow_clash)
+                    response["ignored_operations"] = ignored_operations
+                    return response
 
         warnings = self._collect_schedule_warnings(planned_result["activities"], planned_result["schedule_blocks"])
         final_updated_activities = [
@@ -4401,6 +4516,7 @@ class SchedulingEngine:
             if str(warning.get("activity_id")) in {str(activity_id) for activity_id in mutated_ids}
         ]
         updated_envelope["rejected_changes"] = []
+        updated_envelope["ignored_operations"] = ignored_operations
         updated_envelope["unmet_items"] = []
         updated_envelope["validation_issues"] = [failure.get("reason") for failure in postcondition_failures if failure.get("reason")]
         updated_envelope["conflict"] = conflicts[0] if conflicts else ({"type": "postcondition_failed", **postcondition_failures[0]} if postcondition_failures else None)
@@ -4441,6 +4557,7 @@ class SchedulingEngine:
             "applied_changes": final_updated_activities,
             "accepted_with_warnings": updated_envelope["accepted_with_warnings"],
             "rejected_changes": [],
+            "ignored_operations": ignored_operations,
             "warnings": warnings,
         }
 
@@ -4461,7 +4578,8 @@ class SchedulingEngine:
         schedule_blocks = list(envelope.get("schedule_blocks") or [])
         changed = result.get("updatedActivities") or envelope.get("applied_changes") or []
         referenced_blocks = self._referenced_activity_blocks(schedule_blocks, requested_titles, changed)
-        if not referenced_blocks and envelope.get("activities"):
+        result_applied = bool(result.get("applied", result.get("status") not in {"conflict", "no_operation", "clarification_needed"}))
+        if not referenced_blocks and result_applied and envelope.get("activities"):
             referenced_blocks = self._referenced_activity_blocks(schedule_blocks, [], envelope.get("activities", [])[:8])
 
         status = result.get("status") or envelope.get("status") or ("partial" if conflicts else "success")
@@ -4470,6 +4588,25 @@ class SchedulingEngine:
         if envelope.get("schedule_status") in {"location_pending", "route_conflict"}:
             status = envelope.get("schedule_status")
 
+        allowed_times = set(self._allowed_reply_times(referenced_blocks, warnings))
+        for conflict_item in conflicts[:3]:
+            for key in ("start", "end"):
+                parsed_time = parse_clock(conflict_item.get(key))
+                if parsed_time is not None:
+                    allowed_times.add(format_clock(parsed_time))
+        for failure in postcondition_results[:3]:
+            for key in (
+                "target_start",
+                "target_end",
+                "anchor_start",
+                "anchor_end",
+                "available_window_start",
+                "available_window_end",
+            ):
+                parsed_time = parse_clock(failure.get(key))
+                if parsed_time is not None:
+                    allowed_times.add(format_clock(parsed_time))
+
         return {
             "status": status,
             "envelope_status": envelope.get("status"),
@@ -4477,18 +4614,20 @@ class SchedulingEngine:
             "travel_validation_status": envelope.get("travel_validation_status"),
             "location_resolution_requests": envelope.get("location_resolution_requests") or [],
             "route_conflicts": envelope.get("route_conflicts") or [],
-            "applied": bool(result.get("applied", result.get("status") != "conflict")),
+            "applied": result_applied,
             "allow_clash": allow_clash,
             "date": envelope.get("date"),
             "shift_operation": shift_operation,
             "primary_operation": primary_operation,
             "conflict": conflict or (conflicts[0] if conflicts else None),
             "conflicts": conflicts[:3],
+            "ignored_operations": result.get("ignored_operations") or envelope.get("ignored_operations") or [],
+            "rejected_changes": result.get("rejected_changes") or envelope.get("rejected_changes") or [],
             "warnings": warnings[:4],
             "postcondition_results": postcondition_results[:3],
             "requested_titles": requested_titles,
             "referenced_blocks": referenced_blocks[:8],
-            "allowed_times": self._allowed_reply_times(referenced_blocks, warnings),
+            "allowed_times": sorted(allowed_times),
             "allowed_dates": self._allowed_reply_dates(envelope, shift_operation),
             "changed": [
                 {
@@ -4746,6 +4885,19 @@ class SchedulingEngine:
             if item.get("conflict_lifecycle") == "existing"
         ]
 
+        if status in {"no_operation", "clarification_needed"} or (
+            status not in {"conflict", "partial", "route_conflict", "location_pending"}
+            and not applied
+            and not summary.get("referenced_blocks")
+            and not summary.get("changed")
+        ):
+            return {
+                "reply": "I could not understand or apply the requested change. Please try again with the activity name and time.",
+                "reply_status": "clarification_needed",
+                "recommend_allow_clash": False,
+                "reply_reason": "no_operation",
+            }
+
         if status == "location_pending":
             requests = summary.get("location_resolution_requests") or []
             titles = ", ".join(str(req.get("title") or "an activity") for req in requests[:4])
@@ -4990,6 +5142,15 @@ class SchedulingEngine:
     ) -> Dict[str, Any]:
         """Second-pass result-aware reply. The LLM phrases; deterministic checks decide truth."""
         summary = self._compact_result_summary(result, allow_clash, parsed)
+        jlog(
+            "MODULE_8",
+            (
+                f"applied_operations={len(summary.get('changed') or [])} "
+                f"rejected_operations={len(summary.get('rejected_changes') or [])} "
+                f"ignored_operations={len(summary.get('ignored_operations') or [])}"
+            ),
+            "TRUTH",
+        )
         fallback = self._fallback_result_reply(latest_request, summary)
 
         jsection("MODULE_8", "result-aware reply", "REPLY")
