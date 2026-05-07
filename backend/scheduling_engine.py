@@ -474,6 +474,11 @@ class SchedulingEngine:
 
         canonical_activities = self._load_canonical_activities(current_schedule)
         existing_active = [item for item in canonical_activities if item.get("status") == "active"]
+        existing_active_ids = {
+            item.get("stable_activity_id")
+            for item in existing_active
+            if item.get("stable_activity_id")
+        }
         requested_operations = list(parsed.get("operations") or [])
         if not requested_operations:
             requested_operations = [{**activity, "op": "add"} for activity in (parsed.get("activities") or [])]
@@ -489,7 +494,7 @@ class SchedulingEngine:
                 resolved_anchor = self._resolve_anchor_relation(anchor, existing_active + canonical_activities)
                 if resolved_anchor:
                     operation["anchor_relation"] = resolved_anchor
-                    if not operation.get("location"):
+                    if not operation.get("location") and self._should_inherit_anchor_location(operation):
                         anchor_activity = self._find_activity_by_stable_id(existing_active + canonical_activities, resolved_anchor.get("target_activity_id"))
                         if anchor_activity and not operation.get("location"):
                             operation["location"] = anchor_activity.get("location")
@@ -502,6 +507,14 @@ class SchedulingEngine:
             )
 
         active_set = [item for item in canonical_activities if item.get("status") == "active"]
+        for item in active_set:
+            if (
+                item.get("stable_activity_id") in existing_active_ids
+                and item.get("scheduled_start") is not None
+                and item.get("scheduled_end") is not None
+                and item.get("timing_mode") != TimingMode.FIXED
+            ):
+                item["preserve_scheduled_time"] = True
         planned_result = self._plan_schedule(schedule_date, active_set, preferences)
         conflicts = self._build_conflicts(planned_result["activities"], set())
         warnings = self._collect_schedule_warnings(planned_result["activities"], planned_result["schedule_blocks"])
@@ -1872,6 +1885,7 @@ class SchedulingEngine:
 
         # Pass 1: Categorize
         fixed: List[Dict[str, Any]] = []
+        preserved: List[Dict[str, Any]] = []
         relative: List[Dict[str, Any]] = []
         flexible: List[Dict[str, Any]] = []
         unscheduled: List[Dict[str, Any]] = []
@@ -1881,6 +1895,12 @@ class SchedulingEngine:
             # Support both snake_case and camelCase
             mode = item.get("timing_mode") or item.get("timingMode") or TimingMode.UNSPECIFIED
             
+            has_preserved_time = (
+                item.get("preserve_scheduled_time")
+                and item.get("scheduled_start") is not None
+                and item.get("scheduled_end") is not None
+            )
+
             if mode == TimingMode.FIXED:
                 fs = item.get("fixed_start")
                 if fs is None:
@@ -1894,6 +1914,13 @@ class SchedulingEngine:
                 else:
                     flexible.append(item)
                     jlog("MODULE_C", f"'{item['title']}' -> FLEX (missing fixed_start)", "CLASSIFY")
+            elif has_preserved_time:
+                preserved.append(item)
+                jlog(
+                    "MODULE_C",
+                    f"'{item['title']}' -> PRESERVE ({format_clock(item['scheduled_start'])}-{format_clock(item['scheduled_end'])})",
+                    "CLASSIFY",
+                )
             elif mode == TimingMode.RELATIVE:
                 relative.append(item)
                 jlog("MODULE_C", f"'{item['title']}' -> RELATIVE", "CLASSIFY")
@@ -1919,83 +1946,71 @@ class SchedulingEngine:
                 timeline.append(self._create_conflict_item(item, timeline, reason))
                 timeline.sort(key=lambda x: x["scheduled_start"])
 
-        # 2. Place RELATIVE items (Narrative Order Matters)
-        relative.sort(key=lambda x: x.get("sequence_index") or 999)
-        
-        for item in relative:
-            anchor = item.get("anchor_relation")
-            if not anchor:
-                flexible.append(item)
-                continue
-
-            target_id = anchor.get("target_activity_id")
-            target_title = anchor.get("target_title")
-            anchor_item = next(
-                (
-                    activity for activity in timeline
-                    if (
-                        target_id and activity.get("stable_activity_id") == target_id
-                    ) or (
-                        target_title and clean_title(activity["title"]) == clean_title(target_title)
-                    )
-                ),
-                None,
-            )
-
-            if not anchor_item:
-                flexible.append(item)
-                continue
-
-            relation_kind = clean_title(anchor.get("kind") or "after")
-            if relation_kind == "before":
-                search_end = anchor_item["scheduled_start"]
-                predecessors = [a for a in timeline if a["scheduled_end"] <= search_end and a.get("id") != anchor_item.get("id")]
-                search_start = max([day_start] + [a["scheduled_end"] for a in predecessors])
-                jlog("MODULE_C", f"'{item['title']}' before '{target_title}' search={format_clock(search_start)}->{format_clock(search_end)}", "PLACE_RELATIVE")
-                inserted, reason = self._insert_best_position(
-                    item, timeline, search_start, search_end, min_travel,
-                    prefer_latest=True
+        # 2. Preserve existing scheduled flexible/preferred activities before
+        # inserting new relative requests. This prevents a small edit from
+        # re-optimizing the whole day and invalidating anchor order.
+        preserved.sort(key=lambda x: x["scheduled_start"])
+        for item in preserved:
+            feasible, reason = self._validate_locked_item(item, timeline, day_start, day_end, min_travel)
+            if feasible:
+                item.setdefault("trace", []).append("Preserved existing scheduled time during replanning.")
+                jlog(
+                    "MODULE_C",
+                    f"Preserving {item.get('title')} at {format_clock(item.get('scheduled_start'))}-{format_clock(item.get('scheduled_end'))}",
+                    "ANCHOR",
                 )
+                timeline.append(item)
+                timeline.sort(key=lambda x: x["scheduled_start"])
             else:
-                search_start = anchor_item["scheduled_end"]
-                search_end = day_end
+                jlog("MODULE_C", f"'{item['title']}' preserve failed reason={reason}", "CLASH")
+                timeline.append(self._create_conflict_item(item, timeline, reason))
+                timeline.sort(key=lambda x: x["scheduled_start"])
 
-                successors = [a for a in timeline if a["scheduled_start"] >= search_start]
-                if successors:
-                    search_end = min(a["scheduled_start"] for a in successors)
+        # 3. Place RELATIVE items. A dependent waits until its anchor has been
+        # placed; if the anchor is still flexible, place the anchor first.
+        pending_relative = sorted(relative, key=lambda x: x.get("sequence_index") or 999)
 
-                jlog("MODULE_C", f"'{item['title']}' after '{target_title}' search={format_clock(search_start)}->{format_clock(search_end)}", "PLACE_RELATIVE")
-                inserted, reason = self._insert_best_position(
-                    item, timeline, search_start, search_end, min_travel,
-                    prefer_earliest=True
-                )
-            
-            if inserted:
-                timeline = inserted
-                item["trace"].append(f"Placed near anchor '{target_title}' to respect sequence.")
-            else:
-                tight_inserted = self._insert_tight_relative_position(
-                    item,
-                    timeline,
-                    search_start,
-                    search_end,
-                    relation_kind,
-                    target_title,
-                )
-                if tight_inserted:
-                    jlog("MODULE_C", f"'{item['title']}' fits activity window but transition is tight", "ACCEPTED_TIGHT_TRANSITION")
-                    timeline = tight_inserted
-                else:
-                    jlog("MODULE_C", f"'{item['title']}' no feasible slot in narrative window", "REJECT_REL")
-                    conflict_timeline = self._insert_as_conflict(
+        while pending_relative:
+            progress = False
+            for item in list(pending_relative):
+                anchor = item.get("anchor_relation")
+                if anchor:
+                    target_title = anchor.get("target_title")
+                    jlog("MODULE_C", f"{item.get('title')} depends on {target_title or anchor.get('target_activity_id')}", "DEPENDENCY")
+
+                anchor_item = self._find_anchor_in_timeline(item.get("anchor_relation"), timeline)
+                if not anchor_item:
+                    placed_anchor = self._place_flexible_anchor_for_relative(
                         item,
+                        flexible,
                         timeline,
-                        search_start if relation_kind == "before" else search_start,
-                        reason or "No space in narrative window.",
+                        day_start,
+                        day_end,
+                        min_travel,
                     )
-                    timeline = conflict_timeline or timeline
+                    if placed_anchor:
+                        timeline, flexible = placed_anchor
+                        progress = True
+                    continue
 
-        # 3. Place FLEXIBLE items
+                new_timeline, handled = self._place_relative_item(
+                    item,
+                    anchor_item,
+                    timeline,
+                    day_start,
+                    day_end,
+                    min_travel,
+                )
+                timeline = new_timeline
+                pending_relative.remove(item)
+                progress = True
+
+            if not progress:
+                for item in pending_relative:
+                    flexible.append(item)
+                pending_relative = []
+
+        # 4. Place FLEXIBLE items
         flexible.sort(key=self._calculate_activity_base_score, reverse=True)
         for item in flexible:
             jlog("MODULE_C", f"'{item['title']}' score={self._calculate_activity_base_score(item)}", "PLACE_FLEX")
@@ -2008,10 +2023,10 @@ class SchedulingEngine:
                     timeline = conflict_timeline or timeline
                 else:
                     unscheduled.append(item)
-        
+
         # FINAL PASS: Materialize
         final_blocks = self._materialize_blocks(timeline, day_start, min_travel)
-        
+
         return {
             "activities": timeline,
             "schedule_blocks": final_blocks,
@@ -2019,6 +2034,156 @@ class SchedulingEngine:
             "day_start": format_clock(day_start),
             "day_end": format_clock(day_end)
         }
+
+    def _find_anchor_in_timeline(
+        self,
+        anchor: Optional[Dict[str, Any]],
+        timeline: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        if not anchor:
+            return None
+        target_id = anchor.get("target_activity_id") or anchor.get("target_id")
+        target_title = anchor.get("target_title")
+        return next(
+            (
+                activity for activity in timeline
+                if (
+                    target_id and activity.get("stable_activity_id") == target_id
+                ) or (
+                    target_title and clean_title(activity.get("title")) == clean_title(target_title)
+                )
+            ),
+            None,
+        )
+
+    def _pop_matching_flexible_anchor(
+        self,
+        anchor: Optional[Dict[str, Any]],
+        flexible: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        if not anchor:
+            return None
+        target_id = anchor.get("target_activity_id") or anchor.get("target_id")
+        target_title = anchor.get("target_title")
+        for index, candidate in enumerate(flexible):
+            if (
+                target_id and candidate.get("stable_activity_id") == target_id
+            ) or (
+                target_title and clean_title(candidate.get("title")) == clean_title(target_title)
+            ):
+                return flexible.pop(index)
+        return None
+
+    def _place_flexible_anchor_for_relative(
+        self,
+        dependent: Dict[str, Any],
+        flexible: List[Dict[str, Any]],
+        timeline: List[Dict[str, Any]],
+        day_start: int,
+        day_end: int,
+        min_travel: Optional[int],
+    ) -> Optional[Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]]:
+        anchor = dependent.get("anchor_relation")
+        anchor_item = self._pop_matching_flexible_anchor(anchor, flexible)
+        if not anchor_item:
+            return None
+
+        inserted, reason = self._insert_best_position(anchor_item, timeline, day_start, day_end, min_travel)
+        if not inserted:
+            flexible.append(anchor_item)
+            jlog(
+                "MODULE_C",
+                f"Could not place anchor {anchor_item.get('title')} before {dependent.get('title')}: {reason}",
+                "ANCHOR",
+            )
+            return None
+
+        placed_anchor = self._find_anchor_in_timeline(
+            {"target_activity_id": anchor_item.get("stable_activity_id"), "target_title": anchor_item.get("title")},
+            inserted,
+        )
+        if placed_anchor:
+            jlog(
+                "MODULE_C",
+                f"Placed anchor {placed_anchor.get('title')} at {format_clock(placed_anchor.get('scheduled_start'))}-{format_clock(placed_anchor.get('scheduled_end'))}",
+                "ANCHOR",
+            )
+        return inserted, flexible
+
+    def _place_relative_item(
+        self,
+        item: Dict[str, Any],
+        anchor_item: Dict[str, Any],
+        timeline: List[Dict[str, Any]],
+        day_start: int,
+        day_end: int,
+        min_travel: Optional[int],
+    ) -> Tuple[List[Dict[str, Any]], bool]:
+        anchor = item.get("anchor_relation")
+        if not anchor:
+            return timeline, False
+
+        relation_kind = clean_title(anchor.get("kind") or "after")
+        target_title = anchor.get("target_title") or anchor_item.get("title")
+        if relation_kind == "before":
+            search_end = anchor_item["scheduled_start"]
+            predecessors = [a for a in timeline if a["scheduled_end"] <= search_end and a.get("id") != anchor_item.get("id")]
+            search_start = max([day_start] + [a["scheduled_end"] for a in predecessors])
+            jlog("MODULE_C", f"'{item['title']}' before '{target_title}' search={format_clock(search_start)}->{format_clock(search_end)}", "PLACE_RELATIVE")
+            inserted, reason = self._insert_best_position(
+                item, timeline, search_start, search_end, min_travel,
+                prefer_latest=True
+            )
+        else:
+            search_start = anchor_item["scheduled_end"]
+            search_end = day_end
+
+            successors = [a for a in timeline if a["scheduled_start"] >= search_start]
+            if successors:
+                search_end = min(a["scheduled_start"] for a in successors)
+
+            jlog("MODULE_C", f"'{item['title']}' after '{target_title}' search={format_clock(search_start)}->{format_clock(search_end)}", "PLACE_RELATIVE")
+            inserted, reason = self._insert_best_position(
+                item, timeline, search_start, search_end, min_travel,
+                prefer_earliest=True
+            )
+
+        if inserted:
+            timeline = inserted
+            placed_item = self._find_anchor_in_timeline(
+                {"target_activity_id": item.get("stable_activity_id"), "target_title": item.get("title")},
+                timeline,
+            )
+            if placed_item:
+                jlog(
+                    "MODULE_C",
+                    f"{item.get('title')} after {target_title} -> {format_clock(placed_item.get('scheduled_start'))}-{format_clock(placed_item.get('scheduled_end'))}",
+                    "PLACE_RELATIVE",
+                )
+                placed_item.setdefault("trace", []).append(f"Placed near anchor '{target_title}' to respect sequence.")
+        else:
+            tight_inserted = self._insert_tight_relative_position(
+                item,
+                timeline,
+                search_start,
+                search_end,
+                relation_kind,
+                target_title,
+            )
+            if tight_inserted:
+                jlog("MODULE_C", f"'{item['title']}' fits activity window but transition is tight", "ACCEPTED_TIGHT_TRANSITION")
+                timeline = tight_inserted
+            else:
+                jlog("MODULE_C", f"'{item['title']}' no feasible slot in narrative window", "REJECT_REL")
+                conflict_timeline = self._insert_as_conflict(
+                    item,
+                    timeline,
+                    search_start if relation_kind == "before" else search_start,
+                    reason or "No space in narrative window.",
+                )
+                timeline = conflict_timeline or timeline
+
+        return timeline, True
 
     def _insert_tight_relative_position(
         self,
@@ -2893,6 +3058,9 @@ class SchedulingEngine:
                 geocode_candidates = self.travel_service.geocode_candidates(query, limit=5)
             except Exception as exc:
                 self._debug(f"[TRAVEL] Geocoding skipped/failed for {block.get('title')}: {exc}")
+            self._debug(
+                f"[TRAVEL][LOCATION_PENDING] {block.get('title')} requires {category or 'unknown'} location for accurate travel"
+            )
             requests.append({
                 "activity_id": activity_id,
                 "title": block.get("title"),
@@ -2912,8 +3080,6 @@ class SchedulingEngine:
         block: Dict[str, Any],
         saved_locations: List[Dict[str, Any]],
     ) -> bool:
-        if not block.get("location"):
-            return False
         if self._embedded_activity_coordinate(block):
             return False
         saved = self.travel_service.confirmed_saved_location(
@@ -2924,6 +3090,18 @@ class SchedulingEngine:
         if saved:
             return False
         status = clean_title(block.get("location_status") or "")
+        category = clean_title(block.get("location_category") or "")
+        if not block.get("location"):
+            return status in {"needs_resolution", "fallback_used", "unresolved"} and category in {
+                "meal_place",
+                "supermarket",
+                "fitness_center",
+                "workplace",
+                "institution",
+                "campus_area",
+                "office",
+                "library",
+            }
         if status in {"needs_resolution", "fallback_used", "unresolved"}:
             return True
         return True
@@ -3454,6 +3632,23 @@ class SchedulingEngine:
             normalized["timing_mode"] = TimingMode.FIXED
         return normalized
 
+    def _should_inherit_anchor_location(self, operation: Dict[str, Any]) -> bool:
+        """Only inherit anchor location for same-place follow-up blocks.
+
+        A coffee break right after a meeting usually shares the meeting place.
+        Dinner after grocery shopping should not silently become "at the store".
+        """
+        title = clean_title(operation.get("title") or operation.get("target_title") or "")
+        category = clean_title(operation.get("location_category") or "")
+        if any(keyword in title for keyword in ("coffee", "break", "pause")):
+            return True
+        if category in {"meal_place", "supermarket", "fitness_center", "home"}:
+            return False
+        status = clean_title(operation.get("location_status") or "")
+        if status in {"needs_resolution", "unresolved"}:
+            return False
+        return True
+
     def _conflict_identity(self, conflict: Dict[str, Any]) -> Optional[str]:
         activity_ids = conflict.get("activity_ids") or []
         if len(activity_ids) < 2:
@@ -3472,7 +3667,14 @@ class SchedulingEngine:
         clean_message = clean_title(message)
         clean_activity = clean_title(title)
         action_words = ("move", "shift", "reschedule", "change", "edit", "update")
-        return any(f"{word} {clean_activity}" in clean_message for word in action_words)
+        if not clean_message or not clean_activity:
+            return False
+        for word in action_words:
+            if re.search(rf"\b{word}\s+(?:my\s+|the\s+)?{re.escape(clean_activity)}\b", clean_message):
+                return True
+        if clean_activity in clean_message and re.search(r"\b(?:to|at)\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b", clean_message):
+            return True
+        return False
 
     def _infer_anchor_from_user_message(
         self,
@@ -3527,9 +3729,22 @@ class SchedulingEngine:
 
             if (
                 target
+                and operation.get("op") in {"update", "move", "replace", "update_priority"}
+                and explicit_fixed
+                and message
+                and not self._message_explicitly_targets_activity(message, target.get("title", ""))
+            ):
+                self._debug(
+                    f"[STATE] Ignored parser operation that tried to pin unrelated activity '{target.get('title')}'"
+                )
+                continue
+
+            if (
+                target
                 and has_anchor
                 and not explicit_fixed
                 and target.get("timing_mode") == TimingMode.FIXED
+                and message
                 and not self._message_explicitly_targets_activity(message, target.get("title", ""))
             ):
                 self._debug(f"[STATE] Ignored parser operation that tried to move fixed anchor '{target.get('title')}'")
@@ -3820,7 +4035,7 @@ class SchedulingEngine:
             updated["fixed_end"] = None
             updated["scheduled_start"] = None
             updated["scheduled_end"] = None
-            if updated.get("location") is None and resolved_anchor:
+            if updated.get("location") is None and resolved_anchor and self._should_inherit_anchor_location(operation):
                 anchor_activity = self._find_activity_by_stable_id(anchor_pool, resolved_anchor.get("target_activity_id"))
                 if anchor_activity:
                     updated["location"] = anchor_activity.get("location")
@@ -4006,7 +4221,7 @@ class SchedulingEngine:
                     resolved_anchor = self._resolve_anchor_relation(anchor, active_pool)
                     if resolved_anchor:
                         operation["anchor_relation"] = resolved_anchor
-                        if not operation.get("location"):
+                        if not operation.get("location") and self._should_inherit_anchor_location(operation):
                             anchor_activity = self._find_activity_by_stable_id(active_pool, resolved_anchor.get("target_activity_id"))
                             if anchor_activity:
                                 operation["location"] = anchor_activity.get("location")
@@ -4092,6 +4307,13 @@ class SchedulingEngine:
                 and item.get("is_mandatory")
                 and item.get("stable_activity_id") not in mutated_ids
             )
+            if (
+                item.get("stable_activity_id") not in mutated_ids
+                and item.get("scheduled_start") is not None
+                and item.get("scheduled_end") is not None
+                and not item["locked_fixed"]
+            ):
+                item["preserve_scheduled_time"] = True
             if item["locked_fixed"]:
                 self._debug(
                     f"[STATE] Fixed lock preserved for {item.get('title')} at {format_clock(item.get('fixed_start') or item.get('scheduled_start') or 0)}"

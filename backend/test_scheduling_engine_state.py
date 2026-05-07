@@ -255,6 +255,116 @@ def _with_allow_clash(envelope, allow_clash):
     return updated
 
 
+def _evening_schedule_envelope(accurate_travel_time=False):
+    return {
+        "schema_version": 4,
+        "scheduleId": "evening-test",
+        "date": "2026-05-24",
+        "version": 1,
+        "status": "ok",
+        "schedule_status": "ok",
+        "travel_validation_status": "not_requested",
+        "planning_mode": "feasibility_first",
+        "allow_clash": False,
+        "accurate_travel_time": accurate_travel_time,
+        "preferences": {
+            "allow_clash": False,
+            "accurate_travel_time": accurate_travel_time,
+        },
+        "activities": [
+            {
+                "id": "act-fyp",
+                "stable_activity_id": "act-fyp",
+                "type": "activity",
+                "title": "FYP Implementation",
+                "timing_mode": TimingMode.PREFERRED,
+                "scheduled_start": parse_clock("2:05 PM"),
+                "scheduled_end": parse_clock("5:05 PM"),
+                "startTime": "02:05 PM",
+                "endTime": "05:05 PM",
+                "duration_minutes": 180,
+                "priority": "high",
+            },
+            {
+                "id": "act-gym",
+                "stable_activity_id": "act-gym",
+                "type": "activity",
+                "title": "Gym Workout",
+                "timing_mode": TimingMode.PREFERRED,
+                "scheduled_start": parse_clock("5:40 PM"),
+                "scheduled_end": parse_clock("6:40 PM"),
+                "startTime": "05:40 PM",
+                "endTime": "06:40 PM",
+                "duration_minutes": 60,
+                "location": "gym",
+                "location_label": "gym",
+                "location_category": "fitness_center",
+                "location_status": "resolved_default",
+                "priority": "medium",
+            },
+            {
+                "id": "act-grocery",
+                "stable_activity_id": "act-grocery",
+                "type": "activity",
+                "title": "Grocery Shopping",
+                "timing_mode": TimingMode.PREFERRED,
+                "scheduled_start": parse_clock("7:00 PM"),
+                "scheduled_end": parse_clock("7:45 PM"),
+                "startTime": "07:00 PM",
+                "endTime": "07:45 PM",
+                "duration_minutes": 45,
+                "location": "store",
+                "location_label": "store",
+                "location_category": "supermarket",
+                "location_status": "needs_resolution",
+                "priority": "medium",
+            },
+        ],
+        "schedule_blocks": [],
+        "explanations": [],
+        "conflicts": [],
+        "warnings": [],
+        "location_resolution_requests": [],
+    }
+
+
+def _dinner_after_grocery_operation():
+    return {
+        "op": "add",
+        "title": "Dinner",
+        "timing_mode": TimingMode.RELATIVE,
+        "anchor_relation": {"kind": "after", "target_title": "Grocery Shopping"},
+        "duration_minutes": 60,
+        "location_category": "meal_place",
+        "location_status": "needs_resolution",
+        "location_source": "unresolved",
+    }
+
+
+def _saved_route_locations():
+    return [
+        {
+            "label": "gym",
+            "display_name": "Saved Gym",
+            "address": "Saved Gym",
+            "latitude": 2.92,
+            "longitude": 101.62,
+            "source": "saved_profile",
+            "confirmed_by_user": True,
+        },
+        {
+            "label": "store",
+            "display_name": "Saved Store",
+            "address": "Saved Store",
+            "category": "supermarket",
+            "latitude": 2.93,
+            "longitude": 101.63,
+            "source": "saved_profile",
+            "confirmed_by_user": True,
+        },
+    ]
+
+
 def _build_single_activity_with_location(engine, request_text, title, raw_location=None):
     operation = {
         "op": "add",
@@ -1076,6 +1186,122 @@ def test_success_reply_mentions_added_dinner_before_retained_existing_clash():
     assert "after Gym Workout" in reply["reply"]
     assert "Your existing" in reply["reply"]
     assert "clash is still marked" in reply["reply"]
+
+
+def test_add_dinner_after_grocery_preserves_anchor_order_and_existing_times():
+    engine = SchedulingEngine(DummyClient())
+    envelope = _evening_schedule_envelope()
+    operation = _dinner_after_grocery_operation()
+
+    result = engine.apply_operations(
+        envelope=envelope,
+        operations=[operation],
+        base_version=envelope["version"],
+    )
+    updated = result["envelope"]
+    fyp = _activity_by_title(updated, "FYP Implementation")
+    gym = _activity_by_title(updated, "Gym Workout")
+    grocery = _activity_by_title(updated, "Grocery Shopping")
+    dinner = _activity_by_title(updated, "Dinner")
+
+    assert result["status"] == "success"
+    assert grocery["scheduled_end"] <= dinner["scheduled_start"]
+    assert fyp["scheduled_start"] == parse_clock("2:05 PM")
+    assert gym["scheduled_start"] == parse_clock("5:40 PM")
+    assert grocery["scheduled_start"] == parse_clock("7:00 PM")
+    assert not updated.get("postcondition_results")
+
+
+def test_relative_dependency_places_anchor_before_dependent_regardless_score():
+    engine = SchedulingEngine(DummyClient())
+    anchor = {
+        "id": "act-anchor",
+        "stable_activity_id": "act-anchor",
+        "title": "Grocery Shopping",
+        "timing_mode": TimingMode.UNSPECIFIED,
+        "duration_minutes": 45,
+        "priority": "low",
+        "is_mandatory": True,
+        "location": "store",
+        "trace": [],
+    }
+    dependent = {
+        "id": "act-dependent",
+        "stable_activity_id": "act-dependent",
+        "title": "Dinner",
+        "timing_mode": TimingMode.RELATIVE,
+        "anchor_relation": {"kind": "after", "target_title": "Grocery Shopping"},
+        "duration_minutes": 60,
+        "priority": "high",
+        "is_mandatory": True,
+        "location_category": "meal_place",
+        "location_status": "needs_resolution",
+        "trace": [],
+    }
+
+    planned = engine._plan_schedule(
+        "2026-05-24",
+        [dependent, anchor],
+        {"allow_clash": False, "accurate_travel_time": False},
+    )
+    grocery = next(item for item in planned["activities"] if item["title"] == "Grocery Shopping")
+    dinner = next(item for item in planned["activities"] if item["title"] == "Dinner")
+
+    assert grocery["scheduled_end"] <= dinner["scheduled_start"]
+
+
+def test_accurate_travel_unresolved_dinner_location_is_pending_not_conflict():
+    fake_travel = FakeTravelService(route_minutes=8)
+    engine = SchedulingEngine(DummyClient(), travel_service=fake_travel)
+    envelope = _evening_schedule_envelope(accurate_travel_time=True)
+
+    result = engine.apply_operations(
+        envelope=envelope,
+        operations=[_dinner_after_grocery_operation()],
+        base_version=envelope["version"],
+        saved_locations=_saved_route_locations(),
+    )
+    updated = result["envelope"]
+    grocery = _activity_by_title(updated, "Grocery Shopping")
+    dinner = _activity_by_title(updated, "Dinner")
+
+    assert result["status"] == "success"
+    assert updated["schedule_status"] == "location_pending"
+    assert updated["travel_validation_status"] == "pending_locations"
+    assert grocery["scheduled_end"] <= dinner["scheduled_start"]
+    assert any(request["title"] == "Dinner" for request in updated["location_resolution_requests"])
+    assert not updated.get("conflicts")
+
+
+def test_parser_safety_ignores_unrequested_gym_fixed_update_when_adding_dinner():
+    engine = SchedulingEngine(DummyClient())
+    envelope = _evening_schedule_envelope()
+    message = "y not? i want to have dinner after shopping"
+    dinner_operation = _dinner_after_grocery_operation()
+    dinner_operation["_user_message"] = message
+
+    result = engine.apply_operations(
+        envelope=envelope,
+        operations=[
+            {
+                "op": "update",
+                "title": "Gym Workout",
+                "fixed_start": "17:00",
+                "duration_minutes": 60,
+                "_user_message": message,
+            },
+            dinner_operation,
+        ],
+        base_version=envelope["version"],
+    )
+    updated = result["envelope"]
+    gym = _activity_by_title(updated, "Gym Workout")
+    grocery = _activity_by_title(updated, "Grocery Shopping")
+    dinner = _activity_by_title(updated, "Dinner")
+
+    assert result["status"] == "success"
+    assert gym["scheduled_start"] == parse_clock("5:40 PM")
+    assert grocery["scheduled_end"] <= dinner["scheduled_start"]
 
 
 def test_existing_clash_blocks_editing_clashing_activity_when_allow_clash_is_off():
