@@ -54,6 +54,8 @@ type LocationResolutionRequest = {
   }>;
 };
 
+type ResolvedLocationSnapshot = NonNullable<ActivityBlock["resolved_location"]>;
+
 export function PlanningInputPage({
   onScheduleGenerated,
   onBack,
@@ -145,6 +147,8 @@ export function PlanningInputPage({
   const [activityTime, setActivityTime] = useState("");
   const [activityDuration, setActivityDuration] = useState("");
   const [activityLocation, setActivityLocation] = useState("");
+  const [manualResolvedLocation, setManualResolvedLocation] = useState<ResolvedLocationSnapshot | null>(null);
+  const [isManualLocationPickerOpen, setIsManualLocationPickerOpen] = useState(false);
   const [manualActivityType, setManualActivityType] = useState<"activity" | "travel" | "buffer">("activity");
   const [isConflict, setIsConflict] = useState(false);
 
@@ -270,6 +274,7 @@ export function PlanningInputPage({
       // Fall through — we still allow adding the event, just flag it
     }
 
+    const pickedLocationName = manualResolvedLocation?.display_name || manualResolvedLocation?.address;
     const newActivity: ActivityBlock = {
       id: Date.now().toString(),
       type: manualActivityType,
@@ -277,7 +282,12 @@ export function PlanningInputPage({
       startTime: formattedStartTime,
       endTime: endTimeStr,
       duration: displayDuration,
-      location: manualActivityType === "activity" ? (activityLocation || undefined) : undefined,
+      location: manualActivityType === "activity" ? (pickedLocationName || undefined) : undefined,
+      location_label: manualActivityType === "activity" ? (pickedLocationName || undefined) : undefined,
+      location_status: manualActivityType === "activity" && manualResolvedLocation ? "resolved" : undefined,
+      location_source: manualResolvedLocation?.source,
+      saved_location_label: manualResolvedLocation?.saved_location_label,
+      resolved_location: manualActivityType === "activity" ? (manualResolvedLocation || undefined) : undefined,
     };
 
     const updatedActivities = [...currentActivities, newActivity].sort(
@@ -293,6 +303,7 @@ export function PlanningInputPage({
 
     // Reset form
     setActivityName(""); setActivityTime(""); setActivityDuration(""); setActivityLocation("");
+    setManualResolvedLocation(null);
     setManualActivityType("activity");
     setIsConflict(false);
   };
@@ -588,6 +599,37 @@ export function PlanningInputPage({
     } finally {
       setIsProcessing(false);
     }
+  };
+
+  const manualLocationCandidate: GeocodeCandidate | null = manualResolvedLocation
+    ? {
+        label: manualResolvedLocation.saved_location_label || manualResolvedLocation.label,
+        display_name: manualResolvedLocation.display_name || activityLocation,
+        address: manualResolvedLocation.address || manualResolvedLocation.display_name || activityLocation,
+        latitude: manualResolvedLocation.latitude,
+        longitude: manualResolvedLocation.longitude,
+        source: manualResolvedLocation.source || "manual_event_location",
+        confirmed_by_user: manualResolvedLocation.confirmed_by_user,
+      }
+    : null;
+  const manualLocationPoint = candidateToMapPoint(manualLocationCandidate);
+
+  const handleConfirmManualLocation = async (candidate: GeocodeCandidate) => {
+    const displayName = candidate.display_name || candidate.address || activityLocation || activityName || "Manual event location";
+    const address = candidate.address || candidate.display_name || displayName;
+    setActivityLocation(displayName);
+    setManualResolvedLocation({
+      label: candidate.label || activityName || "manual event",
+      display_name: displayName,
+      address,
+      category: "manual_event",
+      latitude: candidate.latitude,
+      longitude: candidate.longitude,
+      source: candidate.source || "manual_map_pin",
+      confirmed_by_user: candidate.confirmed_by_user ?? true,
+      saved_location_label: candidate.label,
+    });
+    setIsManualLocationPickerOpen(false);
   };
 
   const mapDialogExistingCandidate = (() => {
@@ -921,6 +963,8 @@ export function PlanningInputPage({
                           size="sm"
                           onClick={() => {
                             setManualActivityType("travel");
+                            setActivityLocation("");
+                            setManualResolvedLocation(null);
                           }}
                           className="rounded-xl text-xs"
                         >
@@ -931,6 +975,8 @@ export function PlanningInputPage({
                           size="sm"
                           onClick={() => {
                             setManualActivityType("buffer");
+                            setActivityLocation("");
+                            setManualResolvedLocation(null);
                           }}
                           className="rounded-xl text-xs"
                         >
@@ -973,7 +1019,44 @@ export function PlanningInputPage({
                     {manualActivityType === "activity" && (
                       <div className="space-y-1.5">
                         <Label>Location</Label>
-                        <Input value={activityLocation} onChange={e => setActivityLocation(e.target.value)} placeholder="Optional" className="rounded-xl" />
+                        <div className="rounded-xl border border-border bg-secondary/20 p-3">
+                          {manualResolvedLocation ? (
+                            <div>
+                              <p className="text-sm font-medium">
+                                {manualResolvedLocation.display_name || manualResolvedLocation.address || activityLocation}
+                              </p>
+                              <p className="mt-1 text-xs text-muted-foreground">
+                                Confirmed map point attached to this manual event.
+                              </p>
+                            </div>
+                          ) : (
+                            <p className="text-sm text-muted-foreground">No exact location selected.</p>
+                          )}
+                        </div>
+                        <div className="flex gap-2">
+                          <Button
+                            type="button"
+                            variant="outline"
+                            className="rounded-xl"
+                            onClick={() => setIsManualLocationPickerOpen(true)}
+                          >
+                            <MapPin className="mr-2 h-4 w-4" />
+                            {manualResolvedLocation ? "Change Location" : "Pick Location"}
+                          </Button>
+                          {manualResolvedLocation && (
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              className="rounded-xl"
+                              onClick={() => {
+                                setActivityLocation("");
+                                setManualResolvedLocation(null);
+                              }}
+                            >
+                              Clear
+                            </Button>
+                          )}
+                        </div>
                       </div>
                     )}
                     <Button
@@ -1044,6 +1127,7 @@ export function PlanningInputPage({
           onCancel={() => setEditingEvent(null)}
           onDelete={handleDeleteEvent}
           allActivities={previewSchedule?.activities || []}
+          savedLocations={savedLocationsForPicker}
         />
       )}
 
@@ -1106,6 +1190,22 @@ export function PlanningInputPage({
           </div>
         </div>
       ) : null}
+
+      <LocationPickerDialog
+        open={isManualLocationPickerOpen}
+        onOpenChange={setIsManualLocationPickerOpen}
+        title={`Pick location for ${activityName || "manual activity"}`}
+        description={`Search, choose a saved place, or click the exact point for ${activityName || "this manual activity"}.`}
+        label={activityName || "manual activity"}
+        initialCenter={manualLocationPoint}
+        initialPin={manualLocationPoint}
+        candidates={manualLocationCandidate ? [manualLocationCandidate] : []}
+        savedLocations={savedLocationsForPicker}
+        initialSearchQuery={activityLocation || activityName || ""}
+        searchCategory="manual_event"
+        confirmLabel="Use this point"
+        onConfirm={handleConfirmManualLocation}
+      />
 
       <LocationPickerDialog
         open={Boolean(mapPickerRequest)}

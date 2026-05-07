@@ -8,6 +8,7 @@ from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Dict, Any
 from supabase import create_client, Client
 from dotenv import load_dotenv
+from jplan_logging import jlog
 
 # Robust .env loading
 env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -27,12 +28,12 @@ supabase: Optional[Client] = None
 SCHEDULE_PAYLOAD_VERSION = 4
 
 if not supabase_url or not supabase_key:
-    print(f"[ERROR] Supabase credentials missing! URL: {'Found' if supabase_url else 'Missing'}, Key: {'Found' if supabase_key else 'Missing'}")
+    jlog("DB", f"Supabase credentials missing: URL={'found' if supabase_url else 'missing'}, key={'found' if supabase_key else 'missing'}", "ERROR")
 else:
     try:
         supabase = create_client(supabase_url, supabase_key)
     except Exception as e:
-        print(f"[ERROR] Failed to initialize Supabase client: {e}")
+        jlog("DB", f"Failed to initialize Supabase client: {e}", "ERROR")
 
 def _generate_schedule_id(user_id: str, date: str) -> str:
     """Generate a stable schedule ID based on user and date."""
@@ -148,7 +149,7 @@ def get_all_plans(user_id: str) -> List[Dict[str, Any]]:
         response = supabase.table('daily_plans').select('*').eq('user_id', user_id).order('date', desc=True).execute()
         return [_parse_schedule_payload(p.get('activities'), user_id, p.get('date', '')) for p in response.data]
     except Exception as e:
-        print(f"Error fetching plans: {e}")
+        jlog("DB", f"Error fetching plans: {e}", "ERROR")
         raise
 
 def get_plan_by_date(date: str, user_id: str) -> Optional[Dict[str, Any]]:
@@ -160,7 +161,7 @@ def get_plan_by_date(date: str, user_id: str) -> Optional[Dict[str, Any]]:
         if not response.data: return None
         return _parse_schedule_payload(response.data[0].get('activities'), user_id, date)
     except Exception as e:
-        print(f"Error fetching plan: {e}")
+        jlog("DB", f"Error fetching plan: {e}", "ERROR")
         raise
 
 def save_plan(
@@ -231,12 +232,12 @@ def save_plan(
         }, on_conflict='user_id, date').execute()
         
         if response.data:
-            print(f"[JPLAN][DATABASE] Successfully saved plan for user {user_id} on date {date}")
+            jlog("DB", f"Saved plan user={user_id} date={date}", "SAVE")
             return _parse_schedule_payload(response.data[0].get('activities'), user_id, date)
         else:
             raise Exception("Failed to save plan")
     except Exception as e:
-        print(f"Error saving plan: {e}")
+        jlog("DB", f"Error saving plan: {e}", "ERROR")
         raise
 
 def get_user_locations(user_id: str) -> List[Dict[str, Any]]:
@@ -246,7 +247,7 @@ def get_user_locations(user_id: str) -> List[Dict[str, Any]]:
         response = supabase.table('user_locations').select('*').eq('user_id', user_id).execute()
         return response.data or []
     except Exception as e:
-        print(f"Error fetching user locations: {e}")
+        jlog("DB", f"Error fetching user locations: {e}", "ERROR")
         return []
 
 def add_user_location(
@@ -289,7 +290,7 @@ def add_user_location(
             response = supabase.table('user_locations').upsert(legacy_payload, on_conflict='user_id, label').execute()
         return response.data[0] if response.data else {}
     except Exception as e:
-        print(f"Error saving user location: {e}")
+        jlog("DB", f"Error saving user location: {e}", "ERROR")
         raise
 
 def delete_user_location(user_id: str, label: str) -> bool:
@@ -299,7 +300,7 @@ def delete_user_location(user_id: str, label: str) -> bool:
         supabase.table('user_locations').delete().eq('user_id', user_id).eq('label', label).execute()
         return True
     except Exception as e:
-        print(f"Error deleting location: {e}")
+        jlog("DB", f"Error deleting location: {e}", "ERROR")
         raise
 
 def _cache_query(normalized_query: str, provider: str, country_hint: Optional[str], category_hint: Optional[str]):
@@ -357,12 +358,12 @@ def get_geocode_cache(
                 'updated_at': datetime.now(timezone.utc).isoformat(),
             }).eq('id', row.get('id')).execute()
         except Exception as update_error:
-            print(f"[JPLAN][DATABASE] Geocode cache hit_count update skipped: {update_error}")
+            jlog("DB", f"Geocode cache hit_count update skipped: {update_error}", "CACHE")
 
         result = row.get('result_json')
         return result if isinstance(result, list) else []
     except Exception as e:
-        print(f"[JPLAN][DATABASE] Geocode cache read skipped: {e}")
+        jlog("DB", f"Geocode cache read skipped: {e}", "CACHE")
         return None
 
 def save_geocode_cache(
@@ -399,7 +400,7 @@ def save_geocode_cache(
             supabase.table('geocode_cache').insert(payload).execute()
         return True
     except Exception as e:
-        print(f"[JPLAN][DATABASE] Geocode cache write skipped: {e}")
+        jlog("DB", f"Geocode cache write skipped: {e}", "CACHE")
         return False
 
 def delete_plan(date: str, user_id: str) -> bool:
@@ -409,5 +410,5 @@ def delete_plan(date: str, user_id: str) -> bool:
         supabase.table('daily_plans').delete().eq('date', date).eq('user_id', user_id).execute()
         return True
     except Exception as e:
-        print(f"Error deleting plan: {e}")
+        jlog("DB", f"Error deleting plan: {e}", "ERROR")
         raise

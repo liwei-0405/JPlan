@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 from google import genai
 from typing import List, Dict, Any, Optional
 import database
+from jplan_logging import jjson, jlog
 from scheduling_engine import SchedulingEngine, VersionMismatchError
 from travel_service import TravelService
 
@@ -216,15 +217,11 @@ class TravelCompleteRequest(BaseModel):
 
 
 def debug_log(message: str) -> None:
-    print(f"[JPLAN][API] {message}")
+    jlog("API", message)
 
 
 def debug_json(label: str, payload: Any) -> None:
-    try:
-        serialized = json.dumps(payload, indent=2, ensure_ascii=True)
-    except Exception:
-        serialized = repr(payload)
-    print(f"[JPLAN][API] {label}:\n{serialized}")
+    jjson("API", label, payload)
 
 
 def summarize_envelope(envelope: ScheduleEnvelope | dict | None) -> dict:
@@ -257,9 +254,7 @@ def log_total_token_usage(parsed: Dict[str, Any], reply_meta: Optional[Dict[str,
     total_candidates = int(parser_usage.get("candidates", 0) or 0) + int(reply_usage.get("candidates", 0) or 0)
     total = int(parser_usage.get("total", 0) or 0) + int(reply_usage.get("total", 0) or 0)
     if total:
-        debug_log(
-            f"[TOKEN_USAGE_TOTAL] Prompt={total_prompt} | Candidates={total_candidates} | Total={total}"
-        )
+        jlog("API", f"Prompt={total_prompt} | Candidates={total_candidates} | Total={total}", "TOKEN_TOTAL")
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat_with_llm(request: ChatRequest):
@@ -487,7 +482,7 @@ async def get_all_plans(user_id: str):
             results.append(ScheduleEnvelope(**p))
         return results
     except Exception as e:
-        print(f"[JPLAN][API] Error in get_all_plans: {e}")
+        jlog("API", f"Error in get_all_plans: {e}", "ERROR")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/plans/{date}", response_model=ScheduleEnvelope)
@@ -507,7 +502,7 @@ async def get_plan_by_date(date: str, user_id: str):
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[JPLAN][API] Error in get_plan_by_date: {e}")
+        jlog("API", f"Error in get_plan_by_date: {e}", "ERROR")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/plans", response_model=ScheduleEnvelope)
@@ -624,7 +619,7 @@ async def sync_calendar(request: Dict[str, Any]):
         
     except Exception as e:
         error_msg = str(e)
-        print(f"Sync error: {error_msg}")
+        jlog("API", f"Sync error: {error_msg}", "CALENDAR")
         if "TOKEN_EXPIRED" in error_msg:
             try:
                 database.supabase.table('profiles').update({
@@ -632,7 +627,7 @@ async def sync_calendar(request: Dict[str, Any]):
                     'calendar_sync_enabled': False
                 }).eq('id', user_id).execute()
             except Exception as db_err:
-                print(f"Failed to clear token: {db_err}")
+                jlog("API", f"Failed to clear token: {db_err}", "CALENDAR")
             raise HTTPException(status_code=401, detail="TOKEN_EXPIRED")
         raise HTTPException(status_code=500, detail=error_msg)
 
@@ -653,7 +648,7 @@ async def export_calendar(request: ExportRequest):
         return {"message": "Success", "exported_count": count}
     except Exception as e:
         error_msg = str(e)
-        print(f"Export error: {error_msg}")
+        jlog("API", f"Export error: {error_msg}", "CALENDAR")
         if "TOKEN_EXPIRED" in error_msg:
             try:
                 database.supabase.table('profiles').update({
@@ -661,7 +656,7 @@ async def export_calendar(request: ExportRequest):
                     'calendar_sync_enabled': False
                 }).eq('id', request.user_id).execute()
             except Exception as db_err:
-                print(f"Failed to clear token: {db_err}")
+                jlog("API", f"Failed to clear token: {db_err}", "CALENDAR")
             raise HTTPException(status_code=401, detail="TOKEN_EXPIRED")
         
         if "403" in error_msg or "insufficientPermissions" in error_msg:
@@ -738,17 +733,22 @@ async def complete_travel_validation(request: TravelCompleteRequest):
     envelope.setdefault("preferences", {})
     envelope["preferences"]["accurate_travel_time"] = True
     schedule_id = envelope.get("scheduleId") or envelope.get("schedule_id") or "(draft)"
-    print(
-        f"[TRAVEL][COMPLETE] Starting accurate travel validation "
-        f"schedule_id={schedule_id} date={envelope.get('date')}"
+    jlog(
+        "TRAVEL_SERVICE",
+        f"Starting accurate travel validation schedule_id={schedule_id} date={envelope.get('date')}",
+        "COMPLETE",
     )
     saved_locations = database.get_user_locations(request.user_id)
     validated = scheduling_engine._apply_accurate_travel_if_requested(envelope, saved_locations)
-    print(
-        f"[TRAVEL][VALIDATION] travel_validation_status={validated.get('travel_validation_status')}"
+    jlog(
+        "TRAVEL_SERVICE",
+        f"travel_validation_status={validated.get('travel_validation_status')}",
+        "VALIDATION",
     )
-    print(
-        f"[TRAVEL][COMPLETE] Updated transition blocks: {validated.get('updated_transition_count', 0)}"
+    jlog(
+        "TRAVEL_SERVICE",
+        f"Updated transition blocks={validated.get('updated_transition_count', 0)}",
+        "COMPLETE",
     )
     return ScheduleEnvelope(**validated)
 

@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 
 import database
+from jplan_logging import jlog
 
 
 ORS_BASE_URL = "https://api.openrouteservice.org"
@@ -316,12 +317,12 @@ class TravelService:
 
         nominatim_candidates: List[Dict[str, Any]] = []
         if not self._should_try_nominatim(query, ors_candidates):
-            print("[TRAVEL][NOMINATIM] fallback_disabled_or_skipped reason=ors_good")
+            jlog("TRAVEL_SERVICE", "fallback_disabled_or_skipped reason=ors_good", "NOMINATIM")
         elif not self.enable_nominatim_fallback:
-            print("[TRAVEL][NOMINATIM] fallback_disabled_or_skipped reason=disabled")
+            jlog("TRAVEL_SERVICE", "fallback_disabled_or_skipped reason=disabled", "NOMINATIM")
             warnings.append("OpenStreetMap fallback search is disabled; use the map picker if the results are not right.")
         elif not self.has_api_key() and ors_error is None:
-            print("[TRAVEL][NOMINATIM] fallback_disabled_or_skipped reason=ors_api_key_missing")
+            jlog("TRAVEL_SERVICE", "fallback_disabled_or_skipped reason=ors_api_key_missing", "NOMINATIM")
             warnings.append("Use the map picker because ORS geocoding is not configured.")
         else:
             try:
@@ -364,7 +365,7 @@ class TravelService:
         memory_key = (provider, normalized_query, country_hint, category_hint)
         if memory_key in self.geocode_memory_cache:
             if provider == "nominatim":
-                print(f"[TRAVEL][NOMINATIM] cache_hit query={normalized_query}")
+                jlog("TRAVEL_SERVICE", f"cache_hit query={normalized_query}", "NOMINATIM")
             return self.geocode_memory_cache[memory_key][:limit]
 
         cached = database.get_geocode_cache(
@@ -377,7 +378,7 @@ class TravelService:
             candidates = cached if isinstance(cached, list) else []
             self.geocode_memory_cache[memory_key] = candidates
             if provider == "nominatim":
-                print(f"[TRAVEL][NOMINATIM] cache_hit query={normalized_query}")
+                jlog("TRAVEL_SERVICE", f"cache_hit query={normalized_query}", "NOMINATIM")
             return candidates[:limit]
         return None
 
@@ -491,10 +492,10 @@ class TravelService:
             elapsed = time.monotonic() - _LAST_NOMINATIM_REQUEST_AT
             if elapsed < self.nominatim_min_interval_seconds:
                 wait_seconds = self.nominatim_min_interval_seconds - elapsed
-                print(f"[TRAVEL][NOMINATIM] throttled wait={wait_seconds:.2f}s query={normalized_query}")
+                jlog("TRAVEL_SERVICE", f"throttled wait={wait_seconds:.2f}s query={normalized_query}", "NOMINATIM")
                 time.sleep(wait_seconds)
 
-            print(f"[TRAVEL][NOMINATIM] request_sent query={normalized_query}")
+            jlog("TRAVEL_SERVICE", f"request_sent query={normalized_query}", "NOMINATIM")
             _LAST_NOMINATIM_REQUEST_AT = time.monotonic()
             response = requests.get(
                 NOMINATIM_SEARCH_URL,

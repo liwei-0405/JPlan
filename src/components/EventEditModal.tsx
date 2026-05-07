@@ -2,8 +2,10 @@ import { useState, useEffect } from "react";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
 import { Label } from "./ui/label";
-import { X, AlertCircle } from "lucide-react";
+import { X, AlertCircle, MapPin } from "lucide-react";
 import type { ActivityBlock } from "../App";
+import { LocationPickerDialog, candidateToMapPoint } from "./LocationPickerDialog";
+import type { GeocodeCandidate, SavedLocation } from "../services/planService";
 
 type EventEditModalProps = {
   event: ActivityBlock;
@@ -11,11 +13,13 @@ type EventEditModalProps = {
   onCancel: () => void;
   onDelete?: () => void;
   allActivities: ActivityBlock[];
+  savedLocations?: SavedLocation[];
 };
 
-export function EventEditModal({ event, onSave, onCancel, onDelete, allActivities }: EventEditModalProps) {
+export function EventEditModal({ event, onSave, onCancel, onDelete, allActivities, savedLocations = [] }: EventEditModalProps) {
   const [formData, setFormData] = useState(() => normalizeEventForEdit(event));
   const [isConflict, setIsConflict] = useState(false);
+  const [isLocationPickerOpen, setIsLocationPickerOpen] = useState(false);
 
   useEffect(() => {
     setFormData(normalizeEventForEdit(event));
@@ -39,10 +43,13 @@ export function EventEditModal({ event, onSave, onCancel, onDelete, allActivitie
   }, [formData.startTime, formData.endTime, allActivities, event.id]);
 
   const handleSave = () => {
+    const confirmedLocationName = formData.resolved_location?.display_name || formData.resolved_location?.address;
     onSave({
       ...formData,
       title: formData.title.trim(),
-      location: formData.location?.trim() || undefined,
+      location: confirmedLocationName || formData.location?.trim() || undefined,
+      location_label: confirmedLocationName || formData.location_label || formData.location,
+      location_status: formData.resolved_location ? "resolved" : formData.location_status,
       start: formData.startTime,
       end: formData.endTime,
     });
@@ -87,6 +94,36 @@ export function EventEditModal({ event, onSave, onCancel, onDelete, allActivitie
 
     const formattedEnd = minutesTo12Hour(newEndMins);
     setFormData({ ...formData, duration: durStr, endTime: formattedEnd });
+  };
+
+  const existingLocationCandidate = resolvedLocationToCandidate(formData);
+  const existingLocationPoint = candidateToMapPoint(existingLocationCandidate);
+
+  const handleConfirmPickedLocation = async (candidate: GeocodeCandidate) => {
+    const displayName = candidate.display_name || candidate.address || formData.location || formData.title;
+    const address = candidate.address || candidate.display_name || displayName;
+    setFormData({
+      ...formData,
+      location: displayName,
+      location_label: displayName,
+      location_status: "resolved",
+      location_source: candidate.source || "event_manual_location",
+      location_warning: undefined,
+      saved_location_label: candidate.label || formData.saved_location_label,
+      resolved_location: {
+        label: candidate.label || formData.title,
+        display_name: displayName,
+        address,
+        category: formData.location_category,
+        latitude: candidate.latitude,
+        longitude: candidate.longitude,
+        source: candidate.source || "event_manual_location",
+        confirmed_by_user: candidate.confirmed_by_user ?? true,
+        resolved_for_activity_id: formData.stable_activity_id || formData.id,
+        saved_location_label: candidate.label || formData.saved_location_label,
+      },
+    });
+    setIsLocationPickerOpen(false);
   };
 
   return (
@@ -162,14 +199,58 @@ export function EventEditModal({ event, onSave, onCancel, onDelete, allActivitie
 
           {/* Location */}
           <div>
-            <Label htmlFor="location">Location (optional)</Label>
-            <Input
-              id="location"
-              value={formData.location || ""}
-              onChange={(e) => setFormData({ ...formData, location: e.target.value })}
-              placeholder="e.g., Downtown Office"
-              className="mt-1.5 rounded-xl"
-            />
+            <Label>Location (optional)</Label>
+            <div className="mt-1.5 rounded-xl border border-border bg-secondary/20 p-3">
+              {formData.resolved_location ? (
+                <div>
+                  <p className="text-sm font-medium">
+                    {formData.resolved_location.display_name || formData.resolved_location.address || formData.location}
+                  </p>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    Confirmed map point attached to this event.
+                  </p>
+                </div>
+              ) : formData.location ? (
+                <div>
+                  <p className="text-sm font-medium">{formData.location}</p>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    This location text is not confirmed with coordinates yet.
+                  </p>
+                </div>
+              ) : (
+                <p className="text-sm text-muted-foreground">No exact location selected.</p>
+              )}
+            </div>
+            <div className="mt-2 flex gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                className="rounded-xl"
+                onClick={() => setIsLocationPickerOpen(true)}
+              >
+                <MapPin className="mr-2 h-4 w-4" />
+                {formData.resolved_location || formData.location ? "Change Location" : "Pick Location"}
+              </Button>
+              {(formData.resolved_location || formData.location) && (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  className="rounded-xl"
+                  onClick={() => setFormData({
+                    ...formData,
+                    location: undefined,
+                    location_label: undefined,
+                    location_status: undefined,
+                    location_source: undefined,
+                    location_warning: undefined,
+                    saved_location_label: undefined,
+                    resolved_location: undefined,
+                  })}
+                >
+                  Clear
+                </Button>
+              )}
+            </div>
           </div>
 
           {/* Conflict Warning */}
@@ -216,6 +297,21 @@ export function EventEditModal({ event, onSave, onCancel, onDelete, allActivitie
           </Button>
         </div>
       </div>
+      <LocationPickerDialog
+        open={isLocationPickerOpen}
+        onOpenChange={setIsLocationPickerOpen}
+        title={`Pick location for ${formData.title || "this event"}`}
+        description={`Search, choose a saved place, or click the exact point for ${formData.title || "this event"}.`}
+        label={formData.title || "this event"}
+        initialCenter={existingLocationPoint}
+        initialPin={existingLocationPoint}
+        candidates={existingLocationCandidate ? [existingLocationCandidate] : []}
+        savedLocations={savedLocations}
+        initialSearchQuery={formData.location || formData.title || ""}
+        searchCategory={formData.location_category}
+        confirmLabel="Use this point"
+        onConfirm={handleConfirmPickedLocation}
+      />
     </div>
   );
 }
@@ -232,6 +328,20 @@ function normalizeEventForEdit(event: ActivityBlock): ActivityBlock {
     start: startTime,
     end: endTime,
     duration: event.duration || deriveDuration(startTime, endTime),
+  };
+}
+
+function resolvedLocationToCandidate(event: ActivityBlock): GeocodeCandidate | null {
+  const resolved = event.resolved_location;
+  if (!resolved) return null;
+  return {
+    label: resolved.saved_location_label || resolved.label,
+    display_name: resolved.display_name || event.location_label || event.location,
+    address: resolved.address || resolved.display_name || event.location,
+    latitude: resolved.latitude,
+    longitude: resolved.longitude,
+    source: resolved.source || event.location_source,
+    confirmed_by_user: resolved.confirmed_by_user,
   };
 }
 

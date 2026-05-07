@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
+from jplan_logging import jjson, jlog, jsection
 from travel_service import MissingORSApiKey, TravelService, TravelServiceError, coordinate_from_saved_location
 
 # Constants for the Rich Scheduling Model
@@ -367,7 +368,7 @@ def estimate_travel_minutes(previous_location: Optional[str], next_location: Opt
     # Try to look up in the matrix
     if loc1 in MOCK_DISTANCE_MATRIX and loc2 in MOCK_DISTANCE_MATRIX[loc1]:
         travel_time = MOCK_DISTANCE_MATRIX[loc1][loc2]
-        print(f"[JPLAN][MODULE_B] Found Travel Time: '{loc1}' -> '{loc2}' = {travel_time}m")
+        jlog("MODULE_B", f"Found heuristic travel time: '{loc1}' -> '{loc2}' = {travel_time}m", "TRAVEL")
         return travel_time
     
     # Fallback to default travel time
@@ -380,14 +381,35 @@ class SchedulingEngine:
         self.travel_service = travel_service or TravelService()
 
     def _debug(self, message: str) -> None:
-        print(f"[JPLAN][ENGINE_LOGIC] {message}")
+        module, stage, clean_message = self._log_context_from_message(message)
+        jlog(module, clean_message, stage)
 
     def _debug_json(self, label: str, payload: Any) -> None:
-        try:
-            serialized = json.dumps(payload, indent=2, ensure_ascii=True)
-        except Exception:
-            serialized = repr(payload)
-        print(f"[JPLAN][ENGINE_LOGIC] {label}:\n{serialized}")
+        module, stage, clean_label = self._log_context_from_message(label)
+        if clean_label == label and label.lower().startswith("llm parsed"):
+            module, stage = "MODULE_A", "PARSE"
+        elif clean_label == label and "fallback parse" in label.lower():
+            module, stage = "MODULE_A", "FALLBACK_PARSE"
+        jjson(module, clean_label, payload, stage)
+
+    def _log_context_from_message(self, message: str) -> Tuple[str, Optional[str], str]:
+        match = re.match(r"^\[([A-Z0-9_]+)\](?:\[([A-Z0-9_]+)\])?\s*(.*)$", str(message))
+        if not match:
+            return "ENGINE", "FLOW", str(message)
+
+        head, substage, body = match.group(1), match.group(2), match.group(3)
+        if head.startswith("MODULE_"):
+            stage = substage or ("PARSE" if head == "MODULE_A" else None)
+            return head, stage, body
+        if head == "STATE":
+            return "STATE", substage or "ACTIVITY", body
+        if head == "TRAVEL":
+            return "TRAVEL_SERVICE", substage or "VALIDATION", body
+        if head == "DATE_NORMALIZE":
+            return "MODULE_A", "DATE", body
+        if head == "CONFLICT":
+            return "MODULE_B", "CONFLICT", body
+        return "ENGINE", head, body
 
 
     def parse_text_request(
@@ -617,12 +639,8 @@ class SchedulingEngine:
         audio_part: Any,
         saved_locations: List[Dict[str, Any]] = []
     ) -> Dict[str, Any]:
-        print("\n" + "*"*60)
-        print(" [JPLAN] STARTING MODULE A - LLM PARSING")
-        print("*"*60)
-        self._debug(
-            f"[MODULE_A] Request: {latest_request!r}"
-        )
+        jsection("MODULE_A", "LLM parsing", "PARSE")
+        jlog("MODULE_A", f"Request={latest_request!r}", "PARSE")
         
         # Inject Saved Locations as context for the LLM
         loc_context = ""
@@ -640,7 +658,6 @@ class SchedulingEngine:
         try:
             response = self._generate_parser_content_with_retry(contents)
             raw_response_text = response.text or ""
-            # print(f"\n[JPLAN][LLM_PARSER] --- RAW RESPONSE FROM LLM ---\n{raw_response_text}\n------------------------------------------\n")
             
             # Print Token Usage
             usage = getattr(response, "usage_metadata", None)
@@ -651,7 +668,11 @@ class SchedulingEngine:
                     "candidates": int(getattr(usage, "candidates_token_count", 0) or 0),
                     "total": int(getattr(usage, "total_token_count", 0) or 0),
                 }
-                print(f"\n[JPLAN][API] [TOKEN_USAGE] Prompt: {usage.prompt_token_count} | Candidates: {usage.candidates_token_count} | Total: {usage.total_token_count}")
+                jlog(
+                    "MODULE_A",
+                    f"Prompt={usage.prompt_token_count} | Candidates={usage.candidates_token_count} | Total={usage.total_token_count}",
+                    "TOKEN",
+                )
             
             parsed = self._safe_json_loads(raw_response_text)
             if isinstance(parsed, dict):
@@ -732,13 +753,15 @@ class SchedulingEngine:
                     config={"response_mime_type": "application/json"},
                 )
                 if retry_index > 0:
-                    print("[JPLAN][LLM_RETRY] success on retry")
+                    jlog("MODULE_A", "success on retry", "LLM_RETRY")
                 return response
             except Exception as exc:
                 if self._is_transient_llm_error(exc) and retry_index < len(PARSER_RETRY_DELAYS_SECONDS):
                     reason = self._transient_error_label(exc)
-                    print(
-                        f"[JPLAN][LLM_RETRY] attempt {retry_index + 1}/{len(PARSER_RETRY_DELAYS_SECONDS)} after {reason}"
+                    jlog(
+                        "MODULE_A",
+                        f"attempt {retry_index + 1}/{len(PARSER_RETRY_DELAYS_SECONDS)} after {reason}",
+                        "LLM_RETRY",
                     )
                     time.sleep(PARSER_RETRY_DELAYS_SECONDS[retry_index])
                     continue
@@ -955,7 +978,7 @@ class SchedulingEngine:
         parsed["_reply_source"] = "deterministic_fallback"
         parsed["_llm_reply"] = None
         parsed["_failure_type"] = "llm_fallback_parse"
-        print("[JPLAN][LLM_FALLBACK_PARSE] Used deterministic fallback parser for simple request")
+        jlog("MODULE_A", "Used deterministic fallback parser for simple request", "LLM_FALLBACK_PARSE")
         parsed = self._normalize_plan_level_operations(parsed, latest_request, current_schedule)
         parsed = self._normalize_parsed_locations(parsed, latest_request, [])
         return parsed
@@ -1593,14 +1616,14 @@ class SchedulingEngine:
         raw_location: Optional[str],
         payload: Dict[str, Any],
     ) -> None:
-        print(
-            "[JPLAN][LOCATION] "
+        jlog(
+            "LOCATION",
             f"{title or 'Untitled'} | raw_llm_location={raw_location} | "
             f"explicit_user_location={str(payload.get('explicit_user_location')).lower()} | "
             f"normalized={payload.get('location_label')} | "
             f"category={payload.get('location_category')} | "
             f"source={payload.get('location_source')} | "
-            f"status={payload.get('location_status')}"
+            f"status={payload.get('location_status')} | module=MODULE_A",
         )
 
     def _materialize_blocks(
@@ -1853,7 +1876,7 @@ class SchedulingEngine:
         flexible: List[Dict[str, Any]] = []
         unscheduled: List[Dict[str, Any]] = []
 
-        print(f"[JPLAN][MODULE_C] Pass 1: Categorizing {len(activities)} items...")
+        jlog("MODULE_C", f"Categorizing {len(activities)} items", "PASS_1")
         for item in deepcopy(activities):
             # Support both snake_case and camelCase
             mode = item.get("timing_mode") or item.get("timingMode") or TimingMode.UNSPECIFIED
@@ -1867,20 +1890,18 @@ class SchedulingEngine:
                     item["scheduled_start"] = fs
                     item["scheduled_end"] = fs + dur
                     fixed.append(item)
-                    print(f"  - '{item['title']}' -> FIXED ({format_clock(fs)})")
+                    jlog("MODULE_C", f"'{item['title']}' -> FIXED ({format_clock(fs)})", "CLASSIFY")
                 else:
                     flexible.append(item)
-                    print(f"  - '{item['title']}' -> FLEX (Missing fixed_start)")
+                    jlog("MODULE_C", f"'{item['title']}' -> FLEX (missing fixed_start)", "CLASSIFY")
             elif mode == TimingMode.RELATIVE:
                 relative.append(item)
-                print(f"  - '{item['title']}' -> RELATIVE")
+                jlog("MODULE_C", f"'{item['title']}' -> RELATIVE", "CLASSIFY")
             else:
                 flexible.append(item)
-                print(f"  - '{item['title']}' -> FLEX (Mode: {mode})")
+                jlog("MODULE_C", f"'{item['title']}' -> FLEX (mode={mode})", "CLASSIFY")
 
-        print("\n" + "="*60)
-        print(" [JPLAN] STARTING MODULE C - FEASIBILITY-FIRST CONSTRUCTION")
-        print("="*60)
+        jsection("MODULE_C", "feasibility-first construction", "CONSTRUCT")
         
         timeline: List[Dict[str, Any]] = []
 
@@ -1889,12 +1910,12 @@ class SchedulingEngine:
         for item in fixed:
             feasible, reason = self._validate_locked_item(item, timeline, day_start, day_end, min_travel)
             if feasible:
-                print(f"[JPLAN][MODULE_C] [LOCKING] '{item['title']}' -> {format_clock(item['scheduled_start'])}")
+                jlog("MODULE_C", f"'{item['title']}' -> {format_clock(item['scheduled_start'])}", "LOCKING")
                 item["trace"].append("Locked as a fixed commitment.")
                 timeline.append(item)
                 timeline.sort(key=lambda x: x["scheduled_start"])
             else:
-                print(f"[JPLAN][MODULE_C] [CLASH] '{item['title']}' !!! reason: {reason}")
+                jlog("MODULE_C", f"'{item['title']}' reason={reason}", "CLASH")
                 timeline.append(self._create_conflict_item(item, timeline, reason))
                 timeline.sort(key=lambda x: x["scheduled_start"])
 
@@ -1930,7 +1951,7 @@ class SchedulingEngine:
                 search_end = anchor_item["scheduled_start"]
                 predecessors = [a for a in timeline if a["scheduled_end"] <= search_end and a.get("id") != anchor_item.get("id")]
                 search_start = max([day_start] + [a["scheduled_end"] for a in predecessors])
-                print(f"[JPLAN][MODULE_C] [PLACING_RELATIVE] '{item['title']}' before '{target_title}' (Search: {format_clock(search_start)} -> {format_clock(search_end)})")
+                jlog("MODULE_C", f"'{item['title']}' before '{target_title}' search={format_clock(search_start)}->{format_clock(search_end)}", "PLACE_RELATIVE")
                 inserted, reason = self._insert_best_position(
                     item, timeline, search_start, search_end, min_travel,
                     prefer_latest=True
@@ -1943,7 +1964,7 @@ class SchedulingEngine:
                 if successors:
                     search_end = min(a["scheduled_start"] for a in successors)
 
-                print(f"[JPLAN][MODULE_C] [PLACING_RELATIVE] '{item['title']}' after '{target_title}' (Search: {format_clock(search_start)} -> {format_clock(search_end)})")
+                jlog("MODULE_C", f"'{item['title']}' after '{target_title}' search={format_clock(search_start)}->{format_clock(search_end)}", "PLACE_RELATIVE")
                 inserted, reason = self._insert_best_position(
                     item, timeline, search_start, search_end, min_travel,
                     prefer_earliest=True
@@ -1962,10 +1983,10 @@ class SchedulingEngine:
                     target_title,
                 )
                 if tight_inserted:
-                    print(f"[JPLAN][MODULE_C] [ACCEPTED_TIGHT_TRANSITION] '{item['title']}' - Fits activity window but transition is tight.")
+                    jlog("MODULE_C", f"'{item['title']}' fits activity window but transition is tight", "ACCEPTED_TIGHT_TRANSITION")
                     timeline = tight_inserted
                 else:
-                    print(f"[JPLAN][MODULE_C] [REJECT_REL] '{item['title']}' - No feasible slot in narrative window.")
+                    jlog("MODULE_C", f"'{item['title']}' no feasible slot in narrative window", "REJECT_REL")
                     conflict_timeline = self._insert_as_conflict(
                         item,
                         timeline,
@@ -1977,7 +1998,7 @@ class SchedulingEngine:
         # 3. Place FLEXIBLE items
         flexible.sort(key=self._calculate_activity_base_score, reverse=True)
         for item in flexible:
-            print(f"[JPLAN][MODULE_C] [PLACING_FLEX] '{item['title']}' (Score: {self._calculate_activity_base_score(item)})")
+            jlog("MODULE_C", f"'{item['title']}' score={self._calculate_activity_base_score(item)}", "PLACE_FLEX")
             inserted, reason = self._insert_best_position(item, timeline, day_start, day_end, min_travel)
             if inserted:
                 timeline = inserted
@@ -4085,9 +4106,7 @@ class SchedulingEngine:
                 is_explicit_shift=explicit_shift_requested,
             )
 
-        print("\n" + "!" * 60)
-        print(f" [JPLAN] STARTING MODULE 9 - REPLANNING ({schedule_date})")
-        print("!" * 60)
+        jsection("MODULE_9", f"replanning date={schedule_date}", "REPLAN")
         planned_result = self._plan_schedule(schedule_date, active_set, preferences)
         conflicts = self._build_conflicts(planned_result["activities"], mutated_ids)
         for conflict in conflicts:
@@ -4172,7 +4191,7 @@ class SchedulingEngine:
             else ("conflict" if envelope_status in {"route_conflict", "conflict"} else "success")
         )
 
-        print(f"\n[JPLAN][ENGINE_LOGIC] --- FINAL SCHEDULE SUMMARY ---")
+        jlog("SUMMARY", "Final schedule", "FINAL")
         summary_lines = []
         for block in updated_envelope.get("schedule_blocks", []):
             st = block.get("start")
@@ -4184,9 +4203,8 @@ class SchedulingEngine:
                 line += f" ({block['location']})"
             elif b_type == "transition":
                 line += f" ({block.get('duration_minutes')} min)"
-            print(line)
+            jlog("SUMMARY", line.strip(), "FINAL")
             summary_lines.append(line)
-        print(f"[JPLAN][ENGINE_LOGIC] ---------------------------")
         updated_envelope["final_schedule_summary"] = "\n".join(summary_lines)
 
         return {
@@ -4736,10 +4754,10 @@ class SchedulingEngine:
             }
             for block in summary.get("referenced_blocks") or []
         ]
-        print(f"[JPLAN][MODULE_8] Reply class = {self._module_8_reply_class(reply_status)}")
-        print(f"[JPLAN][MODULE_8] Referenced blocks = {json.dumps(referenced, ensure_ascii=True)}")
-        print(f"[JPLAN][MODULE_8] Final reply = {json.dumps(reply, ensure_ascii=True)}")
-        print(f"[JPLAN][MODULE_8] Reply source = {source}")
+        jlog("MODULE_8", f"Reply class={self._module_8_reply_class(reply_status)}", "REPLY")
+        jlog("MODULE_8", f"Referenced blocks={json.dumps(referenced, ensure_ascii=True)}", "REPLY")
+        jlog("MODULE_8", f"Final reply={json.dumps(reply, ensure_ascii=True)}", "REPLY")
+        jlog("MODULE_8", f"Reply source={source}", "REPLY")
 
     def compose_result_reply(
         self,
@@ -4752,9 +4770,7 @@ class SchedulingEngine:
         summary = self._compact_result_summary(result, allow_clash, parsed)
         fallback = self._fallback_result_reply(latest_request, summary)
 
-        print("\n" + "#" * 60)
-        print(" [JPLAN] STARTING MODULE 8 - RESULT-AWARE REPLY")
-        print("#" * 60)
+        jsection("MODULE_8", "result-aware reply", "REPLY")
 
         if fallback.get("reply_status") == "location_pending":
             fallback = {**fallback, "reply_source": "template"}
@@ -4805,10 +4821,11 @@ RESULT_SUMMARY:
                     "candidates": int(getattr(usage, "candidates_token_count", 0) or 0),
                     "total": int(getattr(usage, "total_token_count", 0) or 0),
                 }
-                print(
-                    f"[JPLAN][LLM_REPLY] Token Usage: Prompt={token_usage['prompt']} | "
-                    f"Candidates={token_usage['candidates']} | Total={token_usage['total']}"
-            )
+                jlog(
+                    "MODULE_8",
+                    f"Prompt={token_usage['prompt']} | Candidates={token_usage['candidates']} | Total={token_usage['total']}",
+                    "TOKEN",
+                )
             reply = (response.text or "").strip()
             if not reply:
                 final = {**fallback, "token_usage": token_usage, "reply_source": "fallback-template"}
@@ -4860,7 +4877,7 @@ RESULT_SUMMARY:
             self._log_module_8_final(final, summary, "llm")
             return final
         except Exception as exc:
-            print(f"[JPLAN][LLM_REPLY] Result-aware reply failed: {exc}")
+            jlog("MODULE_8", f"Result-aware reply failed: {exc}", "ERROR")
             final = {**fallback, "reply_source": "fallback-template"}
             self._log_module_8_final(final, summary, "fallback-template")
             return final

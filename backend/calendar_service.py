@@ -5,6 +5,20 @@ from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta
 from supabase import Client
 
+from jplan_logging import jlog
+
+CALENDAR_VERBOSE_LOGS = os.getenv("JPLAN_CALENDAR_DEBUG", "").lower() in {"1", "true", "yes", "on"}
+
+
+def _calendar_log(message: str, stage: str = "INFO") -> None:
+    jlog("CALENDAR", message, stage)
+
+
+def _calendar_debug(message: str) -> None:
+    if CALENDAR_VERBOSE_LOGS:
+        _calendar_log(message, "DEBUG")
+
+
 class CalendarService:
     def __init__(self, supabase_client: Client):
         self.supabase = supabase_client
@@ -20,7 +34,7 @@ class CalendarService:
             response.raise_for_status()
             return response.json().get("items", [])
         except Exception as e:
-            print(f"Error listing calendars: {e}")
+            _calendar_log(f"Error listing calendars: {e}", "ERROR")
             return []
 
     def refresh_access_token(self, refresh_token: str) -> Optional[str]:
@@ -28,7 +42,7 @@ class CalendarService:
         Exchange a refresh token for a new access token
         """
         if not self.client_id or not self.client_secret:
-            print("Error: GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET not set")
+            _calendar_log("GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET not set", "ERROR")
             return None
 
         url = "https://oauth2.googleapis.com/token"
@@ -44,7 +58,7 @@ class CalendarService:
             response.raise_for_status()
             return response.json().get("access_token")
         except Exception as e:
-            print(f"Error refreshing access token: {e}")
+            _calendar_log(f"Error refreshing access token: {e}", "ERROR")
             if hasattr(e, 'response') and getattr(e.response, 'status_code', None) == 400:
                 raise Exception("TOKEN_EXPIRED")
             return None
@@ -67,7 +81,7 @@ class CalendarService:
             response.raise_for_status()
             return response.json().get("items", [])
         except Exception as e:
-            print(f"Error fetching calendar events: {e}")
+            _calendar_log(f"Error fetching calendar events: {e}", "ERROR")
             return []
 
     def sync_user_calendar(self, user_id: str, date_str: str) -> List[Dict[str, Any]]:
@@ -80,20 +94,20 @@ class CalendarService:
             res = self.supabase.table("profiles").select("google_refresh_token").eq("id", user_id).execute()
             
             if not res.data or len(res.data) == 0:
-                print(f"[ERROR] No profile found for user {user_id}")
+                _calendar_log(f"No profile found for user {user_id}", "ERROR")
                 return []
                 
             refresh_token = res.data[0].get("google_refresh_token")
             
             if not refresh_token:
-                print(f"[DEBUG] Profile found but no refresh token for user {user_id}")
+                _calendar_debug(f"Profile found but no refresh token for user {user_id}")
                 return []
 
             # 2. Refresh access token
             access_token = self.refresh_access_token(refresh_token)
-            print(f"[DEBUG] Access token obtained: {'Yes' if access_token else 'No'}")
+            _calendar_debug(f"Access token obtained: {'yes' if access_token else 'no'}")
             if not access_token:
-                print("[DEBUG] Failed to get access token")
+                _calendar_debug("Failed to get access token")
                 return []
 
             # 3. Define time range for the date (fetching with a buffer to handle timezones)
@@ -117,15 +131,15 @@ class CalendarService:
             start_utc = (target_date - timedelta(hours=14)).isoformat() + "Z"
             end_utc = (target_date + timedelta(hours=38)).isoformat() + "Z"
             
-            print(f"[DEBUG] Fetching events from {start_utc} to {end_utc}")
+            _calendar_debug(f"Fetching events from {start_utc} to {end_utc}")
 
             # 4. Fetch events
             # DEBUG: List all calendars first to see if primary is correct
             calendars = self.list_calendars(access_token)
-            print(f"[DEBUG] Available calendars: {[c.get('summary') for c in calendars]}")
+            _calendar_debug(f"Available calendars: {[c.get('summary') for c in calendars]}")
             
             events = self.get_calendar_events(access_token, start_utc, end_utc)
-            print(f"[DEBUG] Raw events fetched from primary: {len(events)}")
+            _calendar_debug(f"Raw events fetched from primary: {len(events)}")
 
             # 5. Filter events that actually fall into the target date (local time)
             formatted_activities = []
@@ -137,15 +151,15 @@ class CalendarService:
                 end_raw = end_obj.get("dateTime") or end_obj.get("date")
                 summary = event.get("summary", "Untitled Event")
                 
-                print(f"[DEBUG] Evaluating event: '{summary}' | Start: {start_raw}")
+                _calendar_debug(f"Evaluating event: '{summary}' | start={start_raw}")
                 
                 event_date = start_raw.split("T")[0] if "T" in start_raw else start_raw
                 
                 if event_date != date_str:
-                    print(f"[DEBUG] Skipping: event_date {event_date} != target {date_str}")
+                    _calendar_debug(f"Skipping event_date={event_date} target={date_str}")
                     continue
                 
-                print(f"[DEBUG] Including: {summary}")
+                _calendar_debug(f"Including event: {summary}")
                 
                 if "T" in start_raw:
                     try:
@@ -173,7 +187,7 @@ class CalendarService:
             return formatted_activities
 
         except Exception as e:
-            print(f"Sync failed for user {user_id}: {e}")
+            _calendar_log(f"Sync failed for user {user_id}: {e}", "ERROR")
             return []
     def sync_upcoming_events(self, user_id: str, days_ahead: int = 60) -> Dict[str, List[Dict[str, Any]]]:
         """
@@ -183,7 +197,7 @@ class CalendarService:
             # 1. Get refresh token
             res = self.supabase.table("profiles").select("google_refresh_token").eq("id", user_id).execute()
             if not res.data or len(res.data) == 0:
-                print(f"[ERROR] No profile found for user {user_id}")
+                _calendar_log(f"No profile found for user {user_id}", "ERROR")
                 return {}
             
             refresh_token = res.data[0].get("google_refresh_token")
@@ -205,11 +219,11 @@ class CalendarService:
             time_min = now.isoformat() + "Z"
             time_max = (now + timedelta(days=days_ahead)).isoformat() + "Z"
             
-            print(f"[DEBUG] Fetching future events from {time_min} to {time_max}")
+            _calendar_debug(f"Fetching future events from {time_min} to {time_max}")
 
             # 4. Fetch
             events = self.get_calendar_events(access_token, time_min, time_max)
-            print(f"[DEBUG] Total future events fetched: {len(events)}")
+            _calendar_debug(f"Total future events fetched: {len(events)}")
 
             # 5. Group and format
             grouped_data = {}
@@ -256,7 +270,7 @@ class CalendarService:
         except Exception as e:
             if str(e) == "TOKEN_EXPIRED":
                 raise e
-            print(f"Bulk sync failed for user {user_id}: {e}")
+            _calendar_log(f"Bulk sync failed for user {user_id}: {e}", "ERROR")
             return {}
 
     def export_schedule_to_google(self, user_id: str, date_str: str, activities: List[Dict[str, Any]]) -> int:
@@ -267,7 +281,7 @@ class CalendarService:
             # 1. Get refresh token
             res = self.supabase.table("profiles").select("google_refresh_token").eq("id", user_id).execute()
             if not res.data or len(res.data) == 0:
-                print(f"[ERROR] No profile found for user {user_id}")
+                _calendar_log(f"No profile found for user {user_id}", "ERROR")
                 return False
             
             refresh_token = res.data[0].get("google_refresh_token")
@@ -296,11 +310,11 @@ class CalendarService:
                     # Input: "09:00 AM", "2026-04-15"
                     return datetime.strptime(f"{d_str} {t_str}", "%Y-%m-%d %I:%M %p")
                 except Exception as parse_err:
-                    print(f"[ERROR] Time parse error for '{t_str}': {parse_err}")
+                    _calendar_log(f"Time parse error for '{t_str}': {parse_err}", "ERROR")
                     return None
 
             # 3. Cleanup existing JPlan events in Google for this date
-            print(f"[DEBUG] Cleaning up previous JPlan events for {date_str}...")
+            _calendar_debug(f"Cleaning up previous JPlan events for {date_str}")
             # Use a slightly wider range to be sure (target date +/- 12 hours)
             target_date_dt = datetime.fromisoformat(date_str)
             clean_min = (target_date_dt - timedelta(hours=14)).isoformat() + "Z"
@@ -328,35 +342,35 @@ class CalendarService:
                         del_resp = requests.delete(del_url, headers=headers)
                         del_resp.raise_for_status()
                         deleted_count += 1
-                        print(f"[DEBUG] Deleted existing event for full sync reset: {gev.get('summary')} ({start_raw})")
+                        _calendar_debug(f"Deleted existing event for full sync reset: {gev.get('summary')} ({start_raw})")
                     except Exception as del_err:
-                        print(f"[ERROR] Failed to delete event {gev.get('id')}: {del_err}")
+                        _calendar_log(f"Failed to delete event {gev.get('id')}: {del_err}", "ERROR")
             
-            print(f"[DEBUG] Total Cleanup finished. Deleted {deleted_count} events.")
+            _calendar_debug(f"Cleanup finished; deleted={deleted_count}")
 
             # 4. Push each activity
             exported_count = 0
-            print(f"[DEBUG] Starting Master Export for user {user_id} on {date_str}. Total activities: {len(activities)}")
+            _calendar_debug(f"Starting export user={user_id} date={date_str} activities={len(activities)}")
             for act in activities:
-                print(f"[DEBUG] Processing activity: '{act.get('title')}' (source: {act.get('source')}, type: {act.get('type')})")
+                _calendar_debug(f"Processing activity='{act.get('title')}' source={act.get('source')} type={act.get('type')}")
                 
                 # Push EVERYTHING to ensure Google matches JPlan exactly
                 
                 # Only export 'activity' types
                 if act.get("type") != "activity":
-                    print(f"[DEBUG] Skipping '{act.get('title')}' because type is {act.get('type')}")
+                    _calendar_debug(f"Skipping '{act.get('title')}' because type={act.get('type')}")
                     continue
 
                 start_dt = parse_time_to_dt(act.get("startTime"), date_str)
                 end_dt = parse_time_to_dt(act.get("endTime"), date_str)
                 
                 if not start_dt or not end_dt:
-                    print(f"[DEBUG] Skipping '{act.get('title')}' because time parsing failed")
+                    _calendar_debug(f"Skipping '{act.get('title')}' because time parsing failed")
                     continue
 
                 # FIX: Handle cases where end time is physically before start time (e.g. crossing midnight)
                 if end_dt <= start_dt:
-                    print(f"[DEBUG] End time {end_dt} is before start {start_dt}. Assuming next day.")
+                    _calendar_debug(f"End time {end_dt} is before start {start_dt}; assuming next day")
                     end_dt += timedelta(days=1)
 
                 start_payload = {"dateTime": start_dt.strftime("%Y-%m-%dT%H:%M:%S") + "+08:00"}
@@ -371,23 +385,23 @@ class CalendarService:
                     "reminders": {"useDefault": True}
                 }
                 
-                print(f"[DEBUG] Sending event payload to Google: {json.dumps(event)}")
+                _calendar_debug(f"Sending event payload to Google: {json.dumps(event)}")
 
                 url = "https://www.googleapis.com/calendar/v3/calendars/primary/events"
                 resp = requests.post(url, headers=headers, json=event)
                 
                 if resp.status_code == 403:
-                    print(f"[ERROR] 403 Forbidden - likely missing scopes: {resp.text}")
+                    _calendar_log(f"403 Forbidden - likely missing scopes: {resp.text}", "ERROR")
                     raise Exception("insufficientPermissions")
                 
                 resp.raise_for_status()
                 exported_count += 1
 
-            print(f"[DEBUG] Successfully exported {exported_count} activities to Google.")
+            _calendar_log(f"Successfully exported {exported_count} activities to Google", "EXPORT")
             return exported_count
 
         except Exception as e:
             if "TOKEN_EXPIRED" in str(e) or "insufficientPermissions" in str(e):
                 raise e
-            print(f"Export failed for user {user_id}: {e}")
+            _calendar_log(f"Export failed for user {user_id}: {e}", "ERROR")
             return 0
