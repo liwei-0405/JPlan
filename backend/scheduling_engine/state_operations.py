@@ -1,0 +1,1131 @@
+import json
+import re
+import time
+from copy import deepcopy
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
+from uuid import uuid4
+from zoneinfo import ZoneInfo
+
+from jplan_logging import jjson, jlog, jsection
+from travel_service import MissingORSApiKey, TravelService, TravelServiceError, coordinate_from_saved_location
+from .types_utils import *
+from .types_utils import _normalize_location
+
+class StateOperationsMixin:
+    def _merge_target_date_context(
+        self,
+        shifted_activities: List[Dict[str, Any]],
+        target_date_envelope: Optional[Dict[str, Any]],
+        source_date: Optional[str],
+        target_date: Optional[str],
+        is_explicit_shift: bool = False,
+    ) -> List[Dict[str, Any]]:
+        target_context = self._load_canonical_activities(target_date_envelope)
+        existing_active = [item for item in target_context if item.get("status") == "active"]
+        self._debug(f"[STATE] Loaded active activities for {target_date_envelope.get('date') if target_date_envelope else '(none)'}: {len(existing_active)}")
+
+        incoming_ids = {item.get("stable_activity_id") for item in shifted_activities}
+        merged = list(shifted_activities)
+        for activity in existing_active:
+            if activity.get("stable_activity_id") in incoming_ids:
+                continue
+            merged.append(activity)
+        if source_date:
+            target_label = target_date or (target_date_envelope.get("date") if target_date_envelope else source_date)
+            if is_explicit_shift:
+                self._debug(f"[STATE] Applying bulk date shift from {source_date} to {target_label}")
+                self._debug(f"[STATE] Shifted {len(shifted_activities)} active activities to target date")
+            else:
+                self._debug(f"[STATE] Assigning plan date to {target_label}")
+        return merged
+
+    def _normalize_operation(self, raw: Dict[str, Any]) -> Dict[str, Any]:
+        op = clean_title(raw.get("op") or "add") or "add"
+        normalized = deepcopy(raw)
+        normalized["op"] = op
+        if "location" in normalized:
+            normalized["location"] = clean_optional_text(normalized.get("location"))
+        normalized["fixed_start"] = raw.get("fixed_start") or raw.get("startTime")
+        normalized["fixed_end"] = raw.get("fixed_end") or raw.get("endTime")
+        normalized["target_id"] = raw.get("target_id") or raw.get("stable_activity_id") or raw.get("id")
+        normalized["target_title"] = raw.get("target_title") or raw.get("target") or raw.get("title")
+        if raw.get("duration_minutes") is None and raw.get("duration") is not None:
+            normalized["duration_minutes"] = parse_duration_minutes(raw.get("duration"))
+        if normalized.get("anchor_relation") and not normalized.get("timing_mode"):
+            normalized["timing_mode"] = TimingMode.RELATIVE
+        if normalized.get("fixed_start") is not None and not normalized.get("timing_mode"):
+            normalized["timing_mode"] = TimingMode.FIXED
+        return normalized
+
+    def _should_inherit_anchor_location(self, operation: Dict[str, Any]) -> bool:
+        """Only inherit anchor location for same-place follow-up blocks.
+
+        A coffee break right after a meeting usually shares the meeting place.
+        Dinner after grocery shopping should not silently become "at the store".
+        """
+        title = clean_title(operation.get("title") or operation.get("target_title") or "")
+        category = clean_title(operation.get("location_category") or "")
+        if any(keyword in title for keyword in ("coffee", "break", "pause")):
+            return True
+        if category in {"meal_place", "supermarket", "fitness_center", "home"}:
+            return False
+        status = clean_title(operation.get("location_status") or "")
+        if status in {"needs_resolution", "unresolved"}:
+            return False
+        return True
+
+    def _conflict_identity(self, conflict: Dict[str, Any]) -> Optional[str]:
+        activity_ids = conflict.get("activity_ids") or []
+        if len(activity_ids) < 2:
+            return conflict.get("conflict_identity")
+        return "|".join(sorted(str(activity_id) for activity_id in activity_ids))
+
+    def _existing_conflict_identities(self, envelope: Dict[str, Any]) -> set[str]:
+        identities: set[str] = set()
+        for conflict in envelope.get("conflicts") or []:
+            identity = self._conflict_identity(conflict)
+            if identity:
+                identities.add(identity)
+        return identities
+
+    def _message_explicitly_targets_activity(self, message: str, title: str) -> bool:
+        clean_message = clean_title(message)
+        clean_activity = clean_title(title)
+        action_words = ("move", "shift", "reschedule", "change", "edit", "update")
+        if not clean_message or not clean_activity:
+            return False
+        for word in action_words:
+            if re.search(rf"\b{word}\s+(?:my\s+|the\s+)?{re.escape(clean_activity)}\b", clean_message):
+                return True
+        if clean_activity in clean_message and re.search(r"\b(?:to|at)\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b", clean_message):
+            return True
+        return False
+
+    def _infer_anchor_from_user_message(
+        self,
+        operation: Dict[str, Any],
+        active_pool: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        message = clean_title(operation.get("_user_message") or "")
+        target_title = clean_title(operation.get("target_title") or operation.get("title") or "")
+        if not message or not target_title:
+            return None
+
+        for anchor in active_pool:
+            anchor_title = clean_title(anchor.get("title") or "")
+            if not anchor_title or anchor_title == target_title:
+                continue
+            before_patterns = (
+                f"{target_title} before {anchor_title}",
+                f"{target_title} before the {anchor_title}",
+            )
+            after_patterns = (
+                f"{target_title} after {anchor_title}",
+                f"{target_title} after the {anchor_title}",
+            )
+            if any(pattern in message for pattern in before_patterns):
+                return {"kind": "before", "target_title": anchor.get("title")}
+            if any(pattern in message for pattern in after_patterns):
+                return {"kind": "after", "target_title": anchor.get("title")}
+        return None
+
+    def _prepare_operations_for_apply(
+        self,
+        operations: List[Dict[str, Any]],
+        active_pool: List[Dict[str, Any]],
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        prepared: List[Dict[str, Any]] = []
+        ignored: List[Dict[str, Any]] = []
+
+        for raw_operation in operations:
+            operation = self._normalize_operation(raw_operation)
+            inferred_anchor = self._infer_anchor_from_user_message(operation, active_pool)
+            if inferred_anchor:
+                operation["anchor_relation"] = inferred_anchor
+                operation["timing_mode"] = TimingMode.RELATIVE
+                operation["fixed_start"] = None
+                operation["fixed_end"] = None
+
+            target_reference = operation.get("target_id") or operation.get("target_title")
+            resolution = self._resolve_activity_reference(target_reference, active_pool) if target_reference else {"status": "missing"}
+            target = resolution.get("activity") if resolution.get("status") == "resolved" else None
+            has_anchor = bool(operation.get("anchor_relation"))
+            explicit_fixed = operation.get("fixed_start") is not None or operation.get("fixed_end") is not None
+            message = operation.get("_user_message") or ""
+
+            if (
+                target
+                and operation.get("op") in {"update", "move", "replace", "update_priority"}
+                and explicit_fixed
+                and message
+                and not self._message_explicitly_targets_activity(message, target.get("title", ""))
+            ):
+                ignored_item = {
+                    "operation": operation,
+                    "target": target.get("title"),
+                    "reason": "unrequested_fixed_event_mutation",
+                }
+                ignored.append(ignored_item)
+                jlog(
+                    "STATE",
+                    f"Ignored unrequested operation target={target.get('title')} reason=unrequested_fixed_event_mutation",
+                    "OP_FILTER",
+                )
+                continue
+
+            if (
+                target
+                and has_anchor
+                and not explicit_fixed
+                and target.get("timing_mode") == TimingMode.FIXED
+                and message
+                and not self._message_explicitly_targets_activity(message, target.get("title", ""))
+            ):
+                ignored_item = {
+                    "operation": operation,
+                    "target": target.get("title"),
+                    "reason": "unrequested_fixed_event_mutation",
+                }
+                ignored.append(ignored_item)
+                jlog(
+                    "STATE",
+                    f"Ignored unrequested operation target={target.get('title')} reason=unrequested_fixed_event_mutation",
+                    "OP_FILTER",
+                )
+                continue
+
+            prepared.append(operation)
+
+        return prepared, ignored
+
+    def _operation_postcondition(
+        self,
+        operation: Dict[str, Any],
+        target: Dict[str, Any],
+        active_pool: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        anchor = operation.get("anchor_relation")
+        if not anchor:
+            return None
+        resolved_anchor = self._resolve_anchor_relation(anchor, active_pool)
+        anchor_id = (resolved_anchor or {}).get("target_activity_id")
+        if not anchor_id:
+            return None
+        return {
+            "kind": clean_title((resolved_anchor or {}).get("kind") or "after"),
+            "target_activity_id": target.get("stable_activity_id"),
+            "target_title": target.get("title"),
+            "anchor_activity_id": anchor_id,
+            "anchor_title": (resolved_anchor or {}).get("target_title"),
+        }
+
+    def _validate_postconditions(
+        self,
+        planned_by_id: Dict[str, Dict[str, Any]],
+        postconditions: List[Dict[str, Any]],
+        planned_activities: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
+        failures: List[Dict[str, Any]] = []
+        planned_items = planned_activities or list(planned_by_id.values())
+        for condition in postconditions:
+            target = planned_by_id.get(condition.get("target_activity_id"))
+            anchor = planned_by_id.get(condition.get("anchor_activity_id"))
+            if not target or not anchor:
+                failures.append({**condition, "reason": "Target or anchor activity was not found after replanning."})
+                continue
+
+            kind = condition.get("kind") or "after"
+            target_start = target.get("scheduled_start") or 0
+            target_end = target.get("scheduled_end") or 0
+            anchor_start = anchor.get("scheduled_start") or 0
+            anchor_end = anchor.get("scheduled_end") or 0
+            required_duration = parse_duration_minutes(target.get("duration_minutes"), minimum=0)
+
+            if kind == "before":
+                ok = target_end <= anchor_start
+                prior_blocks = [
+                    item for item in planned_items
+                    if item.get("stable_activity_id") not in {target.get("stable_activity_id"), anchor.get("stable_activity_id")}
+                    and item.get("scheduled_end") is not None
+                    and item.get("scheduled_end") <= anchor_start
+                ]
+                available_start = max([item.get("scheduled_end") or DEFAULT_DAY_START for item in prior_blocks] + [DEFAULT_DAY_START])
+                available_end = anchor_start
+                reason = f"{target.get('title')} could not be placed before {anchor.get('title')}."
+            else:
+                ok = target_start >= anchor_end
+                next_blocks = [
+                    item for item in planned_items
+                    if item.get("stable_activity_id") not in {target.get("stable_activity_id"), anchor.get("stable_activity_id")}
+                    and item.get("scheduled_start") is not None
+                    and item.get("scheduled_start") >= anchor_end
+                ]
+                available_start = anchor_end
+                available_end = min([item.get("scheduled_start") or DEFAULT_DAY_END for item in next_blocks] + [DEFAULT_DAY_END])
+                reason = f"{target.get('title')} could not be placed after {anchor.get('title')}."
+
+            if not ok:
+                available_minutes = max(0, available_end - available_start)
+                if available_minutes < required_duration:
+                    detail = (
+                        f"The available window is {format_clock(available_start)}-{format_clock(available_end)} "
+                        f"({available_minutes} min), but {target.get('title')} needs {required_duration} min."
+                    )
+                else:
+                    detail = "The final schedule did not satisfy the requested ordering after replanning."
+                failures.append({
+                    **condition,
+                    "reason": reason,
+                    "detail": detail,
+                    "target_start": format_clock(target_start),
+                    "target_end": format_clock(target_end),
+                    "anchor_start": format_clock(anchor_start),
+                    "anchor_end": format_clock(anchor_end),
+                    "required_duration_minutes": required_duration,
+                    "available_window_start": format_clock(available_start),
+                    "available_window_end": format_clock(available_end),
+                    "available_window_minutes": available_minutes,
+                })
+        return failures
+
+    def _build_postcondition_response(
+        self,
+        original_envelope: Dict[str, Any],
+        current_version: int,
+        failures: List[Dict[str, Any]],
+        allow_clash: bool,
+    ) -> Dict[str, Any]:
+        failure = failures[0]
+        reason = failure.get("detail") or failure.get("reason") or "The requested ordering could not be satisfied."
+        conflict_payload = {
+            "status": "conflict",
+            "type": "postcondition_failed",
+            "conflict_target": failure.get("target_title"),
+            "conflict_reason": reason,
+            "reason_codes": ["postcondition_failed", "no_relative_slot"],
+            "suggestions": [
+                f"Choose a different time for {failure.get('target_title')}",
+                f"Move {failure.get('anchor_title')} if that commitment can change",
+            ],
+            "postcondition": failure,
+        }
+        envelope = deepcopy(original_envelope)
+        envelope["status"] = "conflict"
+        envelope["planning_mode"] = self._planning_mode(allow_clash)
+        envelope["allow_clash"] = allow_clash
+        envelope["conflict"] = conflict_payload
+        envelope["conflicts"] = [conflict_payload]
+        envelope["version"] = current_version
+        envelope["validation_issues"] = list(envelope.get("validation_issues") or []) + [reason]
+        envelope["warnings"] = []
+        envelope["applied_changes"] = []
+        envelope["accepted_with_warnings"] = []
+        envelope["rejected_changes"] = [conflict_payload]
+        return {
+            "status": "conflict",
+            "applied": False,
+            "envelope": envelope,
+            "version": current_version,
+            "activities": envelope.get("activities", []),
+            "updatedActivities": [],
+            "deletedItemIds": [],
+            "conflict": conflict_payload,
+            "postcondition_results": failures,
+            "applied_changes": [],
+            "accepted_with_warnings": [],
+            "rejected_changes": [conflict_payload],
+            "warnings": [],
+        }
+
+    def _find_activity_by_stable_id(
+        self,
+        activities: List[Dict[str, Any]],
+        stable_activity_id: Optional[str],
+    ) -> Optional[Dict[str, Any]]:
+        if not stable_activity_id:
+            return None
+        for activity in activities:
+            if activity.get("stable_activity_id") == stable_activity_id:
+                return activity
+        return None
+
+    def _token_overlap_score(self, left: str, right: str) -> int:
+        left_tokens = {token for token in left.split() if token}
+        right_tokens = {token for token in right.split() if token}
+        if not left_tokens or not right_tokens:
+            return 0
+        return len(left_tokens & right_tokens)
+
+    def _resolve_activity_reference(
+        self,
+        reference: Any,
+        activities: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        normalized_reference = clean_title(str(reference or ""))
+        if not normalized_reference:
+            self._debug("[STATE] Target resolution failed because the reference was empty")
+            return {"status": "missing", "reason": "empty_reference"}
+
+        active_activities = [item for item in activities if item.get("status") == "active"]
+        scored: List[Tuple[int, int, int, Dict[str, Any]]] = []
+        for index, activity in enumerate(active_activities):
+            score = 0
+            if str(reference) == activity.get("stable_activity_id") or str(reference) == activity.get("id"):
+                score = 200
+            elif normalized_reference == activity.get("normalized_title"):
+                score = 150
+            elif normalized_reference == clean_title(activity.get("title", "")):
+                score = 145
+            elif normalized_reference in set(activity.get("aliases") or []):
+                score = 130
+            else:
+                overlap = self._token_overlap_score(normalized_reference, activity.get("normalized_title") or "")
+                if overlap:
+                    score = max(score, 90 + overlap * 10)
+                if normalized_reference in (activity.get("normalized_title") or "") or (activity.get("normalized_title") or "") in normalized_reference:
+                    score = max(score, 80)
+
+            if score <= 0:
+                continue
+
+            recency_rank = len(active_activities) - index
+            scheduled_rank = int(activity.get("scheduled_start") or activity.get("fixed_start") or -1)
+            scored.append((score, recency_rank, scheduled_rank, activity))
+
+        if not scored:
+            self._debug(f"[STATE] Target resolution failed for '{reference}'")
+            return {"status": "not_found", "reason": "no_match", "reference": str(reference)}
+
+        scored.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+        best_score, _, _, best_activity = scored[0]
+        tied = [entry for entry in scored if entry[0] == best_score]
+        if len(tied) > 1:
+            titles = sorted({entry[3].get("title") for entry in tied})
+            self._debug(f"[STATE] Target resolution ambiguous for '{reference}': {titles}")
+            return {
+                "status": "ambiguous",
+                "reference": str(reference),
+                "candidates": titles,
+            }
+
+        self._debug(f"[STATE] Resolved target '{reference}' -> activity_id={best_activity.get('stable_activity_id')}")
+        return {"status": "resolved", "activity": best_activity}
+
+    def _resolve_anchor_relation(
+        self,
+        anchor_relation: Optional[Dict[str, Any]],
+        activities: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        if not anchor_relation:
+            return None
+        target_reference = (
+            anchor_relation.get("target_activity_id")
+            or anchor_relation.get("target_id")
+            or anchor_relation.get("target_title")
+        )
+        if not target_reference:
+            return deepcopy(anchor_relation)
+        resolved = self._resolve_activity_reference(target_reference, activities)
+        if resolved.get("status") != "resolved":
+            return deepcopy(anchor_relation)
+        target = resolved["activity"]
+        return {
+            "kind": anchor_relation.get("kind"),
+            "target_activity_id": target.get("stable_activity_id"),
+            "target_title": target.get("title"),
+        }
+
+    def _mutate_existing_activity(
+        self,
+        existing: Dict[str, Any],
+        operation: Dict[str, Any],
+        source_turn: int,
+        anchor_pool: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        updated = deepcopy(existing)
+        updated["updated_at"] = self._now_iso()
+        updated["source_turn"] = source_turn
+        updated["source"] = "user_operation"
+        updated.setdefault("trace", [])
+
+        for field in ("title", "priority", "location", "notes", "sequence_index"):
+            if operation.get(field) is not None:
+                updated[field] = operation.get(field)
+
+        if operation.get("duration_minutes") is not None:
+            updated["duration_minutes"] = parse_duration_minutes(operation.get("duration_minutes"))
+
+        if operation.get("is_mandatory") is not None:
+            updated["is_mandatory"] = bool(operation.get("is_mandatory"))
+            updated["activity_type"] = "mandatory" if updated["is_mandatory"] else "optional"
+
+        if updated.get("title"):
+            updated["normalized_title"] = clean_title(updated["title"])
+            updated["aliases"] = self._generate_aliases(updated["title"])
+
+        explicit_fixed_start = self._coerce_minutes(operation.get("fixed_start"))
+        explicit_fixed_end = self._coerce_minutes(operation.get("fixed_end"))
+        explicit_earliest = self._coerce_minutes(operation.get("earliest_start"))
+        explicit_latest = self._coerce_minutes(operation.get("latest_end"))
+        explicit_preferred = self._coerce_minutes(operation.get("preferred_start"))
+        explicit_anchor = operation.get("anchor_relation")
+
+        if explicit_anchor:
+            resolved_anchor = self._resolve_anchor_relation(explicit_anchor, anchor_pool)
+            if resolved_anchor:
+                updated["anchor_relation"] = resolved_anchor
+            updated["timing_mode"] = TimingMode.RELATIVE
+            updated["fixed_start"] = None
+            updated["fixed_end"] = None
+            updated["scheduled_start"] = None
+            updated["scheduled_end"] = None
+            if updated.get("location") is None and resolved_anchor and self._should_inherit_anchor_location(operation):
+                anchor_activity = self._find_activity_by_stable_id(anchor_pool, resolved_anchor.get("target_activity_id"))
+                if anchor_activity:
+                    updated["location"] = anchor_activity.get("location")
+                    updated["location_normalized"] = anchor_activity.get("location_normalized")
+        elif explicit_fixed_start is not None or explicit_fixed_end is not None:
+            updated["timing_mode"] = TimingMode.FIXED
+            updated["anchor_relation"] = None
+            if explicit_fixed_start is not None:
+                updated["fixed_start"] = explicit_fixed_start
+            if explicit_fixed_end is not None:
+                updated["fixed_end"] = explicit_fixed_end
+            elif explicit_fixed_start is not None:
+                updated["fixed_end"] = explicit_fixed_start + int(updated.get("duration_minutes") or DEFAULT_DURATION)
+            updated["earliest_start"] = updated.get("fixed_start")
+            updated["latest_end"] = updated.get("fixed_end")
+            updated["scheduled_start"] = updated.get("fixed_start")
+            updated["scheduled_end"] = updated.get("fixed_end")
+
+        if explicit_earliest is not None:
+            updated["earliest_start"] = explicit_earliest
+        if explicit_latest is not None:
+            updated["latest_end"] = explicit_latest
+        if explicit_preferred is not None:
+            updated["preferred_start"] = explicit_preferred
+            if updated.get("timing_mode") == TimingMode.UNSPECIFIED:
+                updated["timing_mode"] = TimingMode.PREFERRED
+
+        if updated.get("location"):
+            updated["location_normalized"] = _normalize_location(updated.get("location"))
+
+        note = operation.get("notes") or f"{operation.get('op', 'update')} request applied to existing activity."
+        if note not in updated["trace"]:
+            updated["trace"].append(note)
+
+        updated["status"] = "active"
+        updated["is_conflict"] = False
+        updated["is_conflicting"] = False
+        updated["conflict_ids"] = []
+        updated["conflict_with"] = []
+        updated["conflict_reason"] = None
+        updated["conflict_priority"] = None
+        updated["conflict_severity"] = None
+        return self._canonicalize_activity(updated, source_turn=source_turn, default_source="user_operation")
+
+    def _build_conflict_response(
+        self,
+        original_envelope: Dict[str, Any],
+        current_version: int,
+        activity: Dict[str, Any],
+        blockers: List[Dict[str, Any]],
+        allow_clash: bool = False,
+    ) -> Dict[str, Any]:
+        blocker = blockers[0] if blockers else None
+        reason = activity.get("conflict_reason") or "Requested change conflicts with the current locked plan."
+        suggestions: List[str] = []
+
+        if blocker:
+            self._debug(
+                f"[CONFLICT] Requested {activity.get('title')} overlaps with fixed {blocker.get('title')}"
+            )
+            next_start = blocker.get("scheduled_end")
+            transition = self._transition_minutes(blocker, activity, 0)
+            if next_start is not None:
+                suggestions.append(f"Move {activity.get('title')} to {format_clock(next_start + transition)}")
+            existing_fixed = self._coerce_minutes(activity.get("fixed_start"))
+            if existing_fixed is not None:
+                suggestions.append(f"Keep {activity.get('title')} at {format_clock(existing_fixed)}")
+            suggestions.append(f"Change {blocker.get('title')} if that commitment can move")
+
+        conflict_payload = {
+            "status": "conflict",
+            "conflict_target": activity.get("title"),
+            "conflict_reason": reason,
+            "reason_codes": [self._reason_code_from_text(reason)],
+            "suggestions": suggestions,
+        }
+        envelope = deepcopy(original_envelope)
+        envelope["status"] = "conflict"
+        envelope["planning_mode"] = self._planning_mode(allow_clash)
+        envelope["allow_clash"] = allow_clash
+        envelope["conflict"] = conflict_payload
+        envelope["conflicts"] = [conflict_payload]
+        envelope["unmet_items"] = envelope.get("unmet_items") or []
+        envelope["validation_issues"] = envelope.get("validation_issues") or []
+        envelope["version"] = current_version
+        envelope.setdefault("explanations", [])
+        envelope["explanations"] = self._merge_explanations(
+            envelope.get("explanations", []),
+            [reason],
+        )
+        envelope["warnings"] = []
+        envelope["applied_changes"] = []
+        envelope["accepted_with_warnings"] = []
+        envelope["rejected_changes"] = [conflict_payload]
+        return {
+            "status": "conflict",
+            "applied": False,
+            "envelope": envelope,
+            "version": current_version,
+            "activities": envelope.get("activities", []),
+            "updatedActivities": [],
+            "deletedItemIds": [],
+            "conflict": conflict_payload,
+            "applied_changes": [],
+            "accepted_with_warnings": [],
+            "rejected_changes": [conflict_payload],
+            "warnings": [],
+        }
+
+    def apply_operations(
+        self, 
+        envelope: Dict[str, Any], 
+        operations: List[Dict[str, Any]], 
+        base_version: int,
+        new_date: Optional[str] = None,
+        target_date_envelope: Optional[Dict[str, Any]] = None,
+        saved_locations: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """Apply operations against the canonical activity set, then regenerate derived schedule blocks."""
+        current_version = int(envelope.get("version", 1))
+        if base_version != current_version:
+            raise VersionMismatchError(f"Version mismatch: baseVersion {base_version} != currentVersion {current_version}")
+
+        working_envelope = deepcopy(envelope)
+        canonical_activities = self._load_canonical_activities(working_envelope)
+        preferences = deepcopy(working_envelope.get("preferences", {}))
+        allow_clash = self._resolve_allow_clash(preferences, working_envelope)
+        planning_mode = self._planning_mode(allow_clash)
+        preferences["allow_clash"] = allow_clash
+        preferences["planning_mode"] = planning_mode
+        accurate_travel_time = self._resolve_accurate_travel_time(preferences, working_envelope)
+        preferences["accurate_travel_time"] = accurate_travel_time
+        schedule_date = new_date or working_envelope.get("date") or str(date.today())
+        source_turn = current_version + 1
+
+        updated_activities: List[Dict[str, Any]] = []
+        deleted_activity_ids: List[str] = []
+        mutated_ids: set[str] = set()
+        source_plan_date = working_envelope.get("date")
+        existing_conflict_identities = self._existing_conflict_identities(working_envelope)
+        postconditions: List[Dict[str, Any]] = []
+        operations_to_apply, ignored_operations = self._prepare_operations_for_apply(
+            self._sanitize_operations(operations),
+            [item for item in canonical_activities if item.get("status") == "active"],
+        )
+        if not operations_to_apply and ignored_operations:
+            return {
+                "status": "no_operation",
+                "applied": False,
+                "envelope": working_envelope,
+                "version": current_version,
+                "activities": working_envelope.get("activities", []),
+                "updatedActivities": [],
+                "deletedItemIds": [],
+                "ignored_operations": ignored_operations,
+                "rejected_changes": [],
+                "reply_reason": "All parser operations were ignored because they targeted unrequested fixed events.",
+            }
+        explicit_shift_requested = any(
+            operation.get("op") == "shift_plan_date"
+            for operation in operations_to_apply
+        )
+
+        for operation in operations_to_apply:
+            op_type = operation.get("op")
+            active_pool = [item for item in canonical_activities if item.get("status") == "active"]
+
+            if op_type == "shift_plan_date":
+                target_date = operation.get("to_date") or new_date or schedule_date
+                if target_date == source_plan_date:
+                    self._debug(f"[STATE] Skipping bulk date shift because the plan is already on {source_plan_date}")
+                    continue
+                if target_date:
+                    schedule_date = target_date
+                self._debug(f"[STATE] Applying bulk date shift from {source_plan_date} to {schedule_date}")
+                mutated_ids.update(
+                    item.get("stable_activity_id")
+                    for item in active_pool
+                    if item.get("stable_activity_id")
+                )
+                for index, activity in enumerate(canonical_activities):
+                    if activity.get("status") != "active":
+                        continue
+                    shifted = deepcopy(activity)
+                    shifted["updated_at"] = self._now_iso()
+                    shifted["source_turn"] = source_turn
+                    shifted.setdefault("trace", [])
+                    shifted["trace"].append(f"Shifted with the whole plan from {source_plan_date} to {schedule_date}.")
+                    canonical_activities[index] = shifted
+                    updated_activities.append(shifted)
+                continue
+
+            if op_type == "add":
+                anchor = operation.get("anchor_relation")
+                if anchor:
+                    resolved_anchor = self._resolve_anchor_relation(anchor, active_pool)
+                    if resolved_anchor:
+                        operation["anchor_relation"] = resolved_anchor
+                        if not operation.get("location") and self._should_inherit_anchor_location(operation):
+                            anchor_activity = self._find_activity_by_stable_id(active_pool, resolved_anchor.get("target_activity_id"))
+                            if anchor_activity:
+                                operation["location"] = anchor_activity.get("location")
+                new_activity = self._canonicalize_activity(
+                    operation,
+                    source_turn=source_turn,
+                    default_source="user_operation",
+                )
+                canonical_activities.append(new_activity)
+                updated_activities.append(new_activity)
+                mutated_ids.add(new_activity["stable_activity_id"])
+                postcondition = self._operation_postcondition(operation, new_activity, active_pool + [new_activity])
+                if postcondition:
+                    postconditions.append(postcondition)
+                self._debug(f"[STATE] Created new activity '{new_activity['title']}' with activity_id={new_activity['stable_activity_id']}")
+                continue
+
+            target_reference = operation.get("target_id") or operation.get("target_title")
+            resolution = self._resolve_activity_reference(target_reference, active_pool)
+            if resolution.get("status") != "resolved":
+                return {
+                    "status": "clarification_needed",
+                    "applied": False,
+                    "envelope": working_envelope,
+                    "version": current_version,
+                    "activities": working_envelope.get("activities", []),
+                    "updatedActivities": [],
+                    "deletedItemIds": [],
+                    "target_resolution": resolution,
+                }
+
+            target = resolution["activity"]
+            target_id = target["stable_activity_id"]
+            target_index = next(
+                index for index, activity in enumerate(canonical_activities)
+                if activity.get("stable_activity_id") == target_id
+            )
+
+            if op_type == "remove":
+                removed = deepcopy(canonical_activities[target_index])
+                canonical_activities[target_index]["status"] = "removed"
+                canonical_activities[target_index]["updated_at"] = self._now_iso()
+                canonical_activities[target_index]["source_turn"] = source_turn
+                deleted_activity_ids.append(target_id)
+                mutated_ids.add(target_id)
+                updated_activities.append(canonical_activities[target_index])
+                self._debug(f"[STATE] Marked activity '{removed.get('title')}' as removed")
+                continue
+
+            if op_type == "replace":
+                canonical_activities[target_index]["status"] = "superseded"
+                canonical_activities[target_index]["updated_at"] = self._now_iso()
+                replacement = self._canonicalize_activity(
+                    operation,
+                    source_turn=source_turn,
+                    default_source="user_operation",
+                )
+                canonical_activities.append(replacement)
+                updated_activities.append(replacement)
+                deleted_activity_ids.append(target_id)
+                mutated_ids.add(replacement["stable_activity_id"])
+                self._debug(f"[STATE] Superseded '{target.get('title')}' with new activity_id={replacement['stable_activity_id']}")
+                continue
+
+            mutated = self._mutate_existing_activity(target, operation, source_turn, active_pool)
+            canonical_activities[target_index] = mutated
+            updated_activities.append(mutated)
+            mutated_ids.add(target_id)
+            postcondition = self._operation_postcondition(operation, mutated, active_pool)
+            if postcondition:
+                postconditions.append(postcondition)
+            self._debug(f"[STATE] Updating existing {mutated.get('title')} activity instead of creating new one")
+
+        active_set = [
+            deepcopy(item)
+            for item in canonical_activities
+            if item.get("status") == "active"
+        ]
+
+        for item in active_set:
+            item["locked_fixed"] = (
+                item.get("timing_mode") == TimingMode.FIXED
+                and item.get("is_mandatory")
+                and item.get("stable_activity_id") not in mutated_ids
+            )
+            if (
+                item.get("stable_activity_id") not in mutated_ids
+                and item.get("scheduled_start") is not None
+                and item.get("scheduled_end") is not None
+                and not item["locked_fixed"]
+            ):
+                item["preserve_scheduled_time"] = True
+            if item["locked_fixed"]:
+                self._debug(
+                    f"[STATE] Fixed lock preserved for {item.get('title')} at {format_clock(item.get('fixed_start') or item.get('scheduled_start') or 0)}"
+                )
+
+        if source_plan_date != schedule_date:
+            active_set = self._merge_target_date_context(
+                active_set,
+                target_date_envelope,
+                source_plan_date,
+                schedule_date,
+                is_explicit_shift=explicit_shift_requested,
+            )
+
+        jsection("MODULE_9", f"replanning date={schedule_date}", "REPLAN")
+        planned_result = self._plan_schedule(schedule_date, active_set, preferences)
+        conflicts = self._build_conflicts(planned_result["activities"], mutated_ids if allow_clash else set())
+        for conflict in conflicts:
+            identity = self._conflict_identity(conflict)
+            conflict["conflict_lifecycle"] = "existing" if identity in existing_conflict_identities else "new"
+
+        planned_by_id = {
+            item.get("stable_activity_id"): item
+            for item in planned_result.get("activities", [])
+            if item.get("stable_activity_id")
+        }
+        postcondition_failures = self._validate_postconditions(
+            planned_by_id,
+            postconditions,
+            planned_result.get("activities", []),
+        )
+        if postcondition_failures and not allow_clash:
+            self._debug(f"[CONFLICT] Requested ordering was not satisfied: {postcondition_failures[0].get('reason')}")
+            response = self._build_postcondition_response(working_envelope, current_version, postcondition_failures, allow_clash=allow_clash)
+            response["ignored_operations"] = ignored_operations
+            return response
+
+        blocking_conflicts = [
+            conflict for conflict in conflicts
+            if any(str(activity_id) in mutated_ids for activity_id in conflict.get("activity_ids") or [])
+        ]
+        if blocking_conflicts and not allow_clash:
+            for mutated_id in mutated_ids:
+                planned_activity = planned_by_id.get(mutated_id)
+                if planned_activity and planned_activity.get("is_conflict"):
+                    if not any(str(mutated_id) in [str(activity_id) for activity_id in conflict.get("activity_ids") or []] for conflict in blocking_conflicts):
+                        continue
+                    blockers = [
+                        planned_by_id.get(blocker_id)
+                        for blocker_id in planned_activity.get("conflict_with") or []
+                        if planned_by_id.get(blocker_id)
+                    ]
+                    response = self._build_conflict_response(working_envelope, current_version, planned_activity, blockers, allow_clash=allow_clash)
+                    response["ignored_operations"] = ignored_operations
+                    return response
+
+        warnings = self._collect_schedule_warnings(planned_result["activities"], planned_result["schedule_blocks"])
+        final_updated_activities = [
+            self._format_activity(planned_by_id[activity_id])
+            for activity_id in mutated_ids
+            if activity_id in planned_by_id
+        ]
+        formatted_activities = [self._format_activity(item) for item in planned_result["activities"]]
+        formatted_unscheduled = [
+            self._format_activity(item) for item in planned_result.get("unscheduled_activities", [])
+        ]
+        envelope_status = "partial" if (conflicts or postcondition_failures) else ("warning" if warnings else "ok")
+        result_status = "warning" if envelope_status == "warning" else "success"
+
+        updated_envelope = deepcopy(working_envelope)
+        updated_envelope["schema_version"] = 4
+        updated_envelope["date"] = schedule_date
+        updated_envelope["status"] = envelope_status
+        updated_envelope["schedule_status"] = envelope_status
+        updated_envelope["planning_mode"] = planning_mode
+        updated_envelope["allow_clash"] = allow_clash
+        updated_envelope["accurate_travel_time"] = accurate_travel_time
+        updated_envelope["preferences"] = preferences
+        updated_envelope["activities"] = formatted_activities
+        updated_envelope["schedule_blocks"] = planned_result["schedule_blocks"]
+        updated_envelope["unscheduled_activities"] = formatted_unscheduled
+        updated_envelope["version"] = current_version + 1
+        updated_envelope["explanations"] = planned_result.get("explanations", [])
+        updated_envelope["conflicts"] = conflicts
+        updated_envelope["warnings"] = warnings
+        updated_envelope["applied_changes"] = final_updated_activities
+        updated_envelope["accepted_with_warnings"] = [
+            warning for warning in warnings
+            if str(warning.get("activity_id")) in {str(activity_id) for activity_id in mutated_ids}
+        ]
+        updated_envelope["rejected_changes"] = []
+        updated_envelope["ignored_operations"] = ignored_operations
+        updated_envelope["unmet_items"] = []
+        updated_envelope["validation_issues"] = [failure.get("reason") for failure in postcondition_failures if failure.get("reason")]
+        updated_envelope["conflict"] = conflicts[0] if conflicts else ({"type": "postcondition_failed", **postcondition_failures[0]} if postcondition_failures else None)
+        updated_envelope["postcondition_results"] = postcondition_failures
+        updated_envelope = self._apply_accurate_travel_if_requested(updated_envelope, saved_locations or [])
+        envelope_status = updated_envelope.get("status") or envelope_status
+        result_status = (
+            "warning"
+            if envelope_status == "warning"
+            else ("conflict" if envelope_status in {"route_conflict", "conflict"} else "success")
+        )
+
+        jlog("SUMMARY", "Final schedule", "FINAL")
+        summary_lines = []
+        for block in updated_envelope.get("schedule_blocks", []):
+            st = block.get("start")
+            et = block.get("end")
+            title = block.get("title")
+            b_type = block.get("block_type")
+            line = f"  - [{st} - {et}] {title}"
+            if b_type == "activity" and block.get("location"):
+                line += f" ({block['location']})"
+            elif b_type == "transition":
+                line += f" ({block.get('duration_minutes')} min)"
+            jlog("SUMMARY", line.strip(), "FINAL")
+            summary_lines.append(line)
+        updated_envelope["final_schedule_summary"] = "\n".join(summary_lines)
+
+        return {
+            "status": result_status,
+            "applied": True,
+            "envelope": updated_envelope,
+            "planned_result": planned_result,
+            "version": updated_envelope["version"],
+            "activities": updated_envelope["activities"],
+            "updatedActivities": final_updated_activities,
+            "deletedItemIds": deleted_activity_ids,
+            "applied_changes": final_updated_activities,
+            "accepted_with_warnings": updated_envelope["accepted_with_warnings"],
+            "rejected_changes": [],
+            "ignored_operations": ignored_operations,
+            "warnings": warnings,
+        }
+
+    def _format_activity(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        s_start = item.get("scheduled_start")
+        s_end = item.get("scheduled_end")
+
+        if s_start is None and item.get("startTime"):
+            s_start = parse_clock(item["startTime"])
+        if s_end is None and item.get("endTime"):
+            s_end = parse_clock(item["endTime"])
+
+        if s_start is None:
+            s_start = item.get("fixed_start")
+        if s_end is None:
+            s_end = item.get("fixed_end") or (s_start + (item.get("duration_minutes") or 60) if s_start is not None else None)
+
+        s_start_val = s_start if s_start is not None else 0
+        s_end_val = s_end if s_end is not None else s_start_val + 60
+
+        conflict_with = item.get("conflict_with") or []
+        if isinstance(conflict_with, str):
+            conflict_with = [conflict_with]
+
+        stable_activity_id = item.get("stable_activity_id") or item.get("id") or "unknown"
+        fixed_start = item.get("fixed_start")
+        fixed_end = item.get("fixed_end")
+        earliest_start = item.get("earliest_start")
+        latest_end = item.get("latest_end")
+        preferred_start = item.get("preferred_start")
+        location = clean_optional_text(item.get("location"))
+
+        return {
+            "id": stable_activity_id,
+            "stable_activity_id": stable_activity_id,
+            "type": item.get("type", "activity"),
+            "entity_type": item.get("entity_type", "activity"),
+            "activity_type": item.get("activity_type") or ("mandatory" if item.get("is_mandatory", True) else "optional"),
+            "title": item.get("title", "Untitled"),
+            "normalized_title": item.get("normalized_title") or clean_title(item.get("title", "Untitled")),
+            "startTime": format_clock(s_start_val),
+            "endTime": format_clock(s_end_val),
+            "location": location,
+            "location_label": clean_optional_text(item.get("location_label")) or location,
+            "location_category": item.get("location_category"),
+            "location_status": item.get("location_status"),
+            "location_source": item.get("location_source"),
+            "location_confidence": item.get("location_confidence"),
+            "location_normalized": item.get("location_normalized") or _normalize_location(location),
+            "saved_location_label": item.get("saved_location_label"),
+            "resolved_location": deepcopy(item.get("resolved_location")) if isinstance(item.get("resolved_location"), dict) else None,
+            "raw_llm_location": item.get("raw_llm_location"),
+            "explicit_user_location": bool(item.get("explicit_user_location", False)),
+            "location_warning": item.get("location_warning"),
+            "duration": item.get("duration") or self._duration_label(item.get("duration_minutes") or (s_end_val - s_start_val)),
+            "duration_minutes": int(item.get("duration_minutes") or (s_end_val - s_start_val)),
+            "priority": item.get("priority", "medium"),
+            "isMandatory": bool(item.get("is_mandatory", True) if "is_mandatory" in item else item.get("isMandatory", True)),
+            "timing_mode": item.get("timing_mode") or item.get("timingMode") or TimingMode.UNSPECIFIED,
+            "fixed_start": fixed_start,
+            "fixed_end": fixed_end,
+            "earliest_start": earliest_start,
+            "latest_end": latest_end,
+            "preferred_start": preferred_start,
+            "anchor_relation": deepcopy(item.get("anchor_relation")),
+            "sequence_index": item.get("sequence_index"),
+            "status": item.get("status", "active"),
+            "source_turn": item.get("source_turn"),
+            "created_at": item.get("created_at"),
+            "updated_at": item.get("updated_at"),
+            "notes": item.get("notes"),
+            "explanation": item["trace"][-1] if item.get("trace") else item.get("explanation"),
+            "trace": item.get("trace", []),
+            "source": item.get("source", "planner"),
+            "isConflict": bool(item.get("is_conflict") or item.get("isConflict", False)),
+            "is_conflicting": bool(item.get("is_conflict") or item.get("isConflict", False)),
+            "conflict_ids": list(item.get("conflict_ids") or []),
+            "conflictWith": conflict_with,
+            "conflictReason": item.get("conflict_reason") or item.get("conflictReason"),
+            "conflictPriority": item.get("conflict_priority"),
+            "conflictSeverity": item.get("conflict_severity"),
+            "reason_codes": list(item.get("reason_codes") or []),
+            "accepted_with_warning": bool(item.get("accepted_with_warning")),
+            "warning_code": item.get("warning_code"),
+            "warnings": list(item.get("warnings") or []),
+            "scheduled_start": s_start_val,
+            "scheduled_end": s_end_val,
+            "prep_buffer": item.get("prep_buffer", DEFAULT_PREP_BUFFER),
+            "aliases": list(item.get("aliases") or []),
+        }
+
+    def _materialize_schedule(
+        self,
+        schedule_date: str,
+        timeline: List[Dict[str, Any]],
+        unscheduled: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        ordered = sorted(timeline, key=lambda item: item["scheduled_start"])
+        valid_ids = {item["id"] for item in ordered}
+        activities: List[Dict[str, Any]] = []
+        explanations: List[str] = []
+        activities = [self._format_activity(item) for item in ordered]
+
+        expanded: List[Dict[str, Any]] = []
+        for index, activity in enumerate(activities):
+            expanded.append(activity)
+            if index == len(activities) - 1:
+                continue
+
+            current = ordered[index]
+            nxt = ordered[index + 1]
+            if nxt["scheduled_start"] < current["scheduled_end"]:
+                continue
+
+            prep_minutes = max(
+                current.get("prep_buffer", DEFAULT_PREP_BUFFER),
+                nxt.get("prep_buffer", DEFAULT_PREP_BUFFER),
+            )
+            travel_minutes = estimate_travel_minutes(current.get("location"), nxt.get("location"))
+
+            block_cursor = current["scheduled_end"]
+            # UI Fix: Only show buffers if they are substantial (> 5 minutes) to avoid clutter
+            if prep_minutes >= 5:
+                expanded.append({
+                    "id": f"buffer-{current['id']}-{nxt['id']}",
+                    "type": "buffer",
+                    "title": "Prep / Buffer",
+                    "startTime": format_clock(block_cursor),
+                    "endTime": format_clock(block_cursor + prep_minutes),
+                    "duration": self._duration_label(prep_minutes),
+                })
+                block_cursor += prep_minutes
+
+            if travel_minutes >= 5:
+                expanded.append({
+                    "id": f"travel-{current['id']}-{nxt['id']}",
+                    "type": "travel",
+                    "title": f"Travel to {nxt['title']}",
+                    "startTime": format_clock(block_cursor),
+                    "endTime": format_clock(block_cursor + travel_minutes),
+                    "duration": self._duration_label(travel_minutes),
+                    "location": nxt.get("location"),
+                })
+
+        for item in ordered:
+            if item.get("trace"):
+                explanations.extend(item["trace"][-2:])
+            if item.get("is_conflict"):
+                explanations.append(
+                    f"{item['title']} was kept even though it clashes with existing activities."
+                )
+
+        return {
+            "date": schedule_date,
+            "activities": expanded,
+            "explanations": self._merge_explanations(explanations),
+            "unscheduled_activities": [
+                {
+                    "title": item["title"],
+                    "reason": item["trace"][-1] if item.get("trace") else "No feasible slot was available.",
+                    "priority": item.get("priority", "medium"),
+                    "isMandatory": item.get("is_mandatory", True),
+                }
+                for item in unscheduled
+            ],
+        }
+
+    def _merge_explanations(self, *groups: List[str]) -> List[str]:
+        merged: List[str] = []
+        seen = set()
+        for group in groups:
+            for explanation in group:
+                key = (explanation or "").strip()
+                if key and key not in seen:
+                    seen.add(key)
+                    merged.append(key)
+        return merged
+
+    def _safe_json_loads(self, raw_text: str) -> Optional[Dict[str, Any]]:
+        clean_text = raw_text.replace("```json", "").replace("```", "").strip()
+        try:
+            return json.loads(clean_text)
+        except json.JSONDecodeError:
+            start = clean_text.find("{")
+            end = clean_text.rfind("}") + 1
+            if start == -1 or end <= 0:
+                return None
+            try:
+                return json.loads(clean_text[start:end])
+            except:
+                return None
+
+    def _duration_label(self, minutes: int) -> str:
+        if minutes % 60 == 0:
+            hours = minutes // 60
+            return f"{hours} hour" if hours == 1 else f"{hours} hours"
+        hours = minutes // 60
+        mins = minutes % 60
+        if hours:
+            return f"{hours}h {mins}m"
+        return f"{mins} mins"
+
+    def _make_id(self, title: str) -> str:
+        slug = re.sub(r"[^a-z0-9]+", "-", clean_title(title)).strip("-") or "activity"
+        suffix = abs(hash(title)) % 100000
+        return f"{slug}-{suffix}"
+
+    def _local_now(self) -> datetime:
+        try:
+            return datetime.now(ZoneInfo(DEFAULT_LOCAL_TIMEZONE))
+        except Exception:
+            return datetime.now(timezone(timedelta(hours=8)))
+
+    def _local_today_iso(self) -> str:
+        return self._local_now().date().isoformat()
+
+    def _local_datetime_context(self) -> str:
+        local_now = self._local_now()
+        return (
+            f"Current local datetime: {local_now.strftime('%Y-%m-%d %H:%M')} "
+            f"{DEFAULT_LOCAL_TIMEZONE}\n"
+            f"Current local date: {local_now.date().isoformat()}\n"
+        )
+

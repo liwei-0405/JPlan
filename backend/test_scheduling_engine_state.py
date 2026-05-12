@@ -2544,3 +2544,113 @@ def test_travel_service_dedupes_nearby_same_named_candidates():
 
     assert len(merged) == 1
     assert merged[0]["display_name"] == "The Arc @ Cyberjaya"
+
+
+def test_scheduling_engine_package_public_api_exports():
+    from scheduling_engine import (
+        BlockType,
+        SchedulingEngine as ExportedSchedulingEngine,
+        TimingMode as ExportedTimingMode,
+        VersionMismatchError,
+        format_clock,
+        parse_clock,
+        parse_duration_minutes,
+    )
+
+    assert ExportedSchedulingEngine is SchedulingEngine
+    assert VersionMismatchError.__name__ == "VersionMismatchError"
+    assert ExportedTimingMode.FIXED == "fixed"
+    assert BlockType.ACTIVITY == "activity"
+    assert format_clock(parse_clock("12:00 PM")) == "12:00 PM"
+    assert parse_duration_minutes("45 minutes") == 45
+
+
+def test_chat_api_smoke_returns_schedule_blocks(monkeypatch):
+    from fastapi.testclient import TestClient
+    import main as backend_main
+
+    class SmokeEngine:
+        def parse_text_request(self, message, history=None, current_schedule=None, saved_locations=None):
+            return {
+                "intent": "add",
+                "reply": "Draft created.",
+                "transcription": message,
+                "date": "2026-05-02",
+                "operations": [
+                    {
+                        "op": "add",
+                        "title": "Reading",
+                        "timing_mode": "fixed",
+                        "fixed_start": "09:00",
+                        "duration_minutes": 30,
+                    }
+                ],
+                "activities": [],
+                "preferences": {},
+            }
+
+        def build_schedule_response(self, parsed, current_schedule=None, latest_request="", saved_locations=None):
+            envelope = {
+                "date": parsed["date"],
+                "version": 1,
+                "schema_version": 4,
+                "status": "ok",
+                "schedule_status": "ok",
+                "travel_validation_status": "not_requested",
+                "planning_mode": "feasibility_first",
+                "allow_clash": False,
+                "accurate_travel_time": False,
+                "preferences": {},
+                "activities": [
+                    {
+                        "id": "act-reading",
+                        "stable_activity_id": "act-reading",
+                        "type": "activity",
+                        "title": "Reading",
+                        "start": "09:00 AM",
+                        "end": "09:30 AM",
+                        "startTime": "09:00 AM",
+                        "endTime": "09:30 AM",
+                    }
+                ],
+                "schedule_blocks": [
+                    {
+                        "id": "act-reading",
+                        "stable_activity_id": "act-reading",
+                        "type": "activity",
+                        "title": "Reading",
+                        "start": "09:00 AM",
+                        "end": "09:30 AM",
+                        "startTime": "09:00 AM",
+                        "endTime": "09:30 AM",
+                    }
+                ],
+                "explanations": [],
+                "unscheduled_activities": [],
+                "conflicts": [],
+                "warnings": [],
+            }
+            return {"schedule_data": envelope, "transcription": parsed.get("transcription")}
+
+        def compose_result_reply(self, latest_request, parsed, result, allow_clash=False):
+            return {
+                "reply": "Reading was scheduled from 09:00 AM to 09:30 AM.",
+                "reply_status": "success",
+                "recommend_allow_clash": False,
+                "reply_reason": None,
+                "token_usage": {},
+            }
+
+    monkeypatch.setattr(backend_main, "scheduling_engine", SmokeEngine())
+    monkeypatch.setattr(backend_main.database, "get_user_locations", lambda user_id: [])
+    monkeypatch.setattr(backend_main.database, "_parse_schedule_payload", lambda payload, user_id, date: payload)
+
+    response = TestClient(backend_main.app).post(
+        "/chat",
+        json={"message": "Add reading at 9am", "history": [], "user_id": "smoke-user"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["schedule_data"]["schedule_blocks"]
+    assert payload["schedule_data"]["schedule_blocks"][0]["title"] == "Reading"

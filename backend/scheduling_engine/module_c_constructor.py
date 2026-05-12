@@ -1,0 +1,793 @@
+import json
+import re
+import time
+from copy import deepcopy
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
+from uuid import uuid4
+from zoneinfo import ZoneInfo
+
+from jplan_logging import jjson, jlog, jsection
+from travel_service import MissingORSApiKey, TravelService, TravelServiceError, coordinate_from_saved_location
+from .types_utils import *
+from .types_utils import _normalize_location
+
+class ModuleCConstructorMixin:
+    def _materialize_blocks(
+        self, 
+        activities: List[Dict[str, Any]], 
+        day_start: int, 
+        min_travel: Optional[int]
+    ) -> List[Dict[str, Any]]:
+        """[Module B/C] Converts sorted activities into a complete timeline with explicit Transition, Buffer, and Idle blocks."""
+        blocks = []
+        ordered = sorted(activities, key=lambda item: item.get("scheduled_start") or 0)
+        
+        last_end = day_start
+        last_loc = None
+
+        for act in ordered:
+            start_min = act.get("scheduled_start") or 0
+            end_min = act.get("scheduled_end") or (start_min + act.get("duration_minutes", 60))
+            current_loc = act.get("location")
+            if not current_loc: current_loc = None # Normalize
+
+            # A. Gap Handling (between last_end and start_min)
+            if start_min > last_end:
+                gap_dur = start_min - last_end
+                
+                # Calculate required overhead
+                buffer_dur = DEFAULT_PREP_BUFFER if last_loc is not None else 0
+                travel_time = 0
+                if last_loc and current_loc and last_loc != current_loc:
+                    travel_time = estimate_travel_minutes(last_loc, current_loc)
+                
+                required_total = buffer_dur + travel_time
+                
+                if gap_dur >= required_total:
+                    # Just-in-Time Move Policy:
+                    # 1. Idle time at current location
+                    idle_at_current = gap_dur - required_total
+                    if idle_at_current > 0:
+                        blocks.append({
+                            "block_type": "idle",
+                            "title": "Free Time",
+                            "start": format_clock(last_end),
+                            "end": format_clock(last_end + idle_at_current),
+                            "duration_minutes": idle_at_current,
+                            "reason": f"Relax at {last_loc or 'current location'} before departing"
+                        })
+                    
+                    # 2. Buffer block (Prep for departure)
+                    if buffer_dur > 0:
+                        b_start = last_end + idle_at_current
+                        blocks.append({
+                            "block_type": "buffer",
+                            "title": "Prep / Buffer",
+                            "start": format_clock(b_start),
+                            "end": format_clock(b_start + buffer_dur),
+                            "duration_minutes": buffer_dur,
+                            "reason": "Preparation before travel"
+                        })
+                    
+                    # 3. Transition block (Travel)
+                    if travel_time > 0:
+                        t_start = last_end + idle_at_current + buffer_dur
+                        blocks.append({
+                            "block_type": "transition",
+                            "title": f"Travel to {current_loc}",
+                            "start": format_clock(t_start),
+                            "end": format_clock(start_min),
+                            "duration_minutes": travel_time,
+                            "from_location": last_loc,
+                            "to_location": current_loc,
+                            "travel_estimate_source": "heuristic",
+                            "travel_validation_status": "not_requested",
+                            "reason": f"Travel timed to arrive exactly for {act['title']}"
+                        })
+                else:
+                    # Not enough time for full buffer + travel? 
+                    # Force move immediately and mark as potentially tight
+                    blocks.append({
+                        "block_type": "transition",
+                        "title": f"Travel to {current_loc} (Tight)",
+                        "start": format_clock(last_end),
+                        "end": format_clock(start_min),
+                        "duration_minutes": gap_dur,
+                        "from_location": last_loc,
+                        "to_location": current_loc,
+                        "travel_estimate_source": "heuristic",
+                        "travel_validation_status": "not_requested",
+                        "is_tight": True,
+                        "warning_code": WARNING_TIGHT_TRANSITION,
+                        "reason": "Immediate departure required due to tight schedule"
+                    })
+
+            # B. Activity Block
+            blocks.append({
+                "block_type": "activity",
+                "id": act.get("id"),
+                "stable_activity_id": act.get("stable_activity_id") or act.get("id"),
+                "title": act["title"],
+                "start": format_clock(start_min),
+                "end": format_clock(end_min),
+                "startTime": format_clock(start_min),
+                "endTime": format_clock(end_min),
+                "duration_minutes": end_min - start_min,
+                "location": current_loc,
+                "location_label": act.get("location_label") or current_loc,
+                "location_category": act.get("location_category"),
+                "location_status": act.get("location_status"),
+                "location_source": act.get("location_source"),
+                "location_confidence": act.get("location_confidence"),
+                "saved_location_label": act.get("saved_location_label"),
+                "resolved_location": deepcopy(act.get("resolved_location")) if isinstance(act.get("resolved_location"), dict) else None,
+                "notes": act.get("notes"),
+                "is_conflict": act.get("is_conflict", False),
+                "is_conflicting": act.get("is_conflict", False),
+                "conflict_ids": list(act.get("conflict_ids") or []),
+                "reason": "Scheduled activity"
+            })
+            
+            last_end = end_min
+            last_loc = current_loc
+
+        return blocks
+
+    def _find_final_activity_block(
+        self,
+        schedule_blocks: List[Dict[str, Any]],
+        activity: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        activity_id = activity.get("stable_activity_id") or activity.get("id")
+        activity_title = clean_title(activity.get("title") or "")
+        for block in schedule_blocks:
+            if block.get("block_type") != "activity":
+                continue
+            if activity_id and str(block.get("stable_activity_id") or block.get("id")) == str(activity_id):
+                return block
+            if activity_title and clean_title(block.get("title") or "") == activity_title:
+                return block
+        return None
+
+    def _collect_schedule_warnings(
+        self,
+        activities: List[Dict[str, Any]],
+        schedule_blocks: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        warnings: List[Dict[str, Any]] = []
+        for activity in activities:
+            if not activity.get("accepted_with_warning") and not activity.get("warning_code"):
+                continue
+            block = self._find_final_activity_block(schedule_blocks, activity)
+            block_index = schedule_blocks.index(block) if block in schedule_blocks else -1
+            tight_transition = None
+            if block_index >= 0 and block_index + 1 < len(schedule_blocks):
+                next_block = schedule_blocks[block_index + 1]
+                if next_block.get("block_type") == "transition" and next_block.get("is_tight"):
+                    tight_transition = next_block
+
+            base_warning = (activity.get("warnings") or [{}])[0]
+            warning = {
+                "warning_code": activity.get("warning_code") or base_warning.get("warning_code") or WARNING_TIGHT_TRANSITION,
+                "activity_id": activity.get("stable_activity_id") or activity.get("id"),
+                "activity_title": activity.get("title"),
+                "anchor_title": base_warning.get("anchor_title"),
+                "start": (block or {}).get("start") or base_warning.get("start"),
+                "end": (block or {}).get("end") or base_warning.get("end"),
+                "explanation": base_warning.get("explanation") or f"{activity.get('title')} was accepted with a scheduling warning.",
+            }
+            if tight_transition:
+                warning["transition"] = {
+                    "title": tight_transition.get("title"),
+                    "start": tight_transition.get("start"),
+                    "end": tight_transition.get("end"),
+                    "from_location": tight_transition.get("from_location"),
+                    "to_location": tight_transition.get("to_location"),
+                }
+            warnings.append(warning)
+        return warnings
+
+    def _resolve_user_reply(self, parsed: Dict[str, Any], latest_request: str) -> str:
+        llm_reply = str(parsed.get("_llm_reply") or "").strip()
+        parsed_reply = str(parsed.get("reply") or "").strip()
+        reply_source = parsed.get("_reply_source")
+        request_text = clean_title(latest_request)
+
+        if reply_source == "llm" and parsed_reply:
+            return parsed_reply
+
+        if llm_reply and clean_title(llm_reply) != request_text:
+            return llm_reply
+
+        if parsed_reply and clean_title(parsed_reply) != request_text:
+            return parsed_reply
+
+        if parsed.get("intent") == "chat":
+            return "I'm here. Tell me what you want to plan or change."
+
+        return "I updated the draft based on your request."
+
+    def _resolve_schedule_date(
+        self,
+        parsed: Dict[str, Any],
+        current_schedule: Optional[Dict[str, Any]],
+        latest_request: str,
+    ) -> str:
+        selected_date = (current_schedule or {}).get("date")
+        parsed_date = parsed.get("date")
+
+        if selected_date and not self._user_explicitly_mentions_date(latest_request):
+            self._debug(
+                f"Date resolution | using selected/current date {selected_date} because request did not explicitly mention a date"
+            )
+            return selected_date
+
+        resolved = parsed_date or selected_date or self._local_today_iso()
+        self._debug(
+            f"Date resolution | selected_date={selected_date} | parsed_date={parsed_date} | resolved={resolved}"
+        )
+        return resolved
+
+    def _user_explicitly_mentions_date(self, request_text: str) -> bool:
+        text = (request_text or "").strip().lower()
+        if not text:
+            return False
+
+        explicit_patterns = [
+            r"\b(today|tomorrow|yesterday|tonight)\b",
+            r"\bnext\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday|week|month)\b",
+            r"\bthis\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday|weekend|week)\b",
+            r"\bon\s+\d{4}-\d{2}-\d{2}\b",
+            r"\b\d{4}-\d{2}-\d{2}\b",
+            r"\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b",
+            r"\b\d{1,2}(st|nd|rd|th)?\s+(of\s+)?"
+            r"(january|february|march|april|may|june|july|august|september|october|november|december)\b",
+            r"\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2}(st|nd|rd|th)?\b",
+        ]
+        return any(re.search(pattern, text) for pattern in explicit_patterns)
+
+    def _plan_schedule(
+        self,
+        schedule_date: str,
+        activities: List[Dict[str, Any]],
+        preferences: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        day_start = parse_clock(preferences.get("day_start")) or DEFAULT_DAY_START
+        day_end = parse_clock(preferences.get("day_end")) or DEFAULT_DAY_END
+        min_travel = preferences.get("min_travel_buffer_minutes") or 0
+
+        # Pass 1: Categorize
+        fixed: List[Dict[str, Any]] = []
+        preserved: List[Dict[str, Any]] = []
+        relative: List[Dict[str, Any]] = []
+        flexible: List[Dict[str, Any]] = []
+        unscheduled: List[Dict[str, Any]] = []
+
+        jlog("MODULE_C", f"Categorizing {len(activities)} items", "PASS_1")
+        for item in deepcopy(activities):
+            # Support both snake_case and camelCase
+            mode = item.get("timing_mode") or item.get("timingMode") or TimingMode.UNSPECIFIED
+            
+            has_preserved_time = (
+                item.get("preserve_scheduled_time")
+                and item.get("scheduled_start") is not None
+                and item.get("scheduled_end") is not None
+            )
+
+            if mode == TimingMode.FIXED:
+                fs = item.get("fixed_start")
+                if fs is None:
+                    fs = item.get("fixedStart")
+                if fs is not None:
+                    dur = int(item.get("duration_minutes") or item.get("durationMinutes") or 60)
+                    item["scheduled_start"] = fs
+                    item["scheduled_end"] = fs + dur
+                    fixed.append(item)
+                    jlog("MODULE_C", f"'{item['title']}' -> FIXED ({format_clock(fs)})", "CLASSIFY")
+                else:
+                    flexible.append(item)
+                    jlog("MODULE_C", f"'{item['title']}' -> FLEX (missing fixed_start)", "CLASSIFY")
+            elif has_preserved_time:
+                preserved.append(item)
+                jlog(
+                    "MODULE_C",
+                    f"'{item['title']}' -> PRESERVE ({format_clock(item['scheduled_start'])}-{format_clock(item['scheduled_end'])})",
+                    "CLASSIFY",
+                )
+            elif mode == TimingMode.RELATIVE:
+                relative.append(item)
+                jlog("MODULE_C", f"'{item['title']}' -> RELATIVE", "CLASSIFY")
+            else:
+                flexible.append(item)
+                jlog("MODULE_C", f"'{item['title']}' -> FLEX (mode={mode})", "CLASSIFY")
+
+        jsection("MODULE_C", "feasibility-first construction", "CONSTRUCT")
+        
+        timeline: List[Dict[str, Any]] = []
+
+        # 1. Place FIXED items first
+        fixed.sort(key=lambda x: x["scheduled_start"])
+        for item in fixed:
+            feasible, reason = self._validate_locked_item(item, timeline, day_start, day_end, min_travel)
+            if feasible:
+                jlog("MODULE_C", f"'{item['title']}' -> {format_clock(item['scheduled_start'])}", "LOCKING")
+                item["trace"].append("Locked as a fixed commitment.")
+                timeline.append(item)
+                timeline.sort(key=lambda x: x["scheduled_start"])
+            else:
+                jlog("MODULE_C", f"'{item['title']}' reason={reason}", "CLASH")
+                timeline.append(self._create_conflict_item(item, timeline, reason))
+                timeline.sort(key=lambda x: x["scheduled_start"])
+
+        # 2. Preserve existing scheduled flexible/preferred activities before
+        # inserting new relative requests. This prevents a small edit from
+        # re-optimizing the whole day and invalidating anchor order.
+        preserved.sort(key=lambda x: x["scheduled_start"])
+        for item in preserved:
+            feasible, reason = self._validate_locked_item(item, timeline, day_start, day_end, min_travel)
+            if feasible:
+                item.setdefault("trace", []).append("Preserved existing scheduled time during replanning.")
+                jlog(
+                    "MODULE_C",
+                    f"Preserving {item.get('title')} at {format_clock(item.get('scheduled_start'))}-{format_clock(item.get('scheduled_end'))}",
+                    "ANCHOR",
+                )
+                timeline.append(item)
+                timeline.sort(key=lambda x: x["scheduled_start"])
+            else:
+                jlog("MODULE_C", f"'{item['title']}' preserve failed reason={reason}", "CLASH")
+                timeline.append(self._create_conflict_item(item, timeline, reason))
+                timeline.sort(key=lambda x: x["scheduled_start"])
+
+        # 3. Place RELATIVE items. A dependent waits until its anchor has been
+        # placed; if the anchor is still flexible, place the anchor first.
+        pending_relative = sorted(relative, key=lambda x: x.get("sequence_index") or 999)
+
+        while pending_relative:
+            progress = False
+            for item in list(pending_relative):
+                anchor = item.get("anchor_relation")
+                if anchor:
+                    target_title = anchor.get("target_title")
+                    jlog("MODULE_C", f"{item.get('title')} depends on {target_title or anchor.get('target_activity_id')}", "DEPENDENCY")
+
+                anchor_item = self._find_anchor_in_timeline(item.get("anchor_relation"), timeline)
+                if not anchor_item:
+                    placed_anchor = self._place_flexible_anchor_for_relative(
+                        item,
+                        flexible,
+                        timeline,
+                        day_start,
+                        day_end,
+                        min_travel,
+                    )
+                    if placed_anchor:
+                        timeline, flexible = placed_anchor
+                        progress = True
+                    continue
+
+                new_timeline, handled = self._place_relative_item(
+                    item,
+                    anchor_item,
+                    timeline,
+                    day_start,
+                    day_end,
+                    min_travel,
+                )
+                timeline = new_timeline
+                pending_relative.remove(item)
+                progress = True
+
+            if not progress:
+                for item in pending_relative:
+                    flexible.append(item)
+                pending_relative = []
+
+        # 4. Place FLEXIBLE items
+        flexible.sort(key=self._calculate_activity_base_score, reverse=True)
+        for item in flexible:
+            jlog("MODULE_C", f"'{item['title']}' score={self._calculate_activity_base_score(item)}", "PLACE_FLEX")
+            inserted, reason = self._insert_best_position(item, timeline, day_start, day_end, min_travel)
+            if inserted:
+                timeline = inserted
+            else:
+                if item.get("is_mandatory"):
+                    conflict_timeline = self._insert_as_conflict(item, timeline, day_start, reason)
+                    timeline = conflict_timeline or timeline
+                else:
+                    unscheduled.append(item)
+
+        # FINAL PASS: Materialize
+        final_blocks = self._materialize_blocks(timeline, day_start, min_travel)
+
+        return {
+            "activities": timeline,
+            "schedule_blocks": final_blocks,
+            "unscheduled_activities": unscheduled,
+            "day_start": format_clock(day_start),
+            "day_end": format_clock(day_end)
+        }
+
+    def _find_anchor_in_timeline(
+        self,
+        anchor: Optional[Dict[str, Any]],
+        timeline: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        if not anchor:
+            return None
+        target_id = anchor.get("target_activity_id") or anchor.get("target_id")
+        target_title = anchor.get("target_title")
+        return next(
+            (
+                activity for activity in timeline
+                if (
+                    target_id and activity.get("stable_activity_id") == target_id
+                ) or (
+                    target_title and clean_title(activity.get("title")) == clean_title(target_title)
+                )
+            ),
+            None,
+        )
+
+    def _pop_matching_flexible_anchor(
+        self,
+        anchor: Optional[Dict[str, Any]],
+        flexible: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        if not anchor:
+            return None
+        target_id = anchor.get("target_activity_id") or anchor.get("target_id")
+        target_title = anchor.get("target_title")
+        for index, candidate in enumerate(flexible):
+            if (
+                target_id and candidate.get("stable_activity_id") == target_id
+            ) or (
+                target_title and clean_title(candidate.get("title")) == clean_title(target_title)
+            ):
+                return flexible.pop(index)
+        return None
+
+    def _place_flexible_anchor_for_relative(
+        self,
+        dependent: Dict[str, Any],
+        flexible: List[Dict[str, Any]],
+        timeline: List[Dict[str, Any]],
+        day_start: int,
+        day_end: int,
+        min_travel: Optional[int],
+    ) -> Optional[Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]]:
+        anchor = dependent.get("anchor_relation")
+        anchor_item = self._pop_matching_flexible_anchor(anchor, flexible)
+        if not anchor_item:
+            return None
+
+        inserted, reason = self._insert_best_position(anchor_item, timeline, day_start, day_end, min_travel)
+        if not inserted:
+            flexible.append(anchor_item)
+            jlog(
+                "MODULE_C",
+                f"Could not place anchor {anchor_item.get('title')} before {dependent.get('title')}: {reason}",
+                "ANCHOR",
+            )
+            return None
+
+        placed_anchor = self._find_anchor_in_timeline(
+            {"target_activity_id": anchor_item.get("stable_activity_id"), "target_title": anchor_item.get("title")},
+            inserted,
+        )
+        if placed_anchor:
+            jlog(
+                "MODULE_C",
+                f"Placed anchor {placed_anchor.get('title')} at {format_clock(placed_anchor.get('scheduled_start'))}-{format_clock(placed_anchor.get('scheduled_end'))}",
+                "ANCHOR",
+            )
+        return inserted, flexible
+
+    def _place_relative_item(
+        self,
+        item: Dict[str, Any],
+        anchor_item: Dict[str, Any],
+        timeline: List[Dict[str, Any]],
+        day_start: int,
+        day_end: int,
+        min_travel: Optional[int],
+    ) -> Tuple[List[Dict[str, Any]], bool]:
+        anchor = item.get("anchor_relation")
+        if not anchor:
+            return timeline, False
+
+        relation_kind = clean_title(anchor.get("kind") or "after")
+        target_title = anchor.get("target_title") or anchor_item.get("title")
+        if relation_kind == "before":
+            search_end = anchor_item["scheduled_start"]
+            predecessors = [a for a in timeline if a["scheduled_end"] <= search_end and a.get("id") != anchor_item.get("id")]
+            search_start = max([day_start] + [a["scheduled_end"] for a in predecessors])
+            jlog("MODULE_C", f"'{item['title']}' before '{target_title}' search={format_clock(search_start)}->{format_clock(search_end)}", "PLACE_RELATIVE")
+            inserted, reason = self._insert_best_position(
+                item, timeline, search_start, search_end, min_travel,
+                prefer_latest=True
+            )
+        else:
+            search_start = anchor_item["scheduled_end"]
+            search_end = day_end
+
+            successors = [a for a in timeline if a["scheduled_start"] >= search_start]
+            if successors:
+                search_end = min(a["scheduled_start"] for a in successors)
+
+            jlog("MODULE_C", f"'{item['title']}' after '{target_title}' search={format_clock(search_start)}->{format_clock(search_end)}", "PLACE_RELATIVE")
+            inserted, reason = self._insert_best_position(
+                item, timeline, search_start, search_end, min_travel,
+                prefer_earliest=True
+            )
+
+        if inserted:
+            timeline = inserted
+            placed_item = self._find_anchor_in_timeline(
+                {"target_activity_id": item.get("stable_activity_id"), "target_title": item.get("title")},
+                timeline,
+            )
+            if placed_item:
+                jlog(
+                    "MODULE_C",
+                    f"{item.get('title')} after {target_title} -> {format_clock(placed_item.get('scheduled_start'))}-{format_clock(placed_item.get('scheduled_end'))}",
+                    "PLACE_RELATIVE",
+                )
+                placed_item.setdefault("trace", []).append(f"Placed near anchor '{target_title}' to respect sequence.")
+        else:
+            tight_inserted = self._insert_tight_relative_position(
+                item,
+                timeline,
+                search_start,
+                search_end,
+                relation_kind,
+                target_title,
+            )
+            if tight_inserted:
+                jlog("MODULE_C", f"'{item['title']}' fits activity window but transition is tight", "ACCEPTED_TIGHT_TRANSITION")
+                timeline = tight_inserted
+            else:
+                jlog("MODULE_C", f"'{item['title']}' no feasible slot in narrative window", "REJECT_REL")
+                conflict_timeline = self._insert_as_conflict(
+                    item,
+                    timeline,
+                    search_start if relation_kind == "before" else search_start,
+                    reason or "No space in narrative window.",
+                )
+                timeline = conflict_timeline or timeline
+
+        return timeline, True
+
+    def _insert_tight_relative_position(
+        self,
+        item: Dict[str, Any],
+        timeline: List[Dict[str, Any]],
+        search_start: int,
+        search_end: int,
+        relation_kind: str,
+        target_title: Optional[str],
+    ) -> Optional[List[Dict[str, Any]]]:
+        duration = int(item.get("duration_minutes") or 60)
+        if search_end - search_start < duration:
+            return None
+
+        if relation_kind == "before":
+            candidate_start = search_end - duration
+        else:
+            candidate_start = search_start
+        candidate_end = candidate_start + duration
+
+        if candidate_start < search_start or candidate_end > search_end:
+            return None
+
+        candidate = deepcopy(item)
+        candidate["scheduled_start"] = candidate_start
+        candidate["scheduled_end"] = candidate_end
+        if self._find_overlaps(candidate, timeline):
+            return None
+
+        next_item = next(
+            (entry for entry in sorted(timeline, key=lambda value: value.get("scheduled_start") or 0)
+             if (entry.get("scheduled_start") or 0) >= candidate_end),
+            None,
+        )
+        warning = {
+            "warning_code": WARNING_TIGHT_TRANSITION,
+            "activity_id": candidate.get("stable_activity_id") or candidate.get("id"),
+            "activity_title": candidate.get("title"),
+            "anchor_title": target_title,
+            "start": format_clock(candidate_start),
+            "end": format_clock(candidate_end),
+            "explanation": (
+                f"{candidate.get('title')} was added, but the transition"
+                f"{f' to {next_item.get('title')}' if next_item else ''} is tight."
+            ),
+        }
+        candidate["accepted_with_warning"] = True
+        candidate["warning_code"] = WARNING_TIGHT_TRANSITION
+        candidate.setdefault("warnings", [])
+        candidate["warnings"].append(warning)
+        candidate.setdefault("trace", [])
+        candidate["trace"].append(warning["explanation"])
+        return sorted(timeline + [candidate], key=lambda entry: entry["scheduled_start"])
+
+    def _insert_as_conflict(
+        self,
+        item: Dict[str, Any],
+        timeline: List[Dict[str, Any]],
+        day_start: int,
+        reason: Optional[str],
+    ) -> Optional[List[Dict[str, Any]]]:
+        base_start = (
+            item.get("fixed_start")
+            or item.get("earliest_start")
+            or item.get("scheduled_start")
+            or day_start
+        )
+        candidate = deepcopy(item)
+        candidate["scheduled_start"] = base_start
+        candidate["scheduled_end"] = base_start + candidate["duration_minutes"]
+        conflict_item = self._create_conflict_item(
+            candidate,
+            timeline,
+            reason or "Added activity but kept clash because an existing block already occupies that time.",
+        )
+        return sorted(timeline + [conflict_item], key=lambda entry: entry["scheduled_start"])
+
+    def _create_conflict_item(
+        self,
+        item: Dict[str, Any],
+        timeline: List[Dict[str, Any]],
+        reason: str,
+    ) -> Dict[str, Any]:
+        conflict_item = deepcopy(item)
+        overlapping = self._find_overlaps(conflict_item, timeline)
+        conflict_ids = [entry["id"] for entry in overlapping]
+        highest_priority = self._highest_priority(overlapping + [conflict_item])
+
+        conflict_item["is_conflict"] = True
+        conflict_item["conflict_with"] = list(dict.fromkeys(conflict_ids))
+        conflict_item["conflict_reason"] = reason
+        conflict_item["reason_codes"] = [self._reason_code_from_text(reason)]
+        conflict_item["conflict_priority"] = conflict_item.get("priority", "medium")
+        conflict_item["conflict_severity"] = self._conflict_severity(conflict_item, overlapping)
+        conflict_item.setdefault("trace", [])
+        if reason not in conflict_item["trace"]:
+            conflict_item["trace"].append(reason)
+        manual_resolution_trace = (
+            f"Both blocks were retained for manual resolution; highest priority in the clash is {highest_priority}."
+        )
+        if manual_resolution_trace not in conflict_item["trace"]:
+            conflict_item["trace"].append(manual_resolution_trace)
+
+        for existing in overlapping:
+            existing["is_conflict"] = True
+            existing.setdefault("conflict_with", [])
+            if conflict_item["id"] not in existing["conflict_with"]:
+                existing["conflict_with"].append(conflict_item["id"])
+            existing["conflict_with"] = [
+                clash_id for clash_id in dict.fromkeys(existing["conflict_with"])
+                if clash_id != existing.get("id")
+            ]
+            existing["conflict_reason"] = existing.get("conflict_reason") or "This activity overlaps with another retained block."
+            existing["reason_codes"] = list(dict.fromkeys((existing.get("reason_codes") or []) + ["fixed_overlap"]))
+            existing["conflict_priority"] = existing.get("priority", "medium")
+            existing["conflict_severity"] = self._conflict_severity(existing, [conflict_item])
+            existing.setdefault("trace", [])
+            conflict_trace = f"Clash preserved with {conflict_item['title']} for manual resolution."
+            if conflict_trace not in existing["trace"]:
+                existing["trace"].append(conflict_trace)
+
+        self._debug(
+            f"Conflict created | title={conflict_item.get('title')} | overlaps={conflict_item.get('conflict_with')} | priority={highest_priority} | severity={conflict_item.get('conflict_severity')}"
+        )
+
+        return conflict_item
+
+    def _calculate_activity_base_score(self, activity: Dict[str, Any]) -> int:
+        """Heuristic score calculation for placement priority."""
+        prio_map = {"high": 50, "medium": 20, "low": 5}
+        score = prio_map.get(activity.get("priority", "medium").lower(), 20)
+        
+        if activity.get("is_mandatory") or activity.get("isMandatory"):
+            score += 100
+            
+        if activity.get("latest_end") is not None:
+            score += max(0, (DEFAULT_DAY_END - activity["latest_end"]) // 30)
+            
+        return score
+
+    def _insert_best_position(
+        self,
+        item: Dict[str, Any],
+        timeline: List[Dict[str, Any]],
+        day_start: int,
+        day_end: int,
+        min_travel: Optional[int],
+        prefer_earliest: bool = False,
+        prefer_latest: bool = False,
+    ) -> Tuple[Optional[List[Dict[str, Any]]], str]:
+        """Finds the optimal time slot for an activity within a range, applying narrative-aware scoring."""
+        best_timeline = None
+        best_score = -999999
+        failure_reason = "No feasible slot was available."
+        
+        duration = int(item.get("duration_minutes") or 60)
+
+        for index in range(len(timeline) + 1):
+            previous_item = timeline[index - 1] if index > 0 else None
+            next_item = timeline[index] if index < len(timeline) else None
+
+            gap_start = day_start if previous_item is None else previous_item["scheduled_end"]
+            gap_end = day_end if next_item is None else next_item["scheduled_start"]
+
+            before_transition = self._transition_minutes(previous_item, item, min_travel)
+            after_transition = self._transition_minutes(item, next_item, min_travel)
+
+            candidate_start = max(
+                gap_start + before_transition,
+                item.get("earliest_start") or day_start,
+                day_start
+            )
+            preferred_start = item.get("preferred_start")
+            if (
+                preferred_start is not None
+                and candidate_start < preferred_start
+                and preferred_start + duration + after_transition <= gap_end
+                and preferred_start + duration <= (item.get("latest_end") or day_end)
+            ):
+                candidate_start = preferred_start
+            candidate_end = candidate_start + duration
+
+            # Feasibility Checks
+            if candidate_end + after_transition > gap_end:
+                continue 
+            
+            if candidate_end > (item.get("latest_end") or day_end):
+                continue 
+
+            # Scoring
+            base_score = self._calculate_activity_base_score(item)
+            delay_penalty = 0
+            if prefer_earliest:
+                delay_minutes = max(0, candidate_start - day_start)
+                delay_penalty = delay_minutes * 2.0 # Strong penalty for delay
+            
+            total_score = base_score - delay_penalty
+            if prefer_latest:
+                total_score += candidate_start
+            if preferred_start is not None:
+                total_score -= abs(candidate_start - preferred_start) * 1.5
+            
+            if total_score > best_score:
+                best_score = total_score
+                candidate = deepcopy(item)
+                candidate["scheduled_start"] = candidate_start
+                candidate["scheduled_end"] = candidate_end
+                
+                if prefer_earliest and delay_minutes > 0:
+                    candidate["trace"].append(f"Placed with {delay_minutes}m delay from earliest possible start.")
+                
+                best_timeline = sorted(timeline + [candidate], key=lambda x: x["scheduled_start"])
+
+        if best_timeline:
+            return best_timeline, ""
+        return None, failure_reason
+
+    def _transition_minutes(
+        self,
+        left: Optional[Dict[str, Any]],
+        right: Optional[Dict[str, Any]],
+        min_travel: Optional[int],
+    ) -> int:
+        if left is None or right is None:
+            return 0
+        travel = estimate_travel_minutes(left.get("location"), right.get("location"))
+        travel = max(travel, min_travel or 0)
+        prep = max(
+            left.get("prep_buffer", DEFAULT_PREP_BUFFER),
+            right.get("prep_buffer", DEFAULT_PREP_BUFFER),
+        )
+        return travel + prep
+
