@@ -1,6 +1,7 @@
 import json
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -11,6 +12,8 @@ from jplan_logging import jjson, jlog, jsection
 from travel_service import MissingORSApiKey, TravelService, TravelServiceError, coordinate_from_saved_location
 from .types_utils import *
 from .types_utils import _normalize_location
+
+MODULE8_LLM_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="jplan-module8")
 
 class Module8ReplyMixin:
     def _compact_result_summary(
@@ -27,9 +30,15 @@ class Module8ReplyMixin:
         requested_titles = self._requested_titles_from_parsed(parsed or {})
         primary_operation = self._primary_reply_operation(parsed or {})
         shift_operation = self._shift_reply_operation(parsed or {})
+        priority_operation = self._priority_reply_operation(parsed or {}, result)
         schedule_blocks = list(envelope.get("schedule_blocks") or [])
         changed = result.get("updatedActivities") or envelope.get("applied_changes") or []
         referenced_blocks = self._referenced_activity_blocks(schedule_blocks, requested_titles, changed)
+        removed_changes = list(result.get("removedActivities") or [])
+        removed_changes.extend([
+            item for item in changed
+            if isinstance(item, dict) and clean_title(item.get("status") or "") == "removed"
+        ])
         result_applied = bool(result.get("applied", result.get("status") not in {"conflict", "no_operation", "clarification_needed"}))
         if not referenced_blocks and result_applied and envelope.get("activities"):
             referenced_blocks = self._referenced_activity_blocks(schedule_blocks, [], envelope.get("activities", [])[:8])
@@ -64,6 +73,8 @@ class Module8ReplyMixin:
             "envelope_status": envelope.get("status"),
             "schedule_status": envelope.get("schedule_status"),
             "travel_validation_status": envelope.get("travel_validation_status"),
+            "reply_hint": result.get("reply") or envelope.get("reply"),
+            "reply_reason": result.get("reply_reason") or envelope.get("reply_reason"),
             "location_resolution_requests": envelope.get("location_resolution_requests") or [],
             "route_conflicts": envelope.get("route_conflicts") or [],
             "applied": result_applied,
@@ -71,6 +82,7 @@ class Module8ReplyMixin:
             "date": envelope.get("date"),
             "shift_operation": shift_operation,
             "primary_operation": primary_operation,
+            "priority_operation": priority_operation,
             "conflict": conflict or (conflicts[0] if conflicts else None),
             "conflicts": conflicts[:3],
             "ignored_operations": result.get("ignored_operations") or envelope.get("ignored_operations") or [],
@@ -79,6 +91,7 @@ class Module8ReplyMixin:
             "postcondition_results": postcondition_results[:3],
             "requested_titles": requested_titles,
             "referenced_blocks": referenced_blocks[:8],
+            "removed_changes": removed_changes,
             "allowed_times": sorted(allowed_times),
             "allowed_dates": self._allowed_reply_dates(envelope, shift_operation),
             "changed": [
@@ -99,8 +112,6 @@ class Module8ReplyMixin:
             if not isinstance(operation, dict):
                 continue
             op_type = clean_title(operation.get("op") or "")
-            if op_type == "remove":
-                continue
             anchor = operation.get("anchor_relation") or {}
             return {
                 "op": op_type or "update",
@@ -121,6 +132,47 @@ class Module8ReplyMixin:
                     "from_date": operation.get("from_date"),
                     "to_date": operation.get("to_date") or parsed.get("date"),
                 }
+        return None
+
+    def _priority_reply_operation(self, parsed: Dict[str, Any], result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        priority_noop = result.get("priority_noop")
+        if isinstance(priority_noop, dict) and priority_noop.get("title") and priority_noop.get("priority"):
+            return {
+                "title": priority_noop.get("title"),
+                "priority": str(priority_noop.get("priority") or "").lower(),
+                "direction": priority_noop.get("direction"),
+                "priority_update_only": True,
+                "already_set": True,
+            }
+        for operation in parsed.get("operations") or []:
+            if not isinstance(operation, dict) or operation.get("priority") is None:
+                continue
+            op_type = clean_title(operation.get("op") or "update")
+            if op_type not in {"update", "move", "replace", "update_priority"}:
+                continue
+            title = operation.get("resolved_target_title") or operation.get("title") or operation.get("target_title")
+            priority = str(operation.get("priority") or "").lower()
+            changed_items = [
+                changed for changed in result.get("updatedActivities") or result.get("applied_changes") or []
+                if isinstance(changed, dict)
+            ]
+            if len(changed_items) == 1:
+                changed = changed_items[0]
+                title = changed.get("title") or title
+                priority = str(changed.get("priority") or priority).lower()
+            for changed in changed_items:
+                if not isinstance(changed, dict):
+                    continue
+                if clean_title(changed.get("title") or "") == clean_title(title or ""):
+                    title = changed.get("title") or title
+                    priority = str(changed.get("priority") or priority).lower()
+                    break
+            return {
+                "title": title,
+                "priority": priority,
+                "direction": operation.get("priority_direction"),
+                "priority_update_only": bool(operation.get("priority_update_only")),
+            }
         return None
 
     def _requested_titles_from_parsed(self, parsed: Dict[str, Any]) -> List[str]:
@@ -250,8 +302,27 @@ class Module8ReplyMixin:
             to_text = self._format_date_for_reply(shift.get("to_date"))
             return f"I've moved the whole plan from {from_text} to {to_text}."
 
+        priority = summary.get("priority_operation") or {}
+        if priority.get("title") and priority.get("priority"):
+            title = priority.get("title")
+            priority_value = priority.get("priority")
+            direction = clean_title(priority.get("direction") or "")
+            jlog("MODULE_8", f"target={title} priority={priority_value}", "PRIORITY_REPLY")
+            if direction == "lowered":
+                return f"I've lowered {title} priority."
+            if direction == "raised":
+                return f"I've raised {title} priority."
+            return f"I've updated {title} priority to {priority_value}."
+
         blocks = summary.get("referenced_blocks") or []
         changed = summary.get("changed") or []
+        operation = summary.get("primary_operation") or {}
+        op_type = clean_title(operation.get("op") or "")
+        if op_type == "remove":
+            removed = (summary.get("removed_changes") or [{}])[0]
+            title = removed.get("title") or operation.get("title") or "that activity"
+            jlog("MODULE_8", f"removed={title}", "REMOVE_REPLY")
+            return f"I've removed {title} from your schedule."
         if not blocks and not changed:
             return None
 
@@ -262,8 +333,6 @@ class Module8ReplyMixin:
                 return f"I generated your schedule{date_text}, including {', '.join(titles)}."
 
         block = blocks[0] if blocks else changed[0]
-        operation = summary.get("primary_operation") or {}
-        op_type = clean_title(operation.get("op") or "")
         verb = {
             "add": "added",
             "move": "moved",
@@ -343,11 +412,29 @@ class Module8ReplyMixin:
             and not summary.get("referenced_blocks")
             and not summary.get("changed")
         ):
+            if summary.get("reply_reason") == "priority_already_set":
+                priority = summary.get("priority_operation") or {}
+                title = priority.get("title") or "That activity"
+                priority_value = priority.get("priority") or "that"
+                jlog("MODULE_8", f"target={title} priority={priority_value}", "PRIORITY_REPLY")
+                return {
+                    "reply": summary.get("reply_hint") or f"{title} is already set to {priority_value} priority.",
+                    "reply_status": "success",
+                    "recommend_allow_clash": False,
+                    "reply_reason": "priority_already_set",
+                }
+            if summary.get("reply_reason") == "already_satisfied" and summary.get("reply_hint"):
+                return {
+                    "reply": summary.get("reply_hint"),
+                    "reply_status": "success",
+                    "recommend_allow_clash": False,
+                    "reply_reason": "already_satisfied",
+                }
             return {
-                "reply": "I could not understand or apply the requested change. Please try again with the activity name and time.",
+                "reply": summary.get("reply_hint") or "I could not understand or apply the requested change. Please try again with the activity name and time.",
                 "reply_status": "clarification_needed",
                 "recommend_allow_clash": False,
-                "reply_reason": "no_operation",
+                "reply_reason": summary.get("reply_reason") or "no_operation",
             }
 
         if status == "location_pending":
@@ -585,6 +672,34 @@ class Module8ReplyMixin:
         jlog("MODULE_8", f"Final reply={json.dumps(reply, ensure_ascii=True)}", "REPLY")
         jlog("MODULE_8", f"Reply source={source}", "REPLY")
 
+    def _module_8_fallback(
+        self,
+        fallback: Dict[str, Any],
+        summary: Dict[str, Any],
+        reason: str,
+        token_usage: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        final = {
+            **fallback,
+            "token_usage": token_usage,
+            "reply_source": "fallback-template",
+            "llm_fallback_reason": reason,
+        }
+        if reason == "module_8_timeout":
+            jlog("MODULE_8", "fallback=fallback-template", "TIMEOUT")
+            jlog("MODULE_8", "reason=timeout", "FALLBACK")
+        else:
+            jlog("MODULE_8", f"reason={reason}", "FALLBACK")
+        self._log_module_8_final(final, summary, "fallback-template")
+        return final
+
+    def _call_module_8_llm(self, prompt: str) -> Any:
+        return self.client.models.generate_content(
+            model=MODULE8_LLM_MODEL,
+            contents=prompt,
+            config={"temperature": 0.2, "max_output_tokens": 150},
+        )
+
     def compose_result_reply(
         self,
         latest_request: str,
@@ -607,7 +722,17 @@ class Module8ReplyMixin:
 
         jsection("MODULE_8", "result-aware reply", "REPLY")
 
+        if clean_title((summary.get("primary_operation") or {}).get("op") or "") == "remove":
+            fallback = {**fallback, "reply_source": "template"}
+            self._log_module_8_final(fallback, summary, "template")
+            return fallback
+
         if fallback.get("reply_status") == "location_pending":
+            fallback = {**fallback, "reply_source": "template"}
+            self._log_module_8_final(fallback, summary, "template")
+            return fallback
+
+        if fallback.get("reply_reason") == "priority_already_set":
             fallback = {**fallback, "reply_source": "template"}
             self._log_module_8_final(fallback, summary, "template")
             return fallback
@@ -618,36 +743,38 @@ class Module8ReplyMixin:
             return fallback
 
         prompt = f"""
-You are JPlan's final response writer. Use ONLY this scheduling result.
-Write naturally, like a helpful planning assistant, not a formal system notice.
-Keep it short: 1-3 sentences.
-If applied=false, clearly say the requested change was not applied as intended, but do not use all-caps.
-If RESULT_SUMMARY includes timing details, mention the concrete reason, such as the available window and required duration.
-If status is ok/success/warning and applied=true, say the schedule was applied.
-If status=warning, say the activity was added/updated and mention the warning naturally.
-If allow_clash=false and status=conflict, gently mention Allow Clash only as an option to force the overlap.
+You are JPlan's final response writer.
+Use ONLY RESULT_SUMMARY. Return 1-2 short sentences.
+Do not invent times, dates, locations, blockers, or actions.
 Do not claim success unless applied=true.
-Do not invent reasons, times, blockers, or suggestions outside RESULT_SUMMARY.
-Use exact times from RESULT_SUMMARY.referenced_blocks only. Do not change, round, or guess times.
-Use exact dates from RESULT_SUMMARY.allowed_dates only. For shift_plan_date, use RESULT_SUMMARY.shift_operation.to_date.
-For a single requested activity, include that activity's exact start and end time.
-For a generated schedule, mention every title in RESULT_SUMMARY.requested_titles that appears in referenced_blocks.
-Do not mention unslotted or failed tasks unless RESULT_SUMMARY says there is a conflict or unmet item.
+If applied=false, say the requested change was not applied and explain the reason from RESULT_SUMMARY.
+If status=conflict and allow_clash=false, mention Allow Clash as an option.
+If priority_operation exists, mention the priority change, not the activity time range.
+If status=warning, mention the warning briefly.
+If status=location_pending, ask user to confirm the listed locations.
+For a single changed activity, include its exact start and end time from referenced_blocks.
+For generated schedules, mention all requested_titles that appear in referenced_blocks.
 
 USER_REQUEST:
 {latest_request}
 
 PARSED_OPERATIONS:
-{json.dumps(parsed.get("operations") or parsed.get("activities") or [], ensure_ascii=True)[:1200]}
+{json.dumps(parsed.get("operations") or parsed.get("activities") or [], ensure_ascii=True)[:600]}
 
 RESULT_SUMMARY:
-{json.dumps(summary, ensure_ascii=True)[:1800]}
+{json.dumps(summary, ensure_ascii=True)[:1200]}
 """
         try:
-            response = self.client.models.generate_content(
-                model="gemini-3.1-flash-lite-preview",
-                contents=prompt,
-            )
+            llm_start = time.perf_counter()
+            timeout_seconds = min(MODULE8_LLM_TIMEOUT_SECONDS, MODULE8_LLM_TOTAL_TIMEOUT_SECONDS)
+            jlog("MODULE_8", f"start timeout={int(timeout_seconds * 1000)}ms", "LLM")
+            future = MODULE8_LLM_EXECUTOR.submit(self._call_module_8_llm, prompt)
+            try:
+                response = future.result(timeout=timeout_seconds)
+            except TimeoutError:
+                future.cancel()
+                return self._module_8_fallback(fallback, summary, "module_8_timeout")
+            jlog("TIMER", f"module_8_llm_seconds={time.perf_counter() - llm_start:.2f}", None)
             usage = getattr(response, "usage_metadata", None)
             token_usage = None
             if usage:
@@ -663,45 +790,29 @@ RESULT_SUMMARY:
                 )
             reply = (response.text or "").strip()
             if not reply:
-                final = {**fallback, "token_usage": token_usage, "reply_source": "fallback-template"}
-                self._log_module_8_final(final, summary, "fallback-template")
-                return final
+                return self._module_8_fallback(fallback, summary, "empty_module_8_reply", token_usage)
 
             if fallback["reply_status"] == "conflict":
                 if not self._reply_claims_failure(reply):
-                    final = {**fallback, "token_usage": token_usage, "reply_source": "fallback-template"}
-                    self._log_module_8_final(final, summary, "fallback-template")
-                    return final
+                    return self._module_8_fallback(fallback, summary, "truth_guard_conflict", token_usage)
             elif fallback["reply_status"] in {"success", "warning"} and self._reply_claims_failure(reply):
-                final = {**fallback, "token_usage": token_usage, "reply_source": "fallback-template"}
-                self._log_module_8_final(final, summary, "fallback-template")
-                return final
+                return self._module_8_fallback(fallback, summary, "truth_guard_false_failure", token_usage)
             elif fallback["reply_status"] == "partial" and summary.get("conflicts"):
                 clean_reply = clean_title(reply)
                 if "clash" not in clean_reply and "conflict" not in clean_reply and "overlap" not in clean_reply:
-                    final = {**fallback, "token_usage": token_usage, "reply_source": "fallback-template"}
-                    self._log_module_8_final(final, summary, "fallback-template")
-                    return final
+                    return self._module_8_fallback(fallback, summary, "truth_guard_missing_conflict", token_usage)
 
             if not self._reply_uses_only_allowed_times(reply, summary):
-                final = {**fallback, "token_usage": token_usage, "reply_source": "fallback-template"}
-                self._log_module_8_final(final, summary, "fallback-template")
-                return final
+                return self._module_8_fallback(fallback, summary, "truth_guard_time", token_usage)
 
             if not self._reply_uses_only_allowed_dates(reply, summary):
-                final = {**fallback, "token_usage": token_usage, "reply_source": "fallback-template"}
-                self._log_module_8_final(final, summary, "fallback-template")
-                return final
+                return self._module_8_fallback(fallback, summary, "truth_guard_date", token_usage)
 
             if not self._reply_mentions_required_range(reply, summary):
-                final = {**fallback, "token_usage": token_usage, "reply_source": "fallback-template"}
-                self._log_module_8_final(final, summary, "fallback-template")
-                return final
+                return self._module_8_fallback(fallback, summary, "truth_guard_required_range", token_usage)
 
             if not self._reply_mentions_requested_titles(reply, summary):
-                final = {**fallback, "token_usage": token_usage, "reply_source": "fallback-template"}
-                self._log_module_8_final(final, summary, "fallback-template")
-                return final
+                return self._module_8_fallback(fallback, summary, "truth_guard_requested_titles", token_usage)
 
             final = {
                 **fallback,
@@ -713,7 +824,5 @@ RESULT_SUMMARY:
             return final
         except Exception as exc:
             jlog("MODULE_8", f"Result-aware reply failed: {exc}", "ERROR")
-            final = {**fallback, "reply_source": "fallback-template"}
-            self._log_module_8_final(final, summary, "fallback-template")
-            return final
+            return self._module_8_fallback(fallback, summary, "module_8_unavailable")
 

@@ -102,6 +102,83 @@ class StateOperationsMixin:
             return True
         return False
 
+    def _resolution_confidence(self, score: int) -> str:
+        if score >= 120:
+            return "high"
+        if score >= 90:
+            return "medium"
+        return "low"
+
+    def _operation_original_target(self, operation: Dict[str, Any]) -> str:
+        return str(
+            operation.get("original_user_target")
+            or operation.get("target_title")
+            or operation.get("title")
+            or operation.get("target_id")
+            or ""
+        ).strip()
+
+    def _operation_targets_requested_activity(
+        self,
+        operation: Dict[str, Any],
+        resolution: Dict[str, Any],
+        message: str,
+    ) -> bool:
+        target = resolution.get("activity") or {}
+        original = self._operation_original_target(operation)
+        resolved_title = target.get("title") or resolution.get("resolved_target_title") or ""
+        confidence = resolution.get("target_resolution_confidence") or "low"
+        allowed = False
+        if self._message_explicitly_targets_activity(message, resolved_title):
+            allowed = True
+        elif confidence == "high" and self._message_explicitly_targets_activity(message, original):
+            allowed = True
+        elif confidence == "high" and clean_title(original) in {"it", "this", "that"} and resolved_title:
+            allowed = True
+        elif confidence == "high" and operation.get("pronoun_resolved_target_title") == resolved_title:
+            allowed = True
+
+        jlog(
+            "TARGET_RESOLUTION",
+            f"original={original or '?'} resolved={resolved_title or '?'} confidence={confidence} allowed={str(allowed).lower()}",
+            None,
+        )
+        return allowed
+
+    def _relative_order_already_satisfied(
+        self,
+        operation: Dict[str, Any],
+        active_pool: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        if operation.get("op") not in {"update", "move"} or not operation.get("anchor_relation"):
+            return None
+        target_resolution = self._resolve_activity_reference(
+            operation.get("target_id") or operation.get("target_title") or operation.get("title"),
+            active_pool,
+        )
+        anchor = self._resolve_anchor_relation(operation.get("anchor_relation"), active_pool)
+        if target_resolution.get("status") != "resolved" or not anchor:
+            return None
+        target = target_resolution["activity"]
+        anchor_activity = self._find_activity_by_stable_id(active_pool, anchor.get("target_activity_id"))
+        if not anchor_activity:
+            return None
+        target_start = target.get("scheduled_start")
+        target_end = target.get("scheduled_end")
+        anchor_start = anchor_activity.get("scheduled_start")
+        anchor_end = anchor_activity.get("scheduled_end")
+        if None in {target_start, target_end, anchor_start, anchor_end}:
+            return None
+        kind = clean_title(anchor.get("kind") or "after")
+        satisfied = target_start >= anchor_end if kind == "after" else target_end <= anchor_start
+        if not satisfied:
+            return None
+        return {
+            "target": target.get("title"),
+            "anchor": anchor_activity.get("title"),
+            "kind": kind,
+        }
+
     def _infer_anchor_from_user_message(
         self,
         operation: Dict[str, Any],
@@ -150,16 +227,26 @@ class StateOperationsMixin:
             target_reference = operation.get("target_id") or operation.get("target_title")
             resolution = self._resolve_activity_reference(target_reference, active_pool) if target_reference else {"status": "missing"}
             target = resolution.get("activity") if resolution.get("status") == "resolved" else None
+            if target:
+                original_target = self._operation_original_target(operation)
+                operation["original_user_target"] = original_target
+                operation["resolved_target_title"] = target.get("title")
+                operation["target_resolution_confidence"] = resolution.get("target_resolution_confidence")
             has_anchor = bool(operation.get("anchor_relation"))
             explicit_fixed = operation.get("fixed_start") is not None or operation.get("fixed_end") is not None
             message = operation.get("_user_message") or ""
+            explicitly_requested_target = (
+                self._operation_targets_requested_activity(operation, resolution, message)
+                if target and message
+                else False
+            )
 
             if (
                 target
                 and operation.get("op") in {"update", "move", "replace", "update_priority"}
                 and explicit_fixed
                 and message
-                and not self._message_explicitly_targets_activity(message, target.get("title", ""))
+                and not explicitly_requested_target
             ):
                 ignored_item = {
                     "operation": operation,
@@ -173,6 +260,20 @@ class StateOperationsMixin:
                     "OP_FILTER",
                 )
                 continue
+            elif target and explicit_fixed and message and explicitly_requested_target:
+                if (
+                    operation.get("target_resolution_confidence") == "high"
+                    and clean_title(operation.get("title") or "") != clean_title(target.get("title") or "")
+                ):
+                    operation["_preserve_resolved_title"] = True
+                jlog(
+                    "STATE",
+                    (
+                        "allowed resolved requested target "
+                        f"original={operation.get('original_user_target')} resolved={target.get('title')}"
+                    ),
+                    "OP_FILTER",
+                )
 
             if (
                 target
@@ -180,7 +281,7 @@ class StateOperationsMixin:
                 and not explicit_fixed
                 and target.get("timing_mode") == TimingMode.FIXED
                 and message
-                and not self._message_explicitly_targets_activity(message, target.get("title", ""))
+                and not explicitly_requested_target
             ):
                 ignored_item = {
                     "operation": operation,
@@ -194,6 +295,20 @@ class StateOperationsMixin:
                     "OP_FILTER",
                 )
                 continue
+            elif target and has_anchor and not explicit_fixed and message and explicitly_requested_target:
+                if (
+                    operation.get("target_resolution_confidence") == "high"
+                    and clean_title(operation.get("title") or "") != clean_title(target.get("title") or "")
+                ):
+                    operation["_preserve_resolved_title"] = True
+                jlog(
+                    "STATE",
+                    (
+                        "allowed resolved requested target "
+                        f"original={operation.get('original_user_target')} resolved={target.get('title')}"
+                    ),
+                    "OP_FILTER",
+                )
 
             prepared.append(operation)
 
@@ -409,8 +524,16 @@ class StateOperationsMixin:
                 "candidates": titles,
             }
 
+        confidence = self._resolution_confidence(best_score)
         self._debug(f"[STATE] Resolved target '{reference}' -> activity_id={best_activity.get('stable_activity_id')}")
-        return {"status": "resolved", "activity": best_activity}
+        return {
+            "status": "resolved",
+            "activity": best_activity,
+            "original_user_target": str(reference),
+            "resolved_target_title": best_activity.get("title"),
+            "target_resolution_confidence": confidence,
+            "score": best_score,
+        }
 
     def _resolve_anchor_relation(
         self,
@@ -449,8 +572,19 @@ class StateOperationsMixin:
         updated["source"] = "user_operation"
         updated.setdefault("trace", [])
 
+        priority_update_only = bool(operation.get("priority_update_only")) and operation.get("priority") is not None
         for field in ("title", "priority", "location", "notes", "sequence_index"):
+            if field == "title" and (operation.get("_preserve_resolved_title") or priority_update_only):
+                continue
             if operation.get(field) is not None:
+                if field == "priority":
+                    old_priority = updated.get("priority") or "medium"
+                    new_priority = str(operation.get(field) or old_priority).lower()
+                    jlog(
+                        "STATE",
+                        f"target={updated.get('title')} old_priority={old_priority} new_priority={new_priority}",
+                        "PRIORITY_UPDATE",
+                    )
                 updated[field] = operation.get(field)
 
         if operation.get("duration_minutes") is not None:
@@ -470,6 +604,7 @@ class StateOperationsMixin:
         explicit_latest = self._coerce_minutes(operation.get("latest_end"))
         explicit_preferred = self._coerce_minutes(operation.get("preferred_start"))
         explicit_anchor = operation.get("anchor_relation")
+        preferred_adjustment = clean_title(operation.get("preferred_adjustment") or operation.get("move_direction") or "")
 
         if explicit_anchor:
             resolved_anchor = self._resolve_anchor_relation(explicit_anchor, anchor_pool)
@@ -486,6 +621,8 @@ class StateOperationsMixin:
                     updated["location"] = anchor_activity.get("location")
                     updated["location_normalized"] = anchor_activity.get("location_normalized")
         elif explicit_fixed_start is not None or explicit_fixed_end is not None:
+            if explicit_fixed_start is not None:
+                updated["requested_fixed_start"] = explicit_fixed_start
             updated["timing_mode"] = TimingMode.FIXED
             updated["anchor_relation"] = None
             if explicit_fixed_start is not None:
@@ -507,6 +644,23 @@ class StateOperationsMixin:
             updated["preferred_start"] = explicit_preferred
             if updated.get("timing_mode") == TimingMode.UNSPECIFIED:
                 updated["timing_mode"] = TimingMode.PREFERRED
+        elif preferred_adjustment in {"earlier", "later"}:
+            current_start = updated.get("scheduled_start") or updated.get("preferred_start") or updated.get("fixed_start")
+            if current_start is not None:
+                delta = -30 if preferred_adjustment == "earlier" else 30
+                updated["preferred_start"] = max(DEFAULT_DAY_START, min(DEFAULT_DAY_END - int(updated.get("duration_minutes") or DEFAULT_DURATION), current_start + delta))
+                updated["timing_mode"] = TimingMode.PREFERRED
+                updated["fixed_start"] = None
+                updated["fixed_end"] = None
+                updated["scheduled_start"] = None
+                updated["scheduled_end"] = None
+                updated["preserve_scheduled_time"] = False
+                updated["preferred_adjustment"] = preferred_adjustment
+                updated["move_direction"] = preferred_adjustment
+
+        if priority_update_only:
+            updated["priority_update_only"] = True
+            updated["priority_direction"] = operation.get("priority_direction")
 
         if updated.get("location"):
             updated["location_normalized"] = _normalize_location(updated.get("location"))
@@ -534,20 +688,34 @@ class StateOperationsMixin:
         allow_clash: bool = False,
     ) -> Dict[str, Any]:
         blocker = blockers[0] if blockers else None
+        blocker_names = [str(item.get("title")) for item in blockers if item and item.get("title")]
         reason = activity.get("conflict_reason") or "Requested change conflicts with the current locked plan."
+        if blocker_names:
+            reason = f"{activity.get('title')} overlaps with {', '.join(blocker_names)}."
         suggestions: List[str] = []
 
         if blocker:
             self._debug(
                 f"[CONFLICT] Requested {activity.get('title')} overlaps with fixed {blocker.get('title')}"
             )
-            next_start = blocker.get("scheduled_end")
-            transition = self._transition_minutes(blocker, activity, 0)
-            if next_start is not None:
+            next_start = max(
+                item.get("scheduled_end") or 0
+                for item in blockers
+                if item and item.get("scheduled_end") is not None
+            )
+            transition = max(self._transition_minutes(item, activity, 0) for item in blockers if item) if blockers else 0
+            if next_start:
                 suggestions.append(f"Move {activity.get('title')} to {format_clock(next_start + transition)}")
             existing_fixed = self._coerce_minutes(activity.get("fixed_start"))
             if existing_fixed is not None:
                 suggestions.append(f"Keep {activity.get('title')} at {format_clock(existing_fixed)}")
+            flexible_blockers = [
+                item.get("title")
+                for item in blockers
+                if item and item.get("timing_mode") != TimingMode.FIXED
+            ]
+            if flexible_blockers:
+                suggestions.append(f"Move {', '.join(flexible_blockers)} later or slightly earlier if feasible")
             suggestions.append(f"Change {blocker.get('title')} if that commitment can move")
 
         conflict_payload = {
@@ -590,6 +758,91 @@ class StateOperationsMixin:
             "warnings": [],
         }
 
+    def _attempt_flexible_edit_repair(
+        self,
+        active_set: List[Dict[str, Any]],
+        mutated_ids: set[str],
+        planned_result: Dict[str, Any],
+        preferences: Dict[str, Any],
+        schedule_date: str,
+    ) -> Optional[Dict[str, Any]]:
+        if len(mutated_ids) != 1:
+            return None
+        mutated_id = next(iter(mutated_ids))
+        planned_by_id = {
+            item.get("stable_activity_id"): item
+            for item in planned_result.get("activities", [])
+            if item.get("stable_activity_id")
+        }
+        requested = planned_by_id.get(mutated_id)
+        requested_source = next(
+            (item for item in active_set if item.get("stable_activity_id") == mutated_id),
+            requested,
+        )
+        requested_time = (
+            requested_source.get("requested_fixed_start")
+            or requested_source.get("fixed_start")
+            or requested_source.get("preferred_start")
+            or requested.get("fixed_start")
+            or requested.get("preferred_start")
+            or requested.get("scheduled_start")
+            if requested and requested_source else None
+        )
+        if not requested or requested_time is None:
+            return None
+        blockers = [
+            planned_by_id.get(blocker_id)
+            for blocker_id in requested.get("conflict_with") or []
+            if planned_by_id.get(blocker_id)
+        ]
+        movable_blockers = [
+            item for item in blockers
+            if item.get("timing_mode") != TimingMode.FIXED and item.get("stable_activity_id") not in mutated_ids
+        ]
+        if not movable_blockers:
+            return None
+
+        jlog(
+            "REPAIR",
+            (
+                f"requested={requested.get('title')} at {format_clock(requested_time)} "
+                f"blocker={movable_blockers[0].get('title')} attempt=move_flexible"
+            ),
+            None,
+        )
+        repaired_active = []
+        for item in deepcopy(active_set):
+            if item.get("stable_activity_id") in mutated_ids:
+                if item.get("timing_mode") != TimingMode.FIXED:
+                    if item.get("requested_fixed_start") is not None:
+                        requested_start = item.get("requested_fixed_start")
+                        item["timing_mode"] = TimingMode.FIXED
+                        item["fixed_start"] = requested_start
+                        item["fixed_end"] = requested_start + int(item.get("duration_minutes") or DEFAULT_DURATION)
+                        item["earliest_start"] = item["fixed_start"]
+                        item["latest_end"] = item["fixed_end"]
+                    item.pop("preserve_scheduled_time", None)
+                    item.pop("scheduled_start", None)
+                    item.pop("scheduled_end", None)
+                repaired_active.append(item)
+                continue
+            if item.get("timing_mode") != TimingMode.FIXED:
+                item.pop("preserve_scheduled_time", None)
+                item.pop("scheduled_start", None)
+                item.pop("scheduled_end", None)
+            repaired_active.append(item)
+
+        repaired = self._plan_schedule(schedule_date, repaired_active, preferences)
+        repaired_conflicts = self._build_conflicts(repaired.get("activities", []), set())
+        blocking = [
+            conflict for conflict in repaired_conflicts
+            if any(str(activity_id) in mutated_ids for activity_id in conflict.get("activity_ids") or [])
+        ]
+        if blocking:
+            return None
+        repaired["repair_applied"] = True
+        return repaired
+
     def apply_operations(
         self, 
         envelope: Dict[str, Any], 
@@ -617,8 +870,11 @@ class StateOperationsMixin:
         source_turn = current_version + 1
 
         updated_activities: List[Dict[str, Any]] = []
+        removed_activities: List[Dict[str, Any]] = []
         deleted_activity_ids: List[str] = []
         mutated_ids: set[str] = set()
+        soft_adjustments: List[Dict[str, Any]] = []
+        priority_noops: List[Dict[str, Any]] = []
         source_plan_date = working_envelope.get("date")
         existing_conflict_identities = self._existing_conflict_identities(working_envelope)
         postconditions: List[Dict[str, Any]] = []
@@ -639,6 +895,28 @@ class StateOperationsMixin:
                 "rejected_changes": [],
                 "reply_reason": "All parser operations were ignored because they targeted unrequested fixed events.",
             }
+        if len(operations_to_apply) == 1:
+            satisfied = self._relative_order_already_satisfied(
+                operations_to_apply[0],
+                [item for item in canonical_activities if item.get("status") == "active"],
+            )
+            if satisfied:
+                return {
+                    "status": "no_operation",
+                    "applied": False,
+                    "envelope": working_envelope,
+                    "version": current_version,
+                    "activities": working_envelope.get("activities", []),
+                    "updatedActivities": [],
+                    "deletedItemIds": [],
+                    "ignored_operations": ignored_operations,
+                    "rejected_changes": [],
+                    "reply_reason": "already_satisfied",
+                    "reply": (
+                        f"{satisfied['target']} is already scheduled {satisfied['kind']} "
+                        f"{satisfied['anchor']}."
+                    ),
+                }
         explicit_shift_requested = any(
             operation.get("op") == "shift_plan_date"
             for operation in operations_to_apply
@@ -718,6 +996,23 @@ class StateOperationsMixin:
                 if activity.get("stable_activity_id") == target_id
             )
 
+            if operation.get("priority_update_only") and operation.get("priority") is not None:
+                old_priority = clean_title(target.get("priority") or "medium")
+                new_priority = clean_title(operation.get("priority") or old_priority)
+                if old_priority == new_priority:
+                    priority_noops.append({
+                        "activity_id": target_id,
+                        "title": target.get("title"),
+                        "priority": new_priority,
+                        "direction": operation.get("priority_direction"),
+                    })
+                    jlog(
+                        "STATE",
+                        f"target={target.get('title')} old_priority={old_priority} new_priority={new_priority} already_set=true",
+                        "PRIORITY_UPDATE",
+                    )
+                    continue
+
             if op_type == "remove":
                 removed = deepcopy(canonical_activities[target_index])
                 canonical_activities[target_index]["status"] = "removed"
@@ -726,8 +1021,17 @@ class StateOperationsMixin:
                 deleted_activity_ids.append(target_id)
                 mutated_ids.add(target_id)
                 updated_activities.append(canonical_activities[target_index])
+                removed_activities.append(self._format_activity(canonical_activities[target_index]))
                 self._debug(f"[STATE] Marked activity '{removed.get('title')}' as removed")
                 continue
+
+            if clean_title(operation.get("preferred_adjustment") or operation.get("move_direction") or "") in {"earlier", "later"}:
+                soft_adjustments.append({
+                    "activity_id": target_id,
+                    "title": target.get("title"),
+                    "direction": clean_title(operation.get("preferred_adjustment") or operation.get("move_direction")),
+                    "original_start": target.get("scheduled_start"),
+                })
 
             if op_type == "replace":
                 canonical_activities[target_index]["status"] = "superseded"
@@ -753,11 +1057,34 @@ class StateOperationsMixin:
                 postconditions.append(postcondition)
             self._debug(f"[STATE] Updating existing {mutated.get('title')} activity instead of creating new one")
 
+        if priority_noops and not mutated_ids and not deleted_activity_ids and not updated_activities:
+            noop = priority_noops[0]
+            reply = f"{noop.get('title') or 'That activity'} is already set to {noop.get('priority') or 'that'} priority."
+            return {
+                "status": "no_operation",
+                "applied": False,
+                "envelope": working_envelope,
+                "version": current_version,
+                "activities": working_envelope.get("activities", []),
+                "updatedActivities": [],
+                "deletedItemIds": [],
+                "ignored_operations": ignored_operations,
+                "rejected_changes": [],
+                "reply_reason": "priority_already_set",
+                "reply": reply,
+                "priority_noop": noop,
+            }
+
         active_set = [
             deepcopy(item)
             for item in canonical_activities
             if item.get("status") == "active"
         ]
+        priority_only_mutated_ids = {
+            str(item.get("stable_activity_id"))
+            for item in canonical_activities
+            if item.get("stable_activity_id") in mutated_ids and item.get("priority_update_only")
+        }
 
         for item in active_set:
             item["locked_fixed"] = (
@@ -766,7 +1093,7 @@ class StateOperationsMixin:
                 and item.get("stable_activity_id") not in mutated_ids
             )
             if (
-                item.get("stable_activity_id") not in mutated_ids
+                (item.get("stable_activity_id") not in mutated_ids or str(item.get("stable_activity_id")) in priority_only_mutated_ids)
                 and item.get("scheduled_start") is not None
                 and item.get("scheduled_end") is not None
                 and not item["locked_fixed"]
@@ -792,6 +1119,21 @@ class StateOperationsMixin:
         for conflict in conflicts:
             identity = self._conflict_identity(conflict)
             conflict["conflict_lifecycle"] = "existing" if identity in existing_conflict_identities else "new"
+
+        if conflicts and not allow_clash:
+            repaired_result = self._attempt_flexible_edit_repair(
+                active_set,
+                mutated_ids,
+                planned_result,
+                preferences,
+                schedule_date,
+            )
+            if repaired_result:
+                planned_result = repaired_result
+                conflicts = self._build_conflicts(planned_result["activities"], set())
+                for conflict in conflicts:
+                    identity = self._conflict_identity(conflict)
+                    conflict["conflict_lifecycle"] = "existing" if identity in existing_conflict_identities else "new"
 
         planned_by_id = {
             item.get("stable_activity_id"): item
@@ -827,6 +1169,29 @@ class StateOperationsMixin:
                     response = self._build_conflict_response(working_envelope, current_version, planned_activity, blockers, allow_clash=allow_clash)
                     response["ignored_operations"] = ignored_operations
                     return response
+
+        unchanged_soft_adjustments = [
+            adjustment for adjustment in soft_adjustments
+            if planned_by_id.get(adjustment.get("activity_id"))
+            and planned_by_id[adjustment["activity_id"]].get("scheduled_start") == adjustment.get("original_start")
+        ]
+        if soft_adjustments and len(unchanged_soft_adjustments) == len(soft_adjustments):
+            direction = soft_adjustments[0].get("direction") or "earlier"
+            title = soft_adjustments[0].get("title") or "that activity"
+            response = {
+                "status": "no_operation",
+                "applied": False,
+                "envelope": working_envelope,
+                "version": current_version,
+                "activities": working_envelope.get("activities", []),
+                "updatedActivities": [],
+                "deletedItemIds": [],
+                "ignored_operations": ignored_operations,
+                "rejected_changes": [],
+                "reply_reason": "soft_adjustment_no_change",
+                "reply": f"I couldn't move {title} {direction} without changing the current constraints.",
+            }
+            return response
 
         warnings = self._collect_schedule_warnings(planned_result["activities"], planned_result["schedule_blocks"])
         final_updated_activities = [
@@ -900,6 +1265,7 @@ class StateOperationsMixin:
             "version": updated_envelope["version"],
             "activities": updated_envelope["activities"],
             "updatedActivities": final_updated_activities,
+            "removedActivities": removed_activities,
             "deletedItemIds": deleted_activity_ids,
             "applied_changes": final_updated_activities,
             "accepted_with_warnings": updated_envelope["accepted_with_warnings"],
@@ -969,6 +1335,9 @@ class StateOperationsMixin:
             "earliest_start": earliest_start,
             "latest_end": latest_end,
             "preferred_start": preferred_start,
+            "requested_fixed_start": item.get("requested_fixed_start"),
+            "preferred_adjustment": item.get("preferred_adjustment"),
+            "move_direction": item.get("move_direction"),
             "anchor_relation": deepcopy(item.get("anchor_relation")),
             "sequence_index": item.get("sequence_index"),
             "status": item.get("status", "active"),

@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import time
 from copy import deepcopy
@@ -28,8 +29,8 @@ DEFAULT_DAY_END = 22 * 60   # 10:00 PM
 DEFAULT_DURATION = 60
 DEFAULT_PREP_BUFFER = 5
 DEFAULT_LOCAL_TIMEZONE = "Asia/Kuala_Lumpur"
-MAX_HISTORY_TURNS = 4
-MAX_HISTORY_MESSAGE_CHARS = 160
+MAX_HISTORY_TURNS = 2
+MAX_HISTORY_MESSAGE_CHARS = 120
 
 PRIORITY_WEIGHT = {
     "low": 1,
@@ -41,6 +42,28 @@ PLANNING_MODE_FEASIBILITY = "feasibility_first"
 PLANNING_MODE_CLASH = "clash_allowed"
 WARNING_TIGHT_TRANSITION = "TIGHT_TRANSITION"
 PARSER_RETRY_DELAYS_SECONDS = (0.4, 0.8)
+DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-lite"
+JPLAN_GEMINI_MODEL = (
+    os.getenv("JPLAN_GEMINI_MODEL")
+    or os.getenv("JPLAN_LLM_MODEL")
+    or DEFAULT_GEMINI_MODEL
+).strip() or DEFAULT_GEMINI_MODEL
+MODULE_A_LLM_MODEL = os.getenv("MODULE_A_LLM_MODEL", JPLAN_GEMINI_MODEL).strip() or JPLAN_GEMINI_MODEL
+MODULE8_LLM_MODEL = os.getenv("MODULE8_LLM_MODEL", JPLAN_GEMINI_MODEL).strip() or JPLAN_GEMINI_MODEL
+ADVISORY_LLM_MODEL = os.getenv("ADVISORY_LLM_MODEL", JPLAN_GEMINI_MODEL).strip() or JPLAN_GEMINI_MODEL
+MODULE_A_MAX_OUTPUT_TOKENS = int(os.getenv("MODULE_A_MAX_OUTPUT_TOKENS", "1200"))
+MODULE_A_LLM_TIMEOUT_SECONDS = float(os.getenv("MODULE_A_LLM_TIMEOUT_SECONDS", "20"))
+MODULE_A_LLM_TOTAL_TIMEOUT_SECONDS = float(os.getenv("MODULE_A_LLM_TOTAL_TIMEOUT_SECONDS", "25"))
+MODULE_A_LLM_ENABLE_RETRY = os.getenv("MODULE_A_LLM_ENABLE_RETRY", "true").strip().lower() not in {"0", "false", "no", "off"}
+MODULE_A_LLM_RETRY_COUNT = max(0, int(os.getenv("MODULE_A_LLM_RETRY_COUNT", "1")))
+MODULE_A_LLM_EXECUTOR_WORKERS = max(1, int(os.getenv("MODULE_A_LLM_EXECUTOR_WORKERS", "2")))
+MODULE_A_LLM_FALLBACK_MODEL = os.getenv("MODULE_A_LLM_FALLBACK_MODEL", "").strip()
+MODULE_A_LLM_FALLBACK_TIMEOUT_SECONDS = float(os.getenv("MODULE_A_LLM_FALLBACK_TIMEOUT_SECONDS", "8"))
+MODULE_A_PARSER_BUSY_REPLY = "The AI parser is busy right now. Please try again in a moment, or split the request into smaller parts."
+MODULE8_LLM_TIMEOUT_SECONDS = float(os.getenv("MODULE8_LLM_TIMEOUT_SECONDS", "8"))
+MODULE8_LLM_TOTAL_TIMEOUT_SECONDS = float(os.getenv("MODULE8_LLM_TOTAL_TIMEOUT_SECONDS", "12"))
+ADVISORY_LLM_TIMEOUT_SECONDS = float(os.getenv("ADVISORY_LLM_TIMEOUT_SECONDS", "8"))
+ADVISORY_LLM_EXECUTOR_WORKERS = max(1, int(os.getenv("ADVISORY_LLM_EXECUTOR_WORKERS", "2")))
 
 MONTH_NAME_TO_NUMBER = {
     "jan": 1,
@@ -149,77 +172,40 @@ GENERIC_SYSTEM_ACTIVITY_TYPES = {
 }
 
 PARSER_PROMPT = """
-You are the parsing layer for JPlan. Convert user requests into structured operations.
-Return ONLY ONE JSON object with: intent, reply, transcription, date, operations, conflict_analysis.
+You are Module A, the JSON parser for JPlan. Convert the latest user request into structured scheduling operations.
+Return ONLY valid JSON.
 
-OPERATIONS SCHEMA:
-{ 
-  "op": "add|remove|move|update|replace|shift_plan_date", 
-  "title": "str", 
-  "timing_mode": "fixed|relative|flexible",
-  "fixed_start": "HH:MM (only if user said exact time)",
-  "anchor_relation": {
-    "kind": "after",
-    "target_title": "str"
-  },
-  "sequence_index": int,
-  "duration_minutes": int, 
-  "priority": "low|medium|high",
-  "location": "str",
-  "notes": "str"
-}
-
-EXAMPLE RESPONSE:
+Schema:
 {
-  "intent": "edit",
-  "reply": "I've scheduled your meeting at MMU, followed by lunch at home, then your gym session.",
-  "operations": [
-    {
-      "op": "add",
-      "title": "Project Meeting",
-      "timing_mode": "fixed",
-      "fixed_start": "10:00",
-      "duration_minutes": 120,
-      "location": "school",
-      "sequence_index": 1
-    },
-    {
-      "op": "add",
-      "title": "Lunch",
-      "timing_mode": "relative",
-      "anchor_relation": { "kind": "after", "target_title": "Project Meeting" },
-      "location": "home",
-      "sequence_index": 2
-    },
-    {
-      "op": "add",
-      "title": "Gym Session",
-      "timing_mode": "fixed",
-      "fixed_start": "16:00",
-      "location": "gym",
-      "sequence_index": 3
-    }
-  ]
+  "intent": "add|edit|move|remove|chat",
+  "transcription": "...",
+  "date": "YYYY-MM-DD or null",
+  "operations": [{
+    "op": "add|update|remove|replace|shift_plan_date",
+    "title": "Activity title",
+    "timing_mode": "fixed|relative|flexible|preferred",
+    "fixed_start": "HH:MM",
+    "duration_minutes": 60,
+    "priority": "low|medium|high",
+    "location": "label or null",
+    "anchor_relation": {"kind":"after|before","target_title":"..."},
+    "sequence_index": 1
+  }],
+  "preferences": {},
+  "conflict_analysis": "short non-decisive note"
 }
 
-TIMING RULES:
-1. FIXED: Only if user says "at 4pm" or "from 10am to 12pm".
-2. RELATIVE: If user says "then", "after that", or "followed by". Set kind="after" and target_title.
-3. PREFERRED: If user says "around 12pm" or "hopefully by 5".
-4. LOCATION: Cross-reference with SAVED_LOCATIONS. Return the 'label'.
-
-STRICT RULES:
-1. Max 3 words for titles.
-2. LOCATION: Always specify a location if possible. Use 'home' for lunch/dinner, 'school' or 'office' for meetings, etc. Set to null only if location is irrelevant.
-3. Use 24H format for all times.
-4. DURATIONS: Use reasonable defaults if not mentioned (e.g. Lunch = 60).
-5. If intent is "chat", leave operations empty.
-6. If the user wants to move the whole plan to another date, use op="shift_plan_date" with from_date, to_date, and scope="all_active_activities".
-7. Do NOT create operations for generic travel, transit, prep, buffer, free-time, or idle blocks. If the user says to account for travel time, keep only the real activities and their locations; the scheduler will add travel blocks automatically.
-8. Keep real travel activities only when they are concrete user commitments, such as "Flight to KL", "Train Ride", "Road Trip", or "Airport Transfer".
-9. You are ONLY the parser. Never reject a requested schedule change because of conflict. Always output the requested operation; the backend scheduler decides feasibility and Allow Clash behavior.
-10. For edit/add/move requests, operations must not be empty. If the user asks "move lunch to 12pm", output update Lunch fixed_start="12:00" even if it may overlap another event.
-11. Do not add extra operations that mutate fixed anchor/blocker events unless the user explicitly asks to move that event by name.
+Critical rules:
+1. You are only the parser. Never reject a requested change because of conflict.
+2. Backend decides feasibility, Allow Clash, travel time, and final reply.
+3. If user asks to move/add/update/remove, operations must not be empty.
+4. If user says "move lunch to 12pm", output update Lunch fixed_start="12:00" even if it overlaps.
+5. Do not add operations that move unrelated fixed events unless user explicitly asks.
+6. Do not create operations for generic travel, transit, prep, buffer, free time, or idle blocks.
+7. Use fixed only for exact times. Use relative for after/before/followed by/then.
+8. Use 24-hour time. Use reasonable durations if missing: lunch/dinner 60, coffee 15, gym 60, shopping 45.
+9. Use current activity titles when possible. Keep conflict_analysis short and non-decisive.
+10. Output only core scheduling fields. Do not output location_label, location_status, location_confidence, location_warning, or other normalized location metadata.
 """
 
 

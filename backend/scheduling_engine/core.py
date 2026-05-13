@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 from jplan_logging import jjson, jlog, jsection
 from travel_service import MissingORSApiKey, TravelService, TravelServiceError, coordinate_from_saved_location
 from .location_normalizer import LocationNormalizerMixin
+from .module_0_router import Module0RouterMixin
 from .module_8_reply import Module8ReplyMixin
 from .module_a_parser import ModuleAParserMixin
 from .module_b_validation import ModuleBValidationMixin
@@ -22,6 +23,7 @@ from .types_utils import _normalize_location
 
 
 class SchedulingEngine(
+    Module0RouterMixin,
     ModuleAParserMixin,
     LocationNormalizerMixin,
     ModuleBValidationMixin,

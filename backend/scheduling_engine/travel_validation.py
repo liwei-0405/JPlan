@@ -18,6 +18,7 @@ class TravelValidationMixin:
         envelope: Dict[str, Any],
         saved_locations: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
+        validation_started = time.perf_counter()
         updated = deepcopy(envelope)
         preferences = updated.setdefault("preferences", {})
         accurate = self._resolve_accurate_travel_time(preferences, updated)
@@ -29,6 +30,7 @@ class TravelValidationMixin:
             updated["travel_validation_status"] = "not_requested"
             updated["location_resolution_requests"] = []
             self._mark_transition_estimate_source(updated, "heuristic")
+            jlog("TIMER", f"accurate_travel_validation_seconds={time.perf_counter() - validation_started:.2f}", None)
             return updated
 
         location_requests = self._location_resolution_requests(updated, saved_locations)
@@ -47,6 +49,7 @@ class TravelValidationMixin:
                 updated.get("explanations", []),
                 ["Accurate travel time is pending until the requested locations are confirmed."],
             )
+            jlog("TIMER", f"accurate_travel_validation_seconds={time.perf_counter() - validation_started:.2f}", None)
             return updated
 
         if updated.get("schedule_status") == "location_pending":
@@ -107,6 +110,7 @@ class TravelValidationMixin:
         self._debug(
             f"[TRAVEL][COMPLETE] Updated transition blocks: {updated.get('updated_transition_count', 0)}"
         )
+        jlog("TIMER", f"accurate_travel_validation_seconds={time.perf_counter() - validation_started:.2f}", None)
         return updated
 
     def _without_pending_travel_explanations(self, explanations: List[str]) -> List[str]:

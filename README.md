@@ -91,6 +91,23 @@ cp .env.example .env
 # Edit .env and fill in the backend, Google AI, Supabase, and optional ORS sections
 ```
 
+### 4.0 AI Model Config
+
+JPlan uses one shared Gemini model setting for Module A parsing, advisory replies, and Module 8 final replies. Add this to `backend/.env` if you want to change the model without editing code:
+
+```env
+GOOGLE_API_KEY=your_google_ai_api_key_here
+JPLAN_GEMINI_MODEL=gemini-3.1-flash-lite
+```
+
+Optional per-module overrides are also supported when testing:
+
+```env
+MODULE_A_LLM_MODEL=gemini-3.1-flash-lite
+MODULE8_LLM_MODEL=gemini-3.1-flash-lite
+ADVISORY_LLM_MODEL=gemini-3.1-flash-lite
+```
+
 ### 4.1 Accurate Travel Time Setup (Optional)
 
 JPlan works without OpenRouteService by using the built-in heuristic travel estimates. When **Accurate Travel Time** is enabled, the backend first builds a fast draft schedule, then validates travel using confirmed coordinates and OpenRouteService routing.

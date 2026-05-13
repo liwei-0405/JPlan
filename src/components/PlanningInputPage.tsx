@@ -155,6 +155,8 @@ export function PlanningInputPage({
   // Chat state
   const [chatInput, setChatInput] = useState("");
   const [isProcessing, setIsProcessing] = useState(false);
+  const [progressSteps, setProgressSteps] = useState<string[]>([]);
+  const [activeProgressIndex, setActiveProgressIndex] = useState(0);
   const [conversationHistory, setConversationHistory] = useState<Array<{ role: "user" | "assistant", message: string, status?: "success" | "partial" | "warning" | "location_pending" | "conflict" | "error" | "clarification_needed" | "not_applied" }>>([
     {
       role: "assistant",
@@ -235,6 +237,35 @@ export function PlanningInputPage({
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [conversationHistory]);
+
+  const progressLabelsForMessage = (message: string) => {
+    const text = message.toLowerCase();
+    const isAdvice = /\b(should i|do you think|what do you suggest|is it better|is it okay|can i fit|why|too packed)\b/.test(text)
+      && !/\b(can you|please|move|add|remove|delete|change|update|shift)\b/.test(text);
+    if (isAdvice) {
+      return ["Reviewing your current schedule...", "Waiting for advice response..."];
+    }
+    const activityMentions = (text.match(/\b(meeting|seminar|lunch|dinner|gym|shopping|grocery|fyp|class|workout|coffee)\b/g) || []).length;
+    const isComplex = activityMentions >= 2 || /\b(generate|plan my day|busy workday|followed by|fit in|account for travel)\b/.test(text);
+    if (isComplex) {
+      return [
+        "Sending request to JPlan...",
+        "Waiting for the AI parser...",
+        "Preparing the draft if parsing succeeds...",
+        "Waiting for the final response...",
+      ];
+    }
+    return ["Sending request to JPlan...", "Checking the schedule...", "Waiting for response..."];
+  };
+
+  useEffect(() => {
+    if (!isProcessing || progressSteps.length <= 1) return;
+    setActiveProgressIndex(0);
+    const interval = window.setInterval(() => {
+      setActiveProgressIndex(prev => Math.min(prev + 1, progressSteps.length - 1));
+    }, 1500);
+    return () => window.clearInterval(interval);
+  }, [isProcessing, progressSteps]);
 
   const handleAddManualActivity = () => {
     if (!activityName.trim() || !activityTime.trim()) return;
@@ -379,6 +410,8 @@ export function PlanningInputPage({
     const currentHistory = [...conversationHistory, { role: "user" as const, message: userMessage }];
     setConversationHistory(currentHistory);
     setChatInput("");
+    setProgressSteps(progressLabelsForMessage(userMessage));
+    setActiveProgressIndex(0);
     setIsProcessing(true);
 
     try {
@@ -425,6 +458,8 @@ export function PlanningInputPage({
       }]);
     } finally {
       setIsProcessing(false);
+      setProgressSteps([]);
+      setActiveProgressIndex(0);
     }
   };
 
@@ -570,6 +605,8 @@ export function PlanningInputPage({
   const handleCompleteTravelValidation = async () => {
     if (!previewSchedule || !user?.id) return;
     setIsProcessing(true);
+    setProgressSteps(["Checking travel and buffer time...", "Preparing explanation..."]);
+    setActiveProgressIndex(0);
     try {
       const validated = await completeTravelValidation({
         ...previewSchedule,
@@ -599,6 +636,8 @@ export function PlanningInputPage({
       }]);
     } finally {
       setIsProcessing(false);
+      setProgressSteps([]);
+      setActiveProgressIndex(0);
     }
   };
 
@@ -903,7 +942,25 @@ export function PlanningInputPage({
                     )}
                     {isProcessing && (
                       <div className="flex justify-start">
-                        <div className="bg-secondary p-3 rounded-2xl animate-pulse text-xs italic">AI is thinking...</div>
+                        <div className="bg-secondary p-3 rounded-2xl text-xs">
+                          <div className="flex items-center gap-2 font-medium">
+                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                            <span>{progressSteps[activeProgressIndex] || "Understanding your request..."}</span>
+                          </div>
+                          {progressSteps.length > 1 && (
+                            <div className="mt-2 flex gap-1">
+                              {progressSteps.map((step, index) => (
+                                <span
+                                  key={`${step}-${index}`}
+                                  className={`h-1.5 flex-1 rounded-full ${index <= activeProgressIndex ? "bg-primary" : "bg-muted-foreground/20"}`}
+                                />
+                              ))}
+                            </div>
+                          )}
+                          <p className="mt-2 text-[11px] text-muted-foreground">
+                            This is an estimated wait indicator; JPlan will show the real result when the backend responds.
+                          </p>
+                        </div>
                       </div>
                     )}
                     <div ref={chatEndRef} />

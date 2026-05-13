@@ -30,6 +30,7 @@ export type ChatResponse = {
     reply_status?: 'success' | 'partial' | 'warning' | 'location_pending' | 'conflict' | 'error' | 'clarification_needed' | 'not_applied';
     recommend_allow_clash?: boolean;
     reply_reason?: string | null;
+    llm_fallback_reason?: string | null;
     patch?: PatchResponse;
     full_schedule?: DailySchedule;
     transcription?: string;

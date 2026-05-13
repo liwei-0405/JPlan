@@ -1,5 +1,6 @@
 import os
 import json
+import time
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -172,6 +173,7 @@ class ChatResponse(BaseModel):
     reply_status: Optional[str] = None
     recommend_allow_clash: bool = False
     reply_reason: Optional[str] = None
+    llm_fallback_reason: Optional[str] = None
 
 class PlanRequest(BaseModel):
     date: str
@@ -258,6 +260,14 @@ def log_total_token_usage(parsed: Dict[str, Any], reply_meta: Optional[Dict[str,
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat_with_llm(request: ChatRequest):
+    chat_started = time.perf_counter()
+
+    def elapsed_seconds(started: float) -> str:
+        return f"{time.perf_counter() - started:.2f}"
+
+    def log_total_timer() -> None:
+        jlog("TIMER", f"total_chat_request_seconds={elapsed_seconds(chat_started)}")
+
     debug_log(f"Received chat | user={request.user_id} | message={request.message!r}")
     jlog(
         "API",
@@ -295,15 +305,58 @@ async def chat_with_llm(request: ChatRequest):
                 "accurate_travel_time": bool(request.accurate_travel_time),
             }
 
-        # Fetch saved locations for the user to provide context to LLM
+        router_started = time.perf_counter()
+        route = scheduling_engine.route_chat_request(request.message, current_envelope)
+        jlog("TIMER", f"router_seconds={elapsed_seconds(router_started)}")
+
+        if route.get("route") == "general_chat":
+            reply_meta = scheduling_engine.compose_general_chat_reply(request.message)
+            log_total_timer()
+            return ChatResponse(
+                reply=reply_meta["reply"],
+                transcription=request.message,
+                reply_status=reply_meta.get("reply_status"),
+            )
+
+        if route.get("route") == "planning_advice":
+            advice_started = time.perf_counter()
+            reply_meta = scheduling_engine.compose_advisory_reply(
+                latest_request=request.message,
+                current_schedule=current_envelope,
+                allow_clash=bool(request.allow_clash),
+                accurate_travel_time=bool(request.accurate_travel_time),
+            )
+            jlog("TIMER", f"advisory_llm_seconds={elapsed_seconds(advice_started)}")
+            log_total_timer()
+            return ChatResponse(
+                reply=reply_meta["reply"],
+                schedule_data=request.current_schedule,
+                transcription=request.message,
+                reply_status="advice",
+            )
+
+        # Fetch saved locations for the user to provide context to parsing/location normalization.
         saved_locations = database.get_user_locations(request.user_id)
 
-        parsed = scheduling_engine.parse_text_request(
-            message=request.message,
-            history=request.history,
-            current_schedule=lightweight_schedule,
-            saved_locations=saved_locations
-        )
+        module_a_started = time.perf_counter()
+        parsed = None
+        if route.get("use_deterministic_parser") and not route.get("use_module_a_llm"):
+            parsed = scheduling_engine.parse_deterministic_fast_path(
+                latest_request=request.message,
+                current_schedule=lightweight_schedule,
+                history=request.history,
+                saved_locations=saved_locations,
+            )
+            if parsed is None:
+                jlog("ROUTER", "fast_path_failed falling_back_to_module_a_llm", "FALLBACK")
+        if parsed is None:
+            parsed = scheduling_engine.parse_text_request(
+                message=request.message,
+                history=request.history,
+                current_schedule=lightweight_schedule,
+                saved_locations=saved_locations
+            )
+        jlog("TIMER", f"module_a_total_seconds={elapsed_seconds(module_a_started)}")
         parsed.setdefault("preferences", {})
         parsed["preferences"]["allow_clash"] = bool(request.allow_clash)
         parsed["preferences"]["accurate_travel_time"] = bool(request.accurate_travel_time)
@@ -312,6 +365,7 @@ async def chat_with_llm(request: ChatRequest):
         reply = parsed.get("reply", "I've processed your request.")
         if intent == "no_operation":
             log_total_token_usage(parsed)
+            log_total_timer()
             return ChatResponse(
                 reply=reply,
                 transcription=parsed.get("transcription"),
@@ -321,8 +375,23 @@ async def chat_with_llm(request: ChatRequest):
             )
         
         if intent == "chat" and not parsed.get("operations") and not parsed.get("activities"):
+            failure_type = parsed.get("_failure_type")
+            parser_failure_types = {
+                "module_a_timeout",
+                "module_a_unavailable",
+                "module_a_executor_saturated",
+                "llm_call_error",
+                "llm_parse_error",
+            }
+            reply_status = "error" if failure_type in parser_failure_types else "chat"
             log_total_token_usage(parsed)
-            return ChatResponse(reply=reply, transcription=parsed.get("transcription"))
+            log_total_timer()
+            return ChatResponse(
+                reply=reply,
+                transcription=parsed.get("transcription"),
+                reply_status=reply_status,
+                reply_reason=failure_type if reply_status == "error" else None,
+            )
 
         if request.current_schedule and (parsed.get("operations") or parsed.get("activities")):
             try:
@@ -343,6 +412,7 @@ async def chat_with_llm(request: ChatRequest):
                 if request.user_id and shift_target_date and shift_target_date != request.current_schedule.date:
                     target_date_envelope = database.get_plan_by_date(shift_target_date, request.user_id)
                 
+                apply_started = time.perf_counter()
                 patch_result = scheduling_engine.apply_operations(
                     envelope=current_envelope,
                     operations=ops,
@@ -351,15 +421,19 @@ async def chat_with_llm(request: ChatRequest):
                     target_date_envelope=target_date_envelope,
                     saved_locations=saved_locations,
                 )
+                jlog("TIMER", f"apply_operations_seconds={elapsed_seconds(apply_started)}")
                 
+                module_8_started = time.perf_counter()
                 reply_meta = scheduling_engine.compose_result_reply(
                     latest_request=request.message,
                     parsed={**parsed, "operations": ops},
                     result=patch_result,
                     allow_clash=bool(request.allow_clash),
                 )
+                jlog("TIMER", f"module_8_total_seconds={elapsed_seconds(module_8_started)}")
                 final_reply = reply_meta["reply"]
                 log_total_token_usage(parsed, reply_meta)
+                log_total_timer()
 
                 return ChatResponse(
                     reply=final_reply,
@@ -376,28 +450,34 @@ async def chat_with_llm(request: ChatRequest):
                     reply_status=reply_meta.get("reply_status"),
                     recommend_allow_clash=bool(reply_meta.get("recommend_allow_clash")),
                     reply_reason=reply_meta.get("reply_reason"),
+                    llm_fallback_reason=reply_meta.get("llm_fallback_reason"),
                 )
             except VersionMismatchError:
                 debug_log("Version mismatch during patch, fallback to full schedule.")
 
+        schedule_build_started = time.perf_counter()
         result = scheduling_engine.build_schedule_response(
             parsed=parsed,
             current_schedule=current_envelope,
             latest_request=request.message,
             saved_locations=saved_locations,
         )
+        jlog("TIMER", f"schedule_build_seconds={elapsed_seconds(schedule_build_started)}")
         
         schedule_dict = result.get("schedule_data")
         if schedule_dict:
+            module_8_started = time.perf_counter()
             reply_meta = scheduling_engine.compose_result_reply(
                 latest_request=request.message,
                 parsed=parsed,
                 result=result,
                 allow_clash=bool(request.allow_clash),
             )
+            jlog("TIMER", f"module_8_total_seconds={elapsed_seconds(module_8_started)}")
             log_total_token_usage(parsed, reply_meta)
             full_envelope_dict = database._parse_schedule_payload(schedule_dict, request.user_id, schedule_dict.get("date"))
             full_envelope = ScheduleEnvelope(**full_envelope_dict)
+            log_total_timer()
             return ChatResponse(
                 reply=reply_meta["reply"],
                 full_schedule=full_envelope,
@@ -406,9 +486,11 @@ async def chat_with_llm(request: ChatRequest):
                 reply_status=reply_meta.get("reply_status"),
                 recommend_allow_clash=bool(reply_meta.get("recommend_allow_clash")),
                 reply_reason=reply_meta.get("reply_reason"),
+                llm_fallback_reason=reply_meta.get("llm_fallback_reason"),
             )
         
         log_total_token_usage(parsed)
+        log_total_timer()
         return ChatResponse(
             reply=result.get("reply", reply), 
             schedule_data=None,
@@ -418,6 +500,7 @@ async def chat_with_llm(request: ChatRequest):
     except Exception as e:
         import traceback
         traceback.print_exc() 
+        log_total_timer()
         return ChatResponse(reply=f"Sorry, I encountered an error: {str(e)}")
 
 @app.post("/api/schedules/{scheduleId}/operations", response_model=SchedulePatchResponse)

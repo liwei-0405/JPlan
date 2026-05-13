@@ -512,7 +512,10 @@ class ModuleCConstructorMixin:
             search_start = anchor_item["scheduled_end"]
             search_end = day_end
 
-            successors = [a for a in timeline if a["scheduled_start"] >= search_start]
+            successors = sorted(
+                [a for a in timeline if a["scheduled_start"] >= search_start],
+                key=lambda a: a["scheduled_start"],
+            )
             if successors:
                 search_end = min(a["scheduled_start"] for a in successors)
 
@@ -548,16 +551,94 @@ class ModuleCConstructorMixin:
                 jlog("MODULE_C", f"'{item['title']}' fits activity window but transition is tight", "ACCEPTED_TIGHT_TRANSITION")
                 timeline = tight_inserted
             else:
-                jlog("MODULE_C", f"'{item['title']}' no feasible slot in narrative window", "REJECT_REL")
-                conflict_timeline = self._insert_as_conflict(
-                    item,
-                    timeline,
-                    search_start if relation_kind == "before" else search_start,
-                    reason or "No space in narrative window.",
-                )
-                timeline = conflict_timeline or timeline
+                extended_inserted = None
+                if relation_kind == "after":
+                    extended_inserted = self._try_extended_after_window(
+                        item,
+                        timeline,
+                        anchor_item,
+                        successors,
+                        day_end,
+                        min_travel,
+                        target_title,
+                    )
+                if extended_inserted:
+                    timeline = extended_inserted
+                else:
+                    jlog("MODULE_C", f"'{item['title']}' no feasible slot in narrative window", "REJECT_REL")
+                    conflict_timeline = self._insert_as_conflict(
+                        item,
+                        timeline,
+                        search_start if relation_kind == "before" else search_start,
+                        reason or "No space in narrative window.",
+                    )
+                    timeline = conflict_timeline or timeline
 
         return timeline, True
+
+    def _try_extended_after_window(
+        self,
+        item: Dict[str, Any],
+        timeline: List[Dict[str, Any]],
+        anchor_item: Dict[str, Any],
+        successors: List[Dict[str, Any]],
+        day_end: int,
+        min_travel: Optional[int],
+        target_title: Optional[str],
+    ) -> Optional[List[Dict[str, Any]]]:
+        if not successors:
+            return None
+        next_item = successors[0]
+        if self._has_explicit_dependency(next_item, anchor_item):
+            return None
+
+        search_start = max(anchor_item["scheduled_end"], next_item.get("scheduled_end") or anchor_item["scheduled_end"])
+        later_successors = [
+            candidate for candidate in timeline
+            if candidate.get("scheduled_start") is not None and candidate.get("scheduled_start") >= search_start
+        ]
+        search_end = min([day_end] + [candidate["scheduled_start"] for candidate in later_successors])
+        jlog(
+            "MODULE_C",
+            (
+                f"{item.get('title')} after {target_title or anchor_item.get('title')} "
+                "immediate_window_failed=true trying_after_next_activity=true"
+            ),
+            "RELATIVE_WINDOW",
+        )
+        inserted, _ = self._insert_best_position(
+            item,
+            timeline,
+            search_start,
+            search_end,
+            min_travel,
+            prefer_earliest=True,
+        )
+        if not inserted:
+            return None
+        placed_item = self._find_anchor_in_timeline(
+            {"target_activity_id": item.get("stable_activity_id"), "target_title": item.get("title")},
+            inserted,
+        )
+        if placed_item:
+            placed_item.setdefault("trace", []).append(
+                f"Immediate window after '{target_title}' was full, so it was placed later while still after the anchor."
+            )
+            placed_item["relative_window_extended"] = True
+            placed_item["relative_window_alternative_after"] = next_item.get("title")
+        return inserted
+
+    def _has_explicit_dependency(self, dependent: Dict[str, Any], anchor: Dict[str, Any]) -> bool:
+        relation = dependent.get("anchor_relation") or {}
+        if clean_title(relation.get("kind") or "") != "after":
+            return False
+        target_id = relation.get("target_activity_id") or relation.get("target_id")
+        target_title = relation.get("target_title")
+        anchor_id = anchor.get("stable_activity_id") or anchor.get("id")
+        return bool(
+            (target_id and str(target_id) == str(anchor_id))
+            or (target_title and clean_title(target_title) == clean_title(anchor.get("title")))
+        )
 
     def _insert_tight_relative_position(
         self,

@@ -6,6 +6,7 @@ This package is an internal split of the original `backend/scheduling_engine.py`
 
 - `core.py`: composes mixins and owns the public `SchedulingEngine` orchestration methods.
 - `types_utils.py`: shared constants, enum-like classes, parser prompt text, time formatting/parsing, and pure helpers.
+- `module_0_router.py`: lightweight chat route classification, deterministic simple-command routing, general chat templates, and non-mutating advisory replies.
 - `module_a_parser.py`: Module A request parsing, parser retry/fallback, operation sanitization, and date normalization helpers.
 - `location_normalizer.py`: backend location normalization and scoped explicit-location detection.
 - `module_b_validation.py`: conflict, overlap, and validation helpers used by construction and operation application.
