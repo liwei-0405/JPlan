@@ -273,6 +273,26 @@ class StateModelMixin:
         location_source = clean_optional_text(raw.get("location_source"))
         location_confidence = raw.get("location_confidence")
         resolved_location = deepcopy(raw.get("resolved_location")) if isinstance(raw.get("resolved_location"), dict) else None
+        location_category_clean = clean_title(location_category or "")
+        location_status_clean = clean_title(location_status or "")
+        travel_required_raw = raw.get("travel_required")
+        if travel_required_raw is None:
+            travel_required = not (
+                location_category_clean in {"home_or_online", "none"}
+                or location_status_clean in {"not_required", "no_location_required"}
+            )
+        elif isinstance(travel_required_raw, str):
+            travel_required = travel_required_raw.strip().lower() not in {"0", "false", "no", "off"}
+        else:
+            travel_required = bool(travel_required_raw)
+        preferred_window_start = self._coerce_minutes(
+            raw.get("preferred_window_start"),
+            raw.get("preferredWindowStart"),
+        )
+        preferred_window_end = self._coerce_minutes(
+            raw.get("preferred_window_end"),
+            raw.get("preferredWindowEnd"),
+        )
 
         is_mandatory = bool(
             raw.get("is_mandatory")
@@ -301,6 +321,12 @@ class StateModelMixin:
             "earliest_start": earliest_start,
             "latest_end": latest_end,
             "preferred_start": preferred_start,
+            "preferred_time_window": raw.get("preferred_time_window") or raw.get("preferredTimeWindow"),
+            "preferred_window_start": preferred_window_start,
+            "preferred_window_end": preferred_window_end,
+            "preferred_order": deepcopy(raw.get("preferred_order")) if isinstance(raw.get("preferred_order"), dict) else None,
+            "preferred_orders": deepcopy(raw.get("preferred_orders")) if isinstance(raw.get("preferred_orders"), list) else [],
+            "soft_dependency": bool(raw.get("soft_dependency", False)),
             "requested_fixed_start": raw.get("requested_fixed_start"),
             "preferred_adjustment": raw.get("preferred_adjustment"),
             "move_direction": raw.get("move_direction"),
@@ -320,6 +346,8 @@ class StateModelMixin:
             "raw_llm_location": raw.get("raw_llm_location"),
             "explicit_user_location": bool(raw.get("explicit_user_location", False)),
             "location_warning": raw.get("location_warning"),
+            "area_preference": raw.get("area_preference"),
+            "travel_required": travel_required,
             "status": raw.get("status") or "active",
             "source_turn": raw.get("source_turn") if raw.get("source_turn") is not None else (source_turn or 0),
             "created_at": raw.get("created_at") or now_iso,
@@ -341,6 +369,8 @@ class StateModelMixin:
             "accepted_with_warning": bool(raw.get("accepted_with_warning")),
             "warning_code": raw.get("warning_code"),
             "warnings": list(raw.get("warnings") or []),
+            "implicit_activity": bool(raw.get("implicit_activity", False)),
+            "implicit_reason": raw.get("implicit_reason"),
         }
 
     def _load_canonical_activities(self, envelope: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:

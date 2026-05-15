@@ -15,6 +15,7 @@ from .module_8_reply import Module8ReplyMixin
 from .module_a_parser import ModuleAParserMixin
 from .module_b_validation import ModuleBValidationMixin
 from .module_c_constructor import ModuleCConstructorMixin
+from .module_d_refinement import ModuleDRefinementMixin, REFINEMENT_META_KEYS
 from .state_model import StateModelMixin
 from .state_operations import StateOperationsMixin
 from .travel_validation import TravelValidationMixin
@@ -28,6 +29,7 @@ class SchedulingEngine(
     LocationNormalizerMixin,
     ModuleBValidationMixin,
     ModuleCConstructorMixin,
+    ModuleDRefinementMixin,
     StateModelMixin,
     TravelValidationMixin,
     StateOperationsMixin,
@@ -139,6 +141,21 @@ class SchedulingEngine(
         if not requested_operations:
             requested_operations = [{**activity, "op": "add"} for activity in (parsed.get("activities") or [])]
         requested_operations = self._sanitize_operations(requested_operations)
+        requested_operations = self._apply_implicit_lunch_handling(
+            requested_operations,
+            latest_request,
+            existing_active,
+            preferences,
+        )
+        self._log_normalized_operations(requested_operations)
+        self._configure_module_d_run_policy(
+            preferences,
+            current_schedule,
+            parsed,
+            requested_operations,
+            latest_request,
+            is_apply_operations=False,
+        )
 
         for raw_op in requested_operations:
             raw_op = {**raw_op, "_user_message": latest_request}
@@ -176,7 +193,7 @@ class SchedulingEngine(
         warnings = self._collect_schedule_warnings(planned_result["activities"], planned_result["schedule_blocks"])
         formatted_activities = [self._format_activity(item) for item in planned_result["activities"]]
         formatted_unscheduled = [self._format_activity(item) for item in planned_result.get("unscheduled_activities", [])]
-        status = "partial" if conflicts else ("warning" if warnings else "ok")
+        status = "partial" if (conflicts or formatted_unscheduled) else ("warning" if warnings else "ok")
 
         schedule_data = {
             "schema_version": 4,
@@ -197,9 +214,12 @@ class SchedulingEngine(
             "applied_changes": formatted_activities,
             "accepted_with_warnings": warnings,
             "rejected_changes": formatted_unscheduled,
-            "unmet_items": [],
+            "unmet_items": formatted_unscheduled,
+            "unmet_optional": formatted_unscheduled,
             "validation_issues": [],
         }
+        for key in REFINEMENT_META_KEYS:
+            schedule_data[key] = planned_result.get(key)
         schedule_data = self._apply_accurate_travel_if_requested(schedule_data, saved_locations or [])
 
         return {

@@ -136,6 +136,25 @@ Public Nominatim usage is intentionally limited for FYP/beta testing: it is neve
 
 For a small beta of around 20 users, this setup is acceptable because Nominatim is fallback-only, user-triggered, throttled, and cached. For production/global scale, replace public Nominatim with a paid geocoder or a self-hosted geocoder. Route cache is currently in-memory only; move it to Supabase/Redis before larger public release.
 
+### 4.2 Module D Implementation Status
+
+Module D v1 is enabled as a safe deterministic refinement pass after initial schedule construction. It runs for complex initial generation and explicit optimize/regenerate requests, but skips simple edits so normal fast-path changes preserve the current schedule behavior.
+
+Optional backend tuning:
+
+```env
+JPLAN_ENABLE_MODULE_D=true
+MODULE_D_MAX_ITERATIONS=30
+MODULE_D_TIME_BUDGET_MS=500
+MODULE_D_MIN_IMPROVEMENT=0.01
+```
+
+Implemented in V1: deterministic bounded local refinement, safe run policy, feasible candidate relocation, optional unscheduled insertion, heuristic/cached travel scoring, fixed-event preservation, dependency-order preservation, and refinement metadata/logs.
+
+Not implemented yet / future full ANSA: stochastic simulated annealing, temperature/cooling, adaptive neighborhood probabilities, full swap/insert/relocate/replace move set, replacement candidate pool, ILS perturbation, SPM-IR preference mining integration, route-service calls inside refinement, global optimality, and long-run optimization mode.
+
+Module D v1 is an ANSA-style deterministic refinement subset. It should not be described as full ANSA until temperature-based probabilistic acceptance, adaptive move weighting, and the complete neighborhood set are implemented.
+
 ---
 
 ## 🏃 Running the Application

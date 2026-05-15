@@ -64,6 +64,11 @@ MODULE8_LLM_TIMEOUT_SECONDS = float(os.getenv("MODULE8_LLM_TIMEOUT_SECONDS", "8"
 MODULE8_LLM_TOTAL_TIMEOUT_SECONDS = float(os.getenv("MODULE8_LLM_TOTAL_TIMEOUT_SECONDS", "12"))
 ADVISORY_LLM_TIMEOUT_SECONDS = float(os.getenv("ADVISORY_LLM_TIMEOUT_SECONDS", "8"))
 ADVISORY_LLM_EXECUTOR_WORKERS = max(1, int(os.getenv("ADVISORY_LLM_EXECUTOR_WORKERS", "2")))
+JPLAN_ENABLE_MODULE_D = os.getenv("JPLAN_ENABLE_MODULE_D", "true").strip().lower() not in {"0", "false", "no", "off"}
+MODULE_D_MAX_ITERATIONS = max(0, int(os.getenv("MODULE_D_MAX_ITERATIONS", "30")))
+MODULE_D_TIME_BUDGET_MS = max(1, int(os.getenv("MODULE_D_TIME_BUDGET_MS", "500")))
+MODULE_D_MIN_IMPROVEMENT = float(os.getenv("MODULE_D_MIN_IMPROVEMENT", "0.01"))
+MODULE_D_TRACE = "Adjusted by Module D refinement to reduce idle/travel cost."
 
 MONTH_NAME_TO_NUMBER = {
     "jan": 1,
@@ -171,6 +176,54 @@ GENERIC_SYSTEM_ACTIVITY_TYPES = {
     "travel",
 }
 
+NO_LOCATION_REQUIRED_TITLE_KEYWORDS = {
+    "assignment",
+    "call",
+    "calling",
+    "coding",
+    "fyp",
+    "implementation",
+    "online meeting",
+    "parents",
+    "phone",
+    "phone call",
+    "plan tomorrow",
+    "planning",
+    "review",
+    "work",
+}
+
+PHYSICAL_PLACE_TITLE_KEYWORDS = {
+    "cafe",
+    "campus",
+    "class",
+    "coffee",
+    "dinner",
+    "gym",
+    "groceries",
+    "grocery",
+    "library",
+    "lunch",
+    "meeting",
+    "office",
+    "restaurant",
+    "seminar",
+    "shopping",
+    "store",
+    "supermarket",
+    "workout",
+}
+
+PREFERRED_TIME_WINDOWS = {
+    "morning": (8 * 60, 12 * 60),
+    "afternoon": (12 * 60, 17 * 60),
+    "lunch": (12 * 60, 14 * 60),
+    "after_lunch": (12 * 60, 17 * 60),
+    "evening": (18 * 60, 21 * 60),
+    "night": (20 * 60, DEFAULT_DAY_END),
+    "not_too_late": (DEFAULT_DAY_START, 20 * 60),
+}
+
 PARSER_PROMPT = """
 You are Module A, the JSON parser for JPlan. Convert the latest user request into structured scheduling operations.
 Return ONLY valid JSON.
@@ -206,6 +259,9 @@ Critical rules:
 8. Use 24-hour time. Use reasonable durations if missing: lunch/dinner 60, coffee 15, gym 60, shopping 45.
 9. Use current activity titles when possible. Keep conflict_analysis short and non-decisive.
 10. Output only core scheduling fields. Do not output location_label, location_status, location_confidence, location_warning, or other normalized location metadata.
+11. Do not invent store/supermarket locations except for grocery/shopping activities.
+12. Soft phrases like preferably, if possible, maybe, sometime after, not too late, later in the day, at night, or around are preferences, not hard anchor_relation.
+13. Use anchor_relation only for hard wording like right after, immediately after, must be after, only after, before X starts, or cannot happen before.
 """
 
 

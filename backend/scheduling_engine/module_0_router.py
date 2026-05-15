@@ -82,6 +82,17 @@ class Module0RouterMixin:
             })
             return self._log_route_decision(route)
 
+        if re.search(r"\b(?:optimi[sz]e|regenerate|rebuild)\b.*\b(?:schedule|plan|day)\b|\bmake\s+(?:the\s+)?(?:schedule|plan|day)\s+better\b", clean):
+            route.update({
+                "route": "simple_schedule_command",
+                "confidence": 0.92,
+                "should_mutate_schedule": True,
+                "use_deterministic_parser": True,
+                "use_module_a_llm": False,
+                "reason": "matched_optimize_request",
+            })
+            return self._log_route_decision(route)
+
         has_activity_entity = bool(re.search(self._ROUTER_ACTIVITY_PATTERN, clean))
         has_action_word = bool(re.search(self._ROUTER_ACTION_PATTERN, clean))
         has_adjustment_word = bool(re.search(self._ROUTER_ADJUSTMENT_PATTERN, clean))

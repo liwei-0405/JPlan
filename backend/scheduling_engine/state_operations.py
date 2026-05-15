@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 
 from jplan_logging import jjson, jlog, jsection
 from travel_service import MissingORSApiKey, TravelService, TravelServiceError, coordinate_from_saved_location
+from .module_d_refinement import REFINEMENT_META_KEYS
 from .types_utils import *
 from .types_utils import _normalize_location
 
@@ -333,6 +334,30 @@ class StateOperationsMixin:
             "target_title": target.get("title"),
             "anchor_activity_id": anchor_id,
             "anchor_title": (resolved_anchor or {}).get("target_title"),
+        }
+
+    def _anchor_resolution_failure(
+        self,
+        operation: Dict[str, Any],
+        active_pool: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        anchor = operation.get("anchor_relation") or {}
+        if not anchor:
+            return None
+        anchor_reference = (
+            anchor.get("target_activity_id")
+            or anchor.get("target_id")
+            or anchor.get("target_title")
+        )
+        if not anchor_reference:
+            return None
+        resolution = self._resolve_activity_reference(anchor_reference, active_pool)
+        if resolution.get("status") == "resolved":
+            return None
+        return {
+            "status": "unresolved_anchor",
+            "anchor_reference": anchor_reference,
+            "anchor_resolution": resolution,
         }
 
     def _validate_postconditions(
@@ -843,6 +868,28 @@ class StateOperationsMixin:
         repaired["repair_applied"] = True
         return repaired
 
+    def _operation_batch_source_text(
+        self,
+        operations: List[Dict[str, Any]],
+        preferences: Dict[str, Any],
+        envelope: Dict[str, Any],
+    ) -> str:
+        for operation in operations or []:
+            if not isinstance(operation, dict):
+                continue
+            for key in ("_latest_request", "_source_text", "_user_message", "_transcription"):
+                value = str(operation.get(key) or "").strip()
+                if value:
+                    return value
+        for source in (preferences, (envelope or {}).get("preferences") or {}, envelope or {}):
+            if not isinstance(source, dict):
+                continue
+            for key in ("latest_request", "original_request", "transcription", "request_text"):
+                value = str(source.get(key) or "").strip()
+                if value:
+                    return value
+        return ""
+
     def apply_operations(
         self, 
         envelope: Dict[str, Any], 
@@ -878,9 +925,51 @@ class StateOperationsMixin:
         source_plan_date = working_envelope.get("date")
         existing_conflict_identities = self._existing_conflict_identities(working_envelope)
         postconditions: List[Dict[str, Any]] = []
+        active_pool_for_prepare = [item for item in canonical_activities if item.get("status") == "active"]
+        sanitized_operations = self._sanitize_operations(operations)
+        latest_operation_message = self._operation_batch_source_text(
+            sanitized_operations,
+            preferences,
+            working_envelope,
+        )
+        if latest_operation_message:
+            normalized_for_apply: List[Dict[str, Any]] = []
+            operation_scopes = self._build_activity_location_scopes(
+                sanitized_operations,
+                latest_operation_message,
+            )
+            for index, operation in enumerate(sanitized_operations):
+                normalized_operation = self._normalize_soft_timing_preferences(
+                    operation,
+                    latest_operation_message,
+                    operation_scopes.get(index),
+                )
+                if normalized_operation.get("location_status") and "raw_llm_location" in normalized_operation:
+                    self._enrich_existing_location_payload(
+                        normalized_operation,
+                        latest_operation_message,
+                        operation_scopes.get(index),
+                    )
+                normalized_for_apply.append(normalized_operation)
+            sanitized_operations = normalized_for_apply
+        sanitized_operations = self._apply_implicit_lunch_handling(
+            sanitized_operations,
+            latest_operation_message,
+            active_pool_for_prepare,
+            preferences,
+        )
+        self._log_normalized_operations(sanitized_operations)
         operations_to_apply, ignored_operations = self._prepare_operations_for_apply(
-            self._sanitize_operations(operations),
-            [item for item in canonical_activities if item.get("status") == "active"],
+            sanitized_operations,
+            active_pool_for_prepare,
+        )
+        self._configure_module_d_run_policy(
+            preferences,
+            working_envelope,
+            {"operations": operations_to_apply},
+            operations_to_apply,
+            str((operations_to_apply[0] if operations_to_apply else {}).get("_user_message") or ""),
+            is_apply_operations=True,
         )
         if not operations_to_apply and ignored_operations:
             return {
@@ -921,10 +1010,18 @@ class StateOperationsMixin:
             operation.get("op") == "shift_plan_date"
             for operation in operations_to_apply
         )
+        explicit_optimize_requested = any(
+            operation.get("op") == "optimize_schedule"
+            for operation in operations_to_apply
+        )
 
         for operation in operations_to_apply:
             op_type = operation.get("op")
             active_pool = [item for item in canonical_activities if item.get("status") == "active"]
+
+            if op_type == "optimize_schedule":
+                jlog("MODULE_D", "explicit optimize request accepted for refinement pass", "REQUEST")
+                continue
 
             if op_type == "shift_plan_date":
                 target_date = operation.get("to_date") or new_date or schedule_date
@@ -995,6 +1092,21 @@ class StateOperationsMixin:
                 index for index, activity in enumerate(canonical_activities)
                 if activity.get("stable_activity_id") == target_id
             )
+
+            anchor_failure = self._anchor_resolution_failure(operation, active_pool)
+            if anchor_failure:
+                return {
+                    "status": "clarification_needed",
+                    "applied": False,
+                    "envelope": working_envelope,
+                    "version": current_version,
+                    "activities": working_envelope.get("activities", []),
+                    "updatedActivities": [],
+                    "deletedItemIds": [],
+                    "target_resolution": resolution,
+                    "anchor_resolution": anchor_failure,
+                    "reply": f"Which {anchor_failure['anchor_reference']} do you mean?",
+                }
 
             if operation.get("priority_update_only") and operation.get("priority") is not None:
                 old_priority = clean_title(target.get("priority") or "medium")
@@ -1097,6 +1209,7 @@ class StateOperationsMixin:
                 and item.get("scheduled_start") is not None
                 and item.get("scheduled_end") is not None
                 and not item["locked_fixed"]
+                and not explicit_optimize_requested
             ):
                 item["preserve_scheduled_time"] = True
             if item["locked_fixed"]:
@@ -1115,12 +1228,35 @@ class StateOperationsMixin:
 
         jsection("MODULE_9", f"replanning date={schedule_date}", "REPLAN")
         planned_result = self._plan_schedule(schedule_date, active_set, preferences)
-        conflicts = self._build_conflicts(planned_result["activities"], mutated_ids if allow_clash else set())
+        is_initial_generation_mode = preferences.get("refinement_reason") == "initial_generation"
+        if (
+            explicit_optimize_requested
+            and not planned_result.get("refinement_applied")
+            and not mutated_ids
+            and not deleted_activity_ids
+            and not updated_activities
+        ):
+            return {
+                "status": "no_operation",
+                "applied": False,
+                "envelope": working_envelope,
+                "planned_result": planned_result,
+                "version": current_version,
+                "activities": working_envelope.get("activities", []),
+                "updatedActivities": [],
+                "deletedItemIds": [],
+                "ignored_operations": ignored_operations,
+                "rejected_changes": [],
+                "reply_reason": "no_safe_refinement",
+                "reply": "I checked your schedule, but did not find a safe optimization to apply.",
+            }
+        forced_conflict_ids = mutated_ids if (allow_clash and not is_initial_generation_mode) else set()
+        conflicts = self._build_conflicts(planned_result["activities"], forced_conflict_ids)
         for conflict in conflicts:
             identity = self._conflict_identity(conflict)
             conflict["conflict_lifecycle"] = "existing" if identity in existing_conflict_identities else "new"
 
-        if conflicts and not allow_clash:
+        if conflicts and not allow_clash and not is_initial_generation_mode:
             repaired_result = self._attempt_flexible_edit_repair(
                 active_set,
                 mutated_ids,
@@ -1145,7 +1281,7 @@ class StateOperationsMixin:
             postconditions,
             planned_result.get("activities", []),
         )
-        if postcondition_failures and not allow_clash:
+        if postcondition_failures and not allow_clash and not is_initial_generation_mode:
             self._debug(f"[CONFLICT] Requested ordering was not satisfied: {postcondition_failures[0].get('reason')}")
             response = self._build_postcondition_response(working_envelope, current_version, postcondition_failures, allow_clash=allow_clash)
             response["ignored_operations"] = ignored_operations
@@ -1155,7 +1291,7 @@ class StateOperationsMixin:
             conflict for conflict in conflicts
             if any(str(activity_id) in mutated_ids for activity_id in conflict.get("activity_ids") or [])
         ]
-        if blocking_conflicts and not allow_clash:
+        if blocking_conflicts and not allow_clash and not is_initial_generation_mode:
             for mutated_id in mutated_ids:
                 planned_activity = planned_by_id.get(mutated_id)
                 if planned_activity and planned_activity.get("is_conflict"):
@@ -1203,8 +1339,20 @@ class StateOperationsMixin:
         formatted_unscheduled = [
             self._format_activity(item) for item in planned_result.get("unscheduled_activities", [])
         ]
-        envelope_status = "partial" if (conflicts or postcondition_failures) else ("warning" if warnings else "ok")
-        result_status = "warning" if envelope_status == "warning" else "success"
+        envelope_status = "partial" if (conflicts or postcondition_failures or formatted_unscheduled) else ("warning" if warnings else "ok")
+        has_only_nonblocking_existing_conflicts = (
+            bool(conflicts)
+            and not blocking_conflicts
+            and not postcondition_failures
+            and not formatted_unscheduled
+            and not is_initial_generation_mode
+        )
+        if allow_clash and conflicts and not is_initial_generation_mode:
+            result_status = "success"
+        elif has_only_nonblocking_existing_conflicts:
+            result_status = "success"
+        else:
+            result_status = "warning" if envelope_status in {"warning", "partial"} else "success"
 
         updated_envelope = deepcopy(working_envelope)
         updated_envelope["schema_version"] = 4
@@ -1229,17 +1377,25 @@ class StateOperationsMixin:
         ]
         updated_envelope["rejected_changes"] = []
         updated_envelope["ignored_operations"] = ignored_operations
-        updated_envelope["unmet_items"] = []
+        updated_envelope["unmet_items"] = formatted_unscheduled
+        updated_envelope["unmet_optional"] = formatted_unscheduled
         updated_envelope["validation_issues"] = [failure.get("reason") for failure in postcondition_failures if failure.get("reason")]
         updated_envelope["conflict"] = conflicts[0] if conflicts else ({"type": "postcondition_failed", **postcondition_failures[0]} if postcondition_failures else None)
         updated_envelope["postcondition_results"] = postcondition_failures
+        for key in REFINEMENT_META_KEYS:
+            updated_envelope[key] = planned_result.get(key)
         updated_envelope = self._apply_accurate_travel_if_requested(updated_envelope, saved_locations or [])
         envelope_status = updated_envelope.get("status") or envelope_status
-        result_status = (
-            "warning"
-            if envelope_status == "warning"
-            else ("conflict" if envelope_status in {"route_conflict", "conflict"} else "success")
-        )
+        if allow_clash and conflicts and not is_initial_generation_mode:
+            result_status = "success"
+        elif has_only_nonblocking_existing_conflicts:
+            result_status = "success"
+        else:
+            result_status = (
+                "warning"
+                if envelope_status in {"warning", "partial"}
+                else ("conflict" if envelope_status in {"route_conflict", "conflict"} else "success")
+            )
 
         jlog("SUMMARY", "Final schedule", "FINAL")
         summary_lines = []
@@ -1301,7 +1457,14 @@ class StateOperationsMixin:
         earliest_start = item.get("earliest_start")
         latest_end = item.get("latest_end")
         preferred_start = item.get("preferred_start")
+        preferred_window_start = item.get("preferred_window_start")
+        preferred_window_end = item.get("preferred_window_end")
         location = clean_optional_text(item.get("location"))
+        raw_travel_required = item.get("travel_required", True)
+        if isinstance(raw_travel_required, str):
+            travel_required = raw_travel_required.strip().lower() not in {"0", "false", "no", "off"}
+        else:
+            travel_required = bool(raw_travel_required)
 
         return {
             "id": stable_activity_id,
@@ -1325,6 +1488,8 @@ class StateOperationsMixin:
             "raw_llm_location": item.get("raw_llm_location"),
             "explicit_user_location": bool(item.get("explicit_user_location", False)),
             "location_warning": item.get("location_warning"),
+            "area_preference": item.get("area_preference"),
+            "travel_required": travel_required,
             "duration": item.get("duration") or self._duration_label(item.get("duration_minutes") or (s_end_val - s_start_val)),
             "duration_minutes": int(item.get("duration_minutes") or (s_end_val - s_start_val)),
             "priority": item.get("priority", "medium"),
@@ -1335,6 +1500,12 @@ class StateOperationsMixin:
             "earliest_start": earliest_start,
             "latest_end": latest_end,
             "preferred_start": preferred_start,
+            "preferred_time_window": item.get("preferred_time_window"),
+            "preferred_window_start": preferred_window_start,
+            "preferred_window_end": preferred_window_end,
+            "preferred_order": deepcopy(item.get("preferred_order")) if isinstance(item.get("preferred_order"), dict) else None,
+            "preferred_orders": deepcopy(item.get("preferred_orders")) if isinstance(item.get("preferred_orders"), list) else [],
+            "soft_dependency": bool(item.get("soft_dependency", False)),
             "requested_fixed_start": item.get("requested_fixed_start"),
             "preferred_adjustment": item.get("preferred_adjustment"),
             "move_direction": item.get("move_direction"),
@@ -1363,6 +1534,8 @@ class StateOperationsMixin:
             "scheduled_end": s_end_val,
             "prep_buffer": item.get("prep_buffer", DEFAULT_PREP_BUFFER),
             "aliases": list(item.get("aliases") or []),
+            "implicit_activity": bool(item.get("implicit_activity", False)),
+            "implicit_reason": item.get("implicit_reason"),
         }
 
     def _materialize_schedule(

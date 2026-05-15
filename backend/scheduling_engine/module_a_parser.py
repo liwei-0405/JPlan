@@ -520,6 +520,9 @@ class ModuleAParserMixin:
             }
 
         if parsed is None:
+            parsed = self._fallback_parse_optimize_request(request, schedule_date)
+
+        if parsed is None:
             parsed = self._fallback_parse_arrange_relation(request, schedule_date, current_schedule)
 
         if parsed is None:
@@ -578,6 +581,25 @@ class ModuleAParserMixin:
         if parsed:
             jlog("MODULE_A", "deterministic_fast_path matched simple pattern", "FAST_PATH")
         return parsed
+
+    def _fallback_parse_optimize_request(self, request: str, schedule_date: str) -> Optional[Dict[str, Any]]:
+        text = clean_title(request)
+        if not re.search(r"\b(?:optimi[sz]e|regenerate|rebuild)\b.*\b(?:schedule|plan|day)\b|\bmake\s+(?:the\s+)?(?:schedule|plan|day)\s+better\b", text):
+            return None
+        return {
+            "intent": "edit",
+            "reply": "I understood this as optimizing the current schedule.",
+            "transcription": request,
+            "date": schedule_date,
+            "operations": [{
+                "op": "optimize_schedule",
+                "scope": "active_schedule",
+            }],
+            "activities": [],
+            "preferences": {
+                "refinement_reason": "explicit_optimize",
+            },
+        }
 
     def _is_schedule_change_intent(self, parsed: Dict[str, Any]) -> bool:
         intent = clean_title(parsed.get("intent") or "")

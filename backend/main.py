@@ -360,6 +360,9 @@ async def chat_with_llm(request: ChatRequest):
         parsed.setdefault("preferences", {})
         parsed["preferences"]["allow_clash"] = bool(request.allow_clash)
         parsed["preferences"]["accurate_travel_time"] = bool(request.accurate_travel_time)
+        parsed["preferences"]["module_0_route"] = route.get("route")
+        parsed["preferences"]["module_0_reason"] = route.get("reason")
+        parsed["preferences"]["latest_request"] = request.message
         
         intent = parsed.get("intent", "chat")
         reply = parsed.get("reply", "I've processed your request.")
@@ -402,7 +405,11 @@ async def chat_with_llm(request: ChatRequest):
                 ops = [
                     {
                         **op,
-                        "_user_message": parsed.get("transcription") or request.message,
+                        "_user_message": request.message,
+                        "_latest_request": request.message,
+                        "_transcription": parsed.get("transcription"),
+                        "_router_route": route.get("route"),
+                        "_router_reason": route.get("reason"),
                     }
                     for op in ops
                 ]

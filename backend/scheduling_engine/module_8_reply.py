@@ -83,6 +83,8 @@ class Module8ReplyMixin:
             "shift_operation": shift_operation,
             "primary_operation": primary_operation,
             "priority_operation": priority_operation,
+            "refinement_applied": bool(envelope.get("refinement_applied") or result.get("refinement_applied")),
+            "refinement_accepted_moves": envelope.get("refinement_accepted_moves") or result.get("refinement_accepted_moves") or [],
             "conflict": conflict or (conflicts[0] if conflicts else None),
             "conflicts": conflicts[:3],
             "ignored_operations": result.get("ignored_operations") or envelope.get("ignored_operations") or [],
@@ -302,6 +304,12 @@ class Module8ReplyMixin:
             to_text = self._format_date_for_reply(shift.get("to_date"))
             return f"I've moved the whole plan from {from_text} to {to_text}."
 
+        operation = summary.get("primary_operation") or {}
+        if clean_title(operation.get("op") or "") == "optimize_schedule":
+            if summary.get("refinement_applied") and summary.get("refinement_accepted_moves"):
+                return "I optimized the schedule by adjusting flexible activities while keeping fixed commitments unchanged."
+            return "I checked your schedule, but did not find a safe optimization to apply."
+
         priority = summary.get("priority_operation") or {}
         if priority.get("title") and priority.get("priority"):
             title = priority.get("title")
@@ -316,7 +324,6 @@ class Module8ReplyMixin:
 
         blocks = summary.get("referenced_blocks") or []
         changed = summary.get("changed") or []
-        operation = summary.get("primary_operation") or {}
         op_type = clean_title(operation.get("op") or "")
         if op_type == "remove":
             removed = (summary.get("removed_changes") or [{}])[0]

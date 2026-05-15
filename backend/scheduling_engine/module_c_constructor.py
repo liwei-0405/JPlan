@@ -13,6 +13,22 @@ from .types_utils import *
 from .types_utils import _normalize_location
 
 class ModuleCConstructorMixin:
+    def _activity_requires_travel(self, activity: Optional[Dict[str, Any]]) -> bool:
+        if not activity:
+            return False
+        status = clean_title(activity.get("location_status") or "")
+        category = clean_title(activity.get("location_category") or "")
+        raw_travel_required = activity.get("travel_required")
+        if raw_travel_required is False:
+            return False
+        if isinstance(raw_travel_required, str) and raw_travel_required.strip().lower() in {"0", "false", "no", "off"}:
+            return False
+        if status in {"not_required", "no_location_required"}:
+            return False
+        if category in {"home_or_online", "none"}:
+            return False
+        return True
+
     def _materialize_blocks(
         self, 
         activities: List[Dict[str, Any]], 
@@ -29,7 +45,8 @@ class ModuleCConstructorMixin:
         for act in ordered:
             start_min = act.get("scheduled_start") or 0
             end_min = act.get("scheduled_end") or (start_min + act.get("duration_minutes", 60))
-            current_loc = act.get("location")
+            travel_required = self._activity_requires_travel(act)
+            current_loc = act.get("location") if travel_required else None
             if not current_loc: current_loc = None # Normalize
 
             # A. Gap Handling (between last_end and start_min)
@@ -37,7 +54,7 @@ class ModuleCConstructorMixin:
                 gap_dur = start_min - last_end
                 
                 # Calculate required overhead
-                buffer_dur = DEFAULT_PREP_BUFFER if last_loc is not None else 0
+                buffer_dur = DEFAULT_PREP_BUFFER if last_loc is not None and current_loc is not None else 0
                 travel_time = 0
                 if last_loc and current_loc and last_loc != current_loc:
                     travel_time = estimate_travel_minutes(last_loc, current_loc)
@@ -120,9 +137,19 @@ class ModuleCConstructorMixin:
                 "location_status": act.get("location_status"),
                 "location_source": act.get("location_source"),
                 "location_confidence": act.get("location_confidence"),
+                "location_warning": act.get("location_warning"),
+                "area_preference": act.get("area_preference"),
+                "travel_required": travel_required,
                 "saved_location_label": act.get("saved_location_label"),
                 "resolved_location": deepcopy(act.get("resolved_location")) if isinstance(act.get("resolved_location"), dict) else None,
                 "notes": act.get("notes"),
+                "preferred_time_window": act.get("preferred_time_window"),
+                "preferred_window_start": act.get("preferred_window_start"),
+                "preferred_window_end": act.get("preferred_window_end"),
+                "preferred_order": deepcopy(act.get("preferred_order")) if isinstance(act.get("preferred_order"), dict) else None,
+                "preferred_orders": deepcopy(act.get("preferred_orders")) if isinstance(act.get("preferred_orders"), list) else [],
+                "implicit_activity": bool(act.get("implicit_activity", False)),
+                "implicit_reason": act.get("implicit_reason"),
                 "is_conflict": act.get("is_conflict", False),
                 "is_conflicting": act.get("is_conflict", False),
                 "conflict_ids": list(act.get("conflict_ids") or []),
@@ -130,7 +157,8 @@ class ModuleCConstructorMixin:
             })
             
             last_end = end_min
-            last_loc = current_loc
+            if travel_required:
+                last_loc = current_loc
 
         return blocks
 
@@ -385,6 +413,7 @@ class ModuleCConstructorMixin:
                 pending_relative = []
 
         # 4. Place FLEXIBLE items
+        self._mark_soft_anchor_boosts(flexible)
         flexible.sort(key=self._calculate_activity_base_score, reverse=True)
         for item in flexible:
             jlog("MODULE_C", f"'{item['title']}' score={self._calculate_activity_base_score(item)}", "PLACE_FLEX")
@@ -392,11 +421,22 @@ class ModuleCConstructorMixin:
             if inserted:
                 timeline = inserted
             else:
-                if item.get("is_mandatory"):
+                if self._should_unschedule_initial_generation_item(item, preferences):
+                    unscheduled.append(self._mark_unscheduled_optional(item, reason or "no_relaxed_slot"))
+                elif item.get("is_mandatory"):
                     conflict_timeline = self._insert_as_conflict(item, timeline, day_start, reason)
                     timeline = conflict_timeline or timeline
                 else:
                     unscheduled.append(item)
+
+        timeline, unscheduled, refinement_metadata = self._apply_module_d_refinement(
+            timeline,
+            unscheduled,
+            day_start,
+            day_end,
+            min_travel,
+            preferences,
+        )
 
         # FINAL PASS: Materialize
         final_blocks = self._materialize_blocks(timeline, day_start, min_travel)
@@ -406,8 +446,44 @@ class ModuleCConstructorMixin:
             "schedule_blocks": final_blocks,
             "unscheduled_activities": unscheduled,
             "day_start": format_clock(day_start),
-            "day_end": format_clock(day_end)
+            "day_end": format_clock(day_end),
+            **refinement_metadata,
         }
+
+    def _should_unschedule_initial_generation_item(
+        self,
+        item: Dict[str, Any],
+        preferences: Dict[str, Any],
+    ) -> bool:
+        if preferences.get("refinement_reason") != "initial_generation":
+            return False
+        if item.get("timing_mode") == TimingMode.FIXED or item.get("fixed_start") is not None:
+            return False
+        priority = clean_title(item.get("priority") or "medium")
+        return (
+            priority == "low"
+            or not item.get("is_mandatory", True)
+            or bool(item.get("soft_dependency"))
+            or bool(item.get("preferred_time_window"))
+        )
+
+    def _mark_unscheduled_optional(
+        self,
+        item: Dict[str, Any],
+        reason: str,
+    ) -> Dict[str, Any]:
+        unscheduled_item = deepcopy(item)
+        unscheduled_item["status"] = "unscheduled"
+        unscheduled_item["unscheduled_reason"] = reason or "no_relaxed_slot"
+        unscheduled_item.setdefault("trace", []).append(
+            reason or "No relaxed slot was available during initial generation."
+        )
+        jlog(
+            "MODULE_C",
+            f"{unscheduled_item.get('title')} reason={unscheduled_item['unscheduled_reason']}",
+            "UNSCHEDULED_OPTIONAL",
+        )
+        return unscheduled_item
 
     def _find_anchor_in_timeline(
         self,
@@ -776,8 +852,106 @@ class ModuleCConstructorMixin:
             
         if activity.get("latest_end") is not None:
             score += max(0, (DEFAULT_DAY_END - activity["latest_end"]) // 30)
+
+        if activity.get("preferred_time_window") or activity.get("preferred_window_start") is not None:
+            score += 35
+
+        if activity.get("implicit_activity"):
+            score += 90
+
+        if activity.get("_soft_anchor_boost"):
+            score += 90
             
         return score
+
+    def _mark_soft_anchor_boosts(self, flexible: List[Dict[str, Any]]) -> None:
+        referenced_titles = set()
+        for item in flexible:
+            for order in self._preferred_order_list(item):
+                target_title = clean_title(order.get("target_title") or "")
+                if target_title:
+                    referenced_titles.add(target_title)
+        if not referenced_titles:
+            return
+        for item in flexible:
+            if clean_title(item.get("title") or "") in referenced_titles:
+                item["_soft_anchor_boost"] = True
+
+    def _preferred_order_list(self, item: Dict[str, Any]) -> List[Dict[str, Any]]:
+        orders: List[Dict[str, Any]] = []
+        if isinstance(item.get("preferred_order"), dict):
+            orders.append(item["preferred_order"])
+        if isinstance(item.get("preferred_orders"), list):
+            orders.extend(order for order in item["preferred_orders"] if isinstance(order, dict))
+
+        deduped: List[Dict[str, Any]] = []
+        seen = set()
+        for order in orders:
+            key = (clean_title(order.get("kind") or "after"), clean_title(order.get("target_title") or ""))
+            if not key[1] or key in seen:
+                continue
+            seen.add(key)
+            deduped.append(order)
+        return deduped
+
+    def _adjust_candidate_for_preferred_orders(
+        self,
+        item: Dict[str, Any],
+        timeline: List[Dict[str, Any]],
+        candidate_start: int,
+        duration: int,
+        gap_start: int,
+        gap_end: int,
+        before_transition: int,
+        after_transition: int,
+    ) -> int:
+        adjusted_start = candidate_start
+        earliest_start = max(gap_start + before_transition, item.get("earliest_start") or gap_start)
+        for order in self._preferred_order_list(item):
+            anchor = self._find_anchor_in_timeline(order, timeline)
+            if not anchor:
+                continue
+            kind = clean_title(order.get("kind") or "after")
+            if kind == "before":
+                latest_start = (anchor.get("scheduled_start") or gap_end) - duration
+                if adjusted_start + duration > (anchor.get("scheduled_start") or gap_end) and latest_start >= earliest_start:
+                    adjusted_start = latest_start
+            else:
+                anchor_end = anchor.get("scheduled_end")
+                if anchor_end is not None and adjusted_start < anchor_end:
+                    shifted_start = max(adjusted_start, anchor_end)
+                    if shifted_start + duration + after_transition <= gap_end:
+                        adjusted_start = shifted_start
+        return adjusted_start
+
+    def _preferred_order_score_adjustment(
+        self,
+        item: Dict[str, Any],
+        timeline: List[Dict[str, Any]],
+        candidate_start: int,
+        candidate_end: int,
+    ) -> Tuple[float, List[Dict[str, str]]]:
+        delta = 0.0
+        violations: List[Dict[str, str]] = []
+        for order in self._preferred_order_list(item):
+            anchor = self._find_anchor_in_timeline(order, timeline)
+            if not anchor:
+                continue
+            kind = clean_title(order.get("kind") or "after")
+            anchor_title = anchor.get("title") or order.get("target_title")
+            if kind == "before":
+                satisfied = candidate_end <= (anchor.get("scheduled_start") or 0)
+            else:
+                satisfied = candidate_start >= (anchor.get("scheduled_end") or 0)
+            if satisfied:
+                delta += 140.0
+            else:
+                delta -= 6000.0
+                violations.append({
+                    "kind": kind,
+                    "anchor_title": anchor_title or "the requested anchor",
+                })
+        return delta, violations
 
     def _insert_best_position(
         self,
@@ -799,12 +973,18 @@ class ModuleCConstructorMixin:
         for index in range(len(timeline) + 1):
             previous_item = timeline[index - 1] if index > 0 else None
             next_item = timeline[index] if index < len(timeline) else None
+            previous_real_item = self._nearest_travel_required_before(timeline, index)
+            next_real_item = self._nearest_travel_required_after(timeline, index)
+            item_requires_travel = self._activity_requires_travel(item)
 
             gap_start = day_start if previous_item is None else previous_item["scheduled_end"]
             gap_end = day_end if next_item is None else next_item["scheduled_start"]
 
-            before_transition = self._transition_minutes(previous_item, item, min_travel)
-            after_transition = self._transition_minutes(item, next_item, min_travel)
+            before_transition = self._transition_minutes(previous_real_item, item, min_travel) if item_requires_travel else 0
+            if item_requires_travel:
+                after_transition = self._transition_minutes(item, next_item, min_travel) if self._activity_requires_travel(next_item) else 0
+            else:
+                after_transition = self._transition_minutes(previous_real_item, next_real_item, min_travel) if next_real_item else 0
 
             candidate_start = max(
                 gap_start + before_transition,
@@ -819,6 +999,25 @@ class ModuleCConstructorMixin:
                 and preferred_start + duration <= (item.get("latest_end") or day_end)
             ):
                 candidate_start = preferred_start
+            preferred_window_start = item.get("preferred_window_start")
+            preferred_window_end = item.get("preferred_window_end")
+            if (
+                preferred_window_start is not None
+                and candidate_start < preferred_window_start
+                and preferred_window_start + duration + after_transition <= gap_end
+                and preferred_window_start + duration <= (item.get("latest_end") or preferred_window_end or day_end)
+            ):
+                candidate_start = preferred_window_start
+            candidate_start = self._adjust_candidate_for_preferred_orders(
+                item,
+                timeline,
+                candidate_start,
+                duration,
+                gap_start,
+                gap_end,
+                before_transition,
+                after_transition,
+            )
             candidate_end = candidate_start + duration
 
             # Feasibility Checks
@@ -840,6 +1039,23 @@ class ModuleCConstructorMixin:
                 total_score += candidate_start
             if preferred_start is not None:
                 total_score -= abs(candidate_start - preferred_start) * 1.5
+            if preferred_window_start is not None or preferred_window_end is not None:
+                window_start = preferred_window_start if preferred_window_start is not None else day_start
+                window_end = preferred_window_end if preferred_window_end is not None else day_end
+                if candidate_start >= window_start and candidate_end <= window_end:
+                    total_score += 160
+                else:
+                    if candidate_start < window_start:
+                        total_score -= (window_start - candidate_start) * 4.0
+                    if candidate_end > window_end:
+                        total_score -= (candidate_end - window_end) * 4.0
+            order_delta, order_violations = self._preferred_order_score_adjustment(
+                item,
+                timeline,
+                candidate_start,
+                candidate_end,
+            )
+            total_score += order_delta
             
             if total_score > best_score:
                 best_score = total_score
@@ -848,13 +1064,55 @@ class ModuleCConstructorMixin:
                 candidate["scheduled_end"] = candidate_end
                 
                 if prefer_earliest and delay_minutes > 0:
-                    candidate["trace"].append(f"Placed with {delay_minutes}m delay from earliest possible start.")
+                    candidate.setdefault("trace", []).append(f"Placed with {delay_minutes}m delay from earliest possible start.")
+                if preferred_window_start is not None or preferred_window_end is not None:
+                    window_label = item.get("preferred_time_window") or "preferred window"
+                    candidate.setdefault("trace", []).append(f"Placed with awareness of the {window_label} preference.")
+                if order_violations:
+                    candidate["accepted_with_warning"] = True
+                    candidate["warning_code"] = "SOFT_PREFERENCE_UNMET"
+                    candidate.setdefault("warnings", [])
+                    for violation in order_violations:
+                        explanation = (
+                            f"{candidate.get('title')} could not fully satisfy the soft "
+                            f"{violation['kind']} {violation['anchor_title']} preference."
+                        )
+                        candidate["warnings"].append({
+                            "warning_code": "SOFT_PREFERENCE_UNMET",
+                            "activity_id": candidate.get("stable_activity_id") or candidate.get("id"),
+                            "activity_title": candidate.get("title"),
+                            "anchor_title": violation["anchor_title"],
+                            "start": format_clock(candidate_start),
+                            "end": format_clock(candidate_end),
+                            "explanation": explanation,
+                        })
+                        candidate.setdefault("trace", []).append(explanation)
                 
                 best_timeline = sorted(timeline + [candidate], key=lambda x: x["scheduled_start"])
 
         if best_timeline:
             return best_timeline, ""
         return None, failure_reason
+
+    def _nearest_travel_required_before(
+        self,
+        timeline: List[Dict[str, Any]],
+        insertion_index: int,
+    ) -> Optional[Dict[str, Any]]:
+        for candidate in reversed(timeline[:insertion_index]):
+            if self._activity_requires_travel(candidate):
+                return candidate
+        return None
+
+    def _nearest_travel_required_after(
+        self,
+        timeline: List[Dict[str, Any]],
+        insertion_index: int,
+    ) -> Optional[Dict[str, Any]]:
+        for candidate in timeline[insertion_index:]:
+            if self._activity_requires_travel(candidate):
+                return candidate
+        return None
 
     def _transition_minutes(
         self,
@@ -863,6 +1121,10 @@ class ModuleCConstructorMixin:
         min_travel: Optional[int],
     ) -> int:
         if left is None or right is None:
+            return 0
+        if not self._activity_requires_travel(left) or not self._activity_requires_travel(right):
+            return 0
+        if not left.get("location") or not right.get("location"):
             return 0
         travel = estimate_travel_minutes(left.get("location"), right.get("location"))
         travel = max(travel, min_travel or 0)

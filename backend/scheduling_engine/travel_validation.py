@@ -236,6 +236,8 @@ class TravelValidationMixin:
         block: Dict[str, Any],
         saved_locations: List[Dict[str, Any]],
     ) -> bool:
+        if not self._block_requires_travel_coordinate(block):
+            return False
         if self._embedded_activity_coordinate(block):
             return False
         saved = self.travel_service.confirmed_saved_location(
@@ -260,6 +262,20 @@ class TravelValidationMixin:
             }
         if status in {"needs_resolution", "fallback_used", "unresolved"}:
             return True
+        return True
+
+    def _block_requires_travel_coordinate(self, block: Dict[str, Any]) -> bool:
+        status = clean_title(block.get("location_status") or "")
+        category = clean_title(block.get("location_category") or "")
+        raw_travel_required = block.get("travel_required")
+        if raw_travel_required is False:
+            return False
+        if isinstance(raw_travel_required, str) and raw_travel_required.strip().lower() in {"0", "false", "no", "off"}:
+            return False
+        if status in {"not_required", "no_location_required"}:
+            return False
+        if category in {"home_or_online", "none"}:
+            return False
         return True
 
     def _affected_transitions_for_activity(
@@ -422,6 +438,7 @@ class TravelValidationMixin:
         activity_indices = [
             index for index, block in enumerate(blocks)
             if block.get("block_type") == "activity"
+            and self._block_requires_travel_coordinate(block)
         ]
         route_conflicts: List[Dict[str, Any]] = []
         warnings: List[Dict[str, Any]] = []
@@ -445,7 +462,15 @@ class TravelValidationMixin:
             right_start = parse_clock(right.get("start") or right.get("startTime") or "")
             if left_end is None or right_start is None:
                 continue
-            available_gap = max(0, right_start - left_end)
+            intermediate_activity_ends = [
+                parse_clock(block.get("end") or block.get("endTime") or "")
+                for block in blocks[left_index + 1:right_index]
+                if block.get("block_type") == "activity"
+            ]
+            route_gap_start = max(
+                [left_end] + [value for value in intermediate_activity_ends if value is not None]
+            )
+            available_gap = max(0, right_start - route_gap_start)
             time_bucket = f"{envelope.get('date')}T{format_clock(right_start)}"
             try:
                 self._debug(
@@ -500,7 +525,7 @@ class TravelValidationMixin:
                 })
                 continue
 
-            replacement_start = left_index + 1
+            replacement_start = right_index
             if transition_index is not None:
                 old_transition_start = parse_clock(transition.get("start") or transition.get("startTime") or "")
                 route_start = right_start - route_minutes

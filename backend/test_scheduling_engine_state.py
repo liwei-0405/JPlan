@@ -369,6 +369,26 @@ def _initial_envelope():
     )["schedule_data"]
 
 
+def _empty_envelope(date_value="2026-05-24"):
+    return {
+        "schema_version": 4,
+        "scheduleId": "empty-test",
+        "date": date_value,
+        "version": 1,
+        "status": "ok",
+        "schedule_status": "ok",
+        "planning_mode": "feasibility_first",
+        "allow_clash": False,
+        "accurate_travel_time": False,
+        "preferences": {"allow_clash": False, "accurate_travel_time": False},
+        "activities": [],
+        "schedule_blocks": [],
+        "explanations": [],
+        "conflicts": [],
+        "warnings": [],
+    }
+
+
 def _custom_envelope(operations):
     engine = SchedulingEngine(DummyClient())
     return engine.build_schedule_response(
@@ -1736,7 +1756,7 @@ def test_failed_anchor_postcondition_rejects_false_success_reply():
     assert result["applied"] is False
     assert result["conflict"]["type"] == "postcondition_failed"
     assert _activity_by_title(result["envelope"], "Seminar")["fixed_start"] == parse_clock("11:00")
-    assert _activity_by_title(result["envelope"], "FYP Implementation")["scheduled_start"] == parse_clock("14:05")
+    assert _activity_by_title(result["envelope"], "FYP Implementation")["scheduled_start"] == parse_clock("14:00")
     assert reply["reply_status"] == "conflict"
     assert "couldn't apply" in reply["reply"]
 
@@ -2345,8 +2365,10 @@ def test_busy_workday_location_mentions_are_scoped_to_nearest_activity():
     assert lunch["location"] == "school"
     assert lunch["location_category"] == "campus_area"
     assert lunch["location_source"] == "explicit_user"
-    assert fyp["location"] == "school"
-    assert fyp["location_category"] == "workplace"
+    assert fyp["location"] is None
+    assert fyp["location_category"] == "home_or_online"
+    assert fyp["location_status"] == "not_required"
+    assert fyp["travel_required"] is False
     assert grocery["location"] != "home"
     assert grocery["location"] != "office"
     assert grocery["location"] != "library"
@@ -2357,6 +2379,303 @@ def test_busy_workday_location_mentions_are_scoped_to_nearest_activity():
     assert gym["location"] != "library"
     assert grocery_block["location"] != "home"
     assert grocery_block["location_category"] == "supermarket"
+
+
+def _productive_day_request_text():
+    return (
+        "Can you help me plan a productive day for 24 May? I don't really have any fixed appointments that day, "
+        "but I have quite a lot of things I want to finish. I should spend around 3 hours on my FYP implementation, "
+        "and I would prefer to do that sometime after lunch when I can focus properly. I also want to review my "
+        "assignment for about an hour before doing the FYP work if possible. In the morning, I'm thinking of going "
+        "to the campus library to study for a while, maybe around 1 to 2 hours. After that, I might want to take a "
+        "short coffee break near campus. I also want to go to the gym for about an hour, preferably not too late. "
+        "Later in the day, I need to buy some groceries, and I also want to have dinner near home. At night, I "
+        "should call my parents and maybe spend a little time planning tomorrow. Try to arrange everything in a "
+        "way that does not feel too rushed, avoids unnecessary travel back and forth, and leaves some reasonable gaps."
+    )
+
+
+def _productive_day_parsed_request():
+    request_text = _productive_day_request_text()
+    return {
+        "intent": "add",
+        "reply": "Draft created.",
+        "transcription": request_text,
+        "date": "2026-05-24",
+        "preferences": {"allow_clash": False},
+        "operations": [
+            {"op": "add", "title": "Study at library", "timing_mode": "flexible", "duration_minutes": 120, "priority": "medium", "location": "library", "sequence_index": 1},
+            {"op": "add", "title": "Coffee break", "timing_mode": "relative", "duration_minutes": 30, "priority": "low", "anchor_relation": {"kind": "after", "target_title": "Study at library"}, "sequence_index": 2},
+            {"op": "add", "title": "Gym", "timing_mode": "flexible", "duration_minutes": 60, "priority": "medium", "sequence_index": 3},
+            {"op": "add", "title": "Review assignment", "timing_mode": "flexible", "duration_minutes": 60, "priority": "high", "location": "store", "sequence_index": 4},
+            {"op": "add", "title": "FYP implementation", "timing_mode": "relative", "duration_minutes": 180, "priority": "high", "anchor_relation": {"kind": "after", "target_title": "Review assignment"}, "sequence_index": 5},
+            {"op": "add", "title": "Buy groceries", "timing_mode": "flexible", "duration_minutes": 45, "priority": "medium", "sequence_index": 6},
+            {"op": "add", "title": "Dinner", "timing_mode": "flexible", "duration_minutes": 60, "priority": "medium", "location": "home", "sequence_index": 7},
+            {"op": "add", "title": "Call parents", "timing_mode": "flexible", "duration_minutes": 30, "priority": "high", "location": "store", "sequence_index": 8},
+            {"op": "add", "title": "Plan tomorrow", "timing_mode": "relative", "duration_minutes": 15, "priority": "low", "location": "store", "anchor_relation": {"kind": "after", "target_title": "Call parents"}, "sequence_index": 9},
+        ],
+    }
+
+
+def test_natural_productive_day_location_neutral_tasks_do_not_become_store():
+    engine = SchedulingEngine(DummyClient())
+    parsed = _productive_day_parsed_request()
+
+    envelope = engine.build_schedule_response(
+        parsed=parsed,
+        current_schedule=None,
+        latest_request=_productive_day_request_text(),
+    )["schedule_data"]
+
+    for title in ("Review assignment", "FYP implementation", "Call parents", "Plan tomorrow"):
+        activity = _activity_by_title(envelope, title)
+        assert activity["location"] is None
+        assert activity["location_category"] == "home_or_online"
+        assert activity["location_status"] == "not_required"
+        assert activity["travel_required"] is False
+
+    groceries = _activity_by_title(envelope, "Buy groceries")
+    assert groceries["location"] == "store"
+    assert groceries["location_category"] == "supermarket"
+    assert groceries["travel_required"] is True
+
+    dinner = _activity_by_title(envelope, "Dinner")
+    assert dinner["location_category"] == "meal_place"
+    assert dinner["area_preference"] == "near_home"
+    assert dinner["location"] is None
+
+
+def test_natural_productive_day_soft_preferences_and_night_window():
+    engine = SchedulingEngine(DummyClient())
+    parsed = _productive_day_parsed_request()
+
+    normalized = engine._normalize_parsed_locations(
+        parsed,
+        _productive_day_request_text(),
+        saved_locations=[],
+    )
+    operations_by_title = {operation["title"]: operation for operation in normalized["operations"]}
+
+    fyp = operations_by_title["FYP implementation"]
+    assert fyp.get("anchor_relation") is None
+    assert fyp["preferred_order"]["target_title"] == "Review assignment"
+    assert fyp["soft_dependency"] is True
+    assert fyp["preferred_time_window"] == "after_lunch"
+
+    call = operations_by_title["Call parents"]
+    assert call["preferred_time_window"] == "night"
+    assert call["preferred_window_start"] == parse_clock("8:00 PM")
+
+    plan = operations_by_title["Plan tomorrow"]
+    assert plan.get("anchor_relation") is None
+    assert plan["preferred_time_window"] == "night"
+    assert plan["preferred_window_start"] == parse_clock("8:00 PM")
+
+
+def test_natural_productive_day_adds_lunch_and_places_fyp_after_lunch():
+    engine = SchedulingEngine(DummyClient())
+    parsed = _productive_day_parsed_request()
+
+    envelope = engine.build_schedule_response(
+        parsed=parsed,
+        current_schedule=None,
+        latest_request=_productive_day_request_text(),
+    )["schedule_data"]
+
+    lunch = _activity_by_title(envelope, "Lunch Break")
+    fyp = _activity_by_title(envelope, "FYP implementation")
+    review = _activity_by_title(envelope, "Review assignment")
+
+    assert lunch["implicit_activity"] is True
+    assert lunch["preferred_time_window"] == "lunch"
+    assert parse_clock("12:00 PM") <= lunch["scheduled_start"] <= parse_clock("2:00 PM")
+    assert fyp["scheduled_start"] >= lunch["scheduled_end"]
+    assert fyp["scheduled_start"] >= parse_clock("12:00 PM")
+    assert review["scheduled_end"] <= fyp["scheduled_start"]
+    assert any(order["target_title"] == "Lunch Break" for order in fyp["preferred_orders"])
+    assert any(order["target_title"] == "Review assignment" for order in fyp["preferred_orders"])
+
+
+def test_implicit_lunch_not_duplicated_when_lunch_exists():
+    engine = SchedulingEngine(DummyClient())
+    request = (
+        "Plan 24 May. Lunch with my friend is at 1 PM. "
+        "I want to do FYP implementation sometime after lunch."
+    )
+    parsed = {
+        "intent": "add",
+        "reply": "Draft created.",
+        "transcription": request,
+        "date": "2026-05-24",
+        "preferences": {"allow_clash": False},
+        "operations": [
+            {"op": "add", "title": "Lunch with my friend", "timing_mode": "fixed", "fixed_start": "13:00", "duration_minutes": 60, "priority": "medium"},
+            {"op": "add", "title": "FYP implementation", "timing_mode": "flexible", "duration_minutes": 180, "priority": "high"},
+            {"op": "add", "title": "Assignment review", "timing_mode": "flexible", "duration_minutes": 60, "priority": "medium"},
+        ],
+    }
+
+    envelope = engine.build_schedule_response(
+        parsed=parsed,
+        current_schedule=None,
+        latest_request=request,
+    )["schedule_data"]
+
+    lunch_titles = [activity["title"] for activity in envelope["activities"] if "lunch" in activity["title"].lower()]
+    assert lunch_titles == ["Lunch with my friend"]
+
+
+def test_before_lunch_adds_lunch_and_prefers_activity_before_it():
+    engine = SchedulingEngine(DummyClient())
+    request = "Plan 24 May. I want to review my assignment before lunch if possible, then go to the gym."
+    parsed = {
+        "intent": "add",
+        "reply": "Draft created.",
+        "transcription": request,
+        "date": "2026-05-24",
+        "preferences": {"allow_clash": False},
+        "operations": [
+            {"op": "add", "title": "Review assignment", "timing_mode": "flexible", "duration_minutes": 60, "priority": "high"},
+            {"op": "add", "title": "Gym", "timing_mode": "flexible", "duration_minutes": 60, "priority": "medium"},
+        ],
+    }
+
+    envelope = engine.build_schedule_response(
+        parsed=parsed,
+        current_schedule=None,
+        latest_request=request,
+    )["schedule_data"]
+
+    lunch = _activity_by_title(envelope, "Lunch Break")
+    review = _activity_by_title(envelope, "Review assignment")
+    assert review["scheduled_end"] <= lunch["scheduled_start"]
+    assert review["preferred_order"]["kind"] == "before"
+    assert review["preferred_order"]["target_title"] == "Lunch Break"
+
+
+def test_simple_edit_after_lunch_does_not_infer_new_lunch():
+    engine = SchedulingEngine(DummyClient())
+    envelope = _custom_envelope([
+        {"op": "add", "title": "Gym", "timing_mode": "flexible", "duration_minutes": 60},
+        {"op": "add", "title": "Study", "timing_mode": "flexible", "duration_minutes": 60},
+    ])
+
+    result = engine.apply_operations(
+        envelope=envelope,
+        operations=[{
+            "op": "update",
+            "title": "Gym",
+            "target_title": "Gym",
+            "timing_mode": "relative",
+            "anchor_relation": {"kind": "after", "target_title": "Lunch"},
+            "_user_message": "move gym after lunch",
+            "_router_route": "simple_schedule_command",
+        }],
+        base_version=envelope["version"],
+    )
+
+    assert result["status"] == "clarification_needed"
+    assert all(activity["title"] != "Lunch Break" for activity in result["activities"])
+
+
+def test_natural_productive_day_generates_partial_instead_of_full_rejection():
+    engine = SchedulingEngine(DummyClient())
+    parsed = _productive_day_parsed_request()
+
+    envelope = engine.build_schedule_response(
+        parsed=parsed,
+        current_schedule=None,
+        latest_request=_productive_day_request_text(),
+    )["schedule_data"]
+
+    assert envelope["status"] in {"ok", "warning", "partial"}
+    assert len(envelope["activities"]) >= 7
+    assert "kept unchanged" not in " ".join(envelope.get("explanations") or []).lower()
+    fyp = _activity_by_title(envelope, "FYP implementation")
+    assert fyp["scheduled_start"] >= parse_clock("12:00 PM")
+    call = _activity_by_title(envelope, "Call parents")
+    assert call["scheduled_start"] >= parse_clock("8:00 PM")
+    plan = _activity_by_title(envelope, "Plan tomorrow")
+    assert plan["scheduled_start"] >= parse_clock("8:00 PM")
+
+
+def test_natural_productive_day_module_d_scans_movable_candidates(capsys):
+    engine = SchedulingEngine(DummyClient())
+    parsed = _productive_day_parsed_request()
+    capsys.readouterr()
+
+    envelope = engine.build_schedule_response(
+        parsed=parsed,
+        current_schedule=None,
+        latest_request=_productive_day_request_text(),
+    )["schedule_data"]
+    logs = capsys.readouterr().out
+
+    assert envelope["preferences"]["refinement_reason"] == "initial_generation"
+    assert "[JPLAN][MODULE_D][START] reason=initial_generation" in logs
+    assert "[JPLAN][MODULE_D][CANDIDATE_SCAN]" in logs
+    assert "movable=true" in logs
+    assert "[JPLAN][MODULE_D][NO_CANDIDATE] reason=all_movable_items_protected" not in logs
+
+
+def test_apply_operations_scans_original_request_for_natural_preferences(capsys):
+    engine = SchedulingEngine(DummyClient())
+    request = _productive_day_request_text()
+    envelope = _empty_envelope("2026-05-24")
+    envelope["preferences"]["module_0_route"] = "complex_schedule_command"
+    operations = [
+        {"op": "add", "title": "Library Study", "timing_mode": "flexible", "duration_minutes": 90, "priority": "medium", "location": "library", "location_status": "fallback_used", "raw_llm_location": "library", "travel_required": True},
+        {"op": "add", "title": "Coffee Break", "timing_mode": "relative", "duration_minutes": 15, "priority": "low", "anchor_relation": {"kind": "after", "target_title": "Library Study"}, "location": None, "location_category": "meal_place", "location_status": "needs_resolution", "raw_llm_location": None, "travel_required": True},
+        {"op": "add", "title": "Gym", "timing_mode": "flexible", "duration_minutes": 60, "priority": "medium", "location": "gym", "location_status": "resolved_default", "raw_llm_location": None, "travel_required": True},
+        {"op": "add", "title": "Assignment Review", "timing_mode": "flexible", "duration_minutes": 60, "priority": "high", "location": None, "location_category": "home_or_online", "location_status": "not_required", "raw_llm_location": None, "travel_required": False},
+        {"op": "add", "title": "FYP Implementation", "timing_mode": "relative", "duration_minutes": 180, "priority": "high", "anchor_relation": {"kind": "after", "target_title": "Assignment Review"}, "location": None, "location_category": "home_or_online", "location_status": "not_required", "raw_llm_location": None, "travel_required": False},
+        {"op": "add", "title": "Grocery Shopping", "timing_mode": "flexible", "duration_minutes": 45, "priority": "medium", "location": "store", "location_status": "needs_resolution", "raw_llm_location": None, "travel_required": True},
+        {"op": "add", "title": "Dinner", "timing_mode": "flexible", "duration_minutes": 60, "priority": "medium", "location": None, "location_category": "meal_place", "location_status": "needs_resolution", "raw_llm_location": "home", "travel_required": True},
+        {"op": "add", "title": "Call Parents", "timing_mode": "flexible", "duration_minutes": 30, "priority": "high", "location": None, "location_category": "home_or_online", "location_status": "not_required", "raw_llm_location": None, "travel_required": False},
+        {"op": "add", "title": "Plan Tomorrow", "timing_mode": "flexible", "duration_minutes": 15, "priority": "low", "preferred_time_window": "night", "preferred_window_start": 1200, "preferred_window_end": 1320, "location": None, "location_category": "home_or_online", "location_status": "not_required", "raw_llm_location": None, "travel_required": False},
+    ]
+
+    capsys.readouterr()
+    result = engine.apply_operations(
+        envelope=envelope,
+        operations=[
+            {
+                **operation,
+                "_user_message": "Plan a productive day with FYP, dinner, call parents, and planning tomorrow.",
+                "_latest_request": request,
+                "_router_route": "complex_schedule_command",
+                "_router_reason": "multi_activity_generation",
+            }
+            for operation in operations
+        ],
+        base_version=envelope["version"],
+    )
+    logs = capsys.readouterr().out
+
+    updated = result["envelope"]
+    lunch = _activity_by_title(updated, "Lunch Break")
+    fyp = _activity_by_title(updated, "FYP Implementation")
+    dinner = _activity_by_title(updated, "Dinner")
+    call = _activity_by_title(updated, "Call Parents")
+    plan = _activity_by_title(updated, "Plan Tomorrow")
+
+    assert lunch["implicit_activity"] is True
+    assert "[JPLAN][IMPLICIT_LUNCH][DETECT] found=true" in logs
+    assert "[JPLAN][IMPLICIT_LUNCH][CHECK] existing_lunch=false existing_meal_dinner_ignored=true" in logs
+    assert "[JPLAN][IMPLICIT_LUNCH][ADD] title=Lunch Break window=12:00 PM-02:00 PM" in logs
+    assert "[JPLAN][NORMALIZED_OPS] count=10" in logs
+    assert "[JPLAN][SOFT_PREF] FYP Implementation preferred_window=after_lunch preferred_order=after Lunch Break" in logs
+    assert "[JPLAN][SOFT_PREF] Call Parents preferred_window=night" in logs
+    assert fyp["preferred_time_window"] == "after_lunch"
+    assert any(order["target_title"] == "Lunch Break" for order in fyp["preferred_orders"])
+    assert fyp["scheduled_start"] >= lunch["scheduled_end"]
+    assert dinner["preferred_time_window"] == "evening"
+    assert dinner["scheduled_start"] >= parse_clock("6:00 PM")
+    assert dinner["area_preference"] == "near_home"
+    assert call["preferred_time_window"] == "night"
+    assert call["scheduled_start"] >= parse_clock("8:00 PM")
+    assert plan["preferred_time_window"] == "night"
+    assert plan["scheduled_start"] >= parse_clock("8:00 PM")
 
 
 def test_location_normalizer_does_not_leak_library_to_meeting():
@@ -2554,6 +2873,45 @@ def test_accurate_travel_with_saved_coordinates_uses_route_service():
     assert envelope["travel_validation_status"] == "validated"
     assert transition["travel_estimate_source"] == "routing_service"
     assert transition["route_duration_minutes"] == 18
+    assert fake_travel.route_calls == 1
+
+
+def test_accurate_travel_skips_location_neutral_tasks_and_bridges_real_locations():
+    fake_travel = FakeTravelService(route_minutes=12)
+    engine = SchedulingEngine(DummyClient(), travel_service=fake_travel)
+    parsed = {
+        "intent": "add",
+        "reply": "Draft created.",
+        "transcription": "Study at Library, then review assignment, then go to gym.",
+        "date": "2026-05-02",
+        "preferences": {"accurate_travel_time": True},
+        "operations": [
+            {"op": "add", "title": "Study at library", "timing_mode": TimingMode.FIXED, "fixed_start": "09:00", "duration_minutes": 60, "location": "library"},
+            {"op": "add", "title": "Review assignment", "timing_mode": TimingMode.FIXED, "fixed_start": "10:00", "duration_minutes": 30},
+            {"op": "add", "title": "Gym", "timing_mode": TimingMode.FIXED, "fixed_start": "11:00", "duration_minutes": 60, "location": "gym"},
+        ],
+    }
+    saved_locations = [
+        {"label": "library", "address": "Library", "latitude": 2.91, "longitude": 101.61},
+        {"label": "gym", "address": "Gym", "latitude": 2.92, "longitude": 101.62},
+    ]
+
+    envelope = engine.build_schedule_response(
+        parsed,
+        None,
+        "Study at Library, then review assignment, then go to gym.",
+        saved_locations=saved_locations,
+    )["schedule_data"]
+    review = _activity_by_title(envelope, "Review assignment")
+    transition = next(block for block in envelope["schedule_blocks"] if block.get("block_type") == "transition")
+
+    assert review["location_status"] == "not_required"
+    assert review["travel_required"] is False
+    assert envelope["location_resolution_requests"] == []
+    assert envelope["travel_validation_status"] == "validated"
+    assert transition["from_location"] == "library"
+    assert transition["to_location"] == "gym"
+    assert transition["route_duration_minutes"] == 12
     assert fake_travel.route_calls == 1
 
 
@@ -3442,6 +3800,354 @@ def test_soft_adjustment_result_is_not_silent_success_when_unchanged():
         assert result["applied"] is False
 
 
+def test_module_d_complex_generation_runs_and_preserves_fixed_events():
+    envelope = _initial_envelope()
+
+    assert envelope["preferences"]["refinement_reason"] == "initial_generation"
+    assert envelope["refinement_skipped_reason"] is None
+    assert envelope["refinement_iterations"] >= 0
+    assert {activity["title"] for activity in envelope["activities"]} >= {
+        "Project Meeting",
+        "Seminar",
+        "Lunch",
+        "FYP Implementation",
+        "Grocery Shopping",
+        "Gym Workout",
+    }
+    assert _activity_by_title(envelope, "Project Meeting")["startTime"] == "09:00 AM"
+    assert _activity_by_title(envelope, "Seminar")["startTime"] == "11:00 AM"
+    assert _activity_by_title(envelope, "Lunch")["startTime"] == "01:00 PM"
+
+
+def test_module_d_apply_path_empty_current_complex_generation_runs(capsys):
+    engine = SchedulingEngine(DummyClient())
+    operations = [
+        {
+            **operation,
+            "_user_message": "Can you help me plan a productive day for 24 May?",
+            "_router_route": "complex_schedule_command",
+            "_router_reason": "multi_activity_generation",
+        }
+        for operation in _initial_parsed_request()["operations"]
+    ]
+    capsys.readouterr()
+
+    result = engine.apply_operations(
+        envelope=_empty_envelope("2026-05-24"),
+        operations=operations,
+        base_version=1,
+        new_date="2026-05-24",
+    )
+    logs = capsys.readouterr().out
+
+    assert result["status"] == "success"
+    assert result["envelope"]["preferences"]["refinement_reason"] == "initial_generation"
+    assert result["envelope"]["refinement_skipped_reason"] is None
+    assert "[JPLAN][MODULE_D][POLICY] route=complex_schedule_command add_ops=6 active_before=0 is_apply_operations=true reason=initial_generation" in logs
+    assert "[JPLAN][MODULE_D][START] reason=initial_generation" in logs
+
+
+def test_module_d_simple_edits_skip_refinement(capsys):
+    engine = SchedulingEngine(DummyClient())
+    envelope = _initial_envelope()
+    capsys.readouterr()
+
+    result = engine.apply_operations(
+        envelope=envelope,
+        operations=[{"op": "remove", "title": "Gym Workout", "_user_message": "remove gym"}],
+        base_version=envelope["version"],
+    )
+    logs = capsys.readouterr().out
+
+    assert result["status"] == "success"
+    assert result["envelope"]["preferences"]["refinement_reason"] == "skipped_simple_edit"
+    assert result["envelope"]["refinement_skipped_reason"] == "simple_edit"
+    assert "[JPLAN][MODULE_D][SKIP] reason=simple_edit" in logs
+    assert "[JPLAN][MODULE_D][START]" not in logs
+
+
+def test_module_d_fixed_time_move_skips_refinement_even_when_conflicting(capsys):
+    engine = SchedulingEngine(DummyClient())
+    envelope = _initial_envelope()
+    capsys.readouterr()
+
+    result = engine.apply_operations(
+        envelope=envelope,
+        operations=[{
+            "op": "update",
+            "title": "Lunch",
+            "timing_mode": TimingMode.FIXED,
+            "fixed_start": "12:00",
+            "_user_message": "move lunch to 12pm",
+            "_router_route": "simple_schedule_command",
+        }],
+        base_version=envelope["version"],
+    )
+    logs = capsys.readouterr().out
+
+    assert result["status"] in {"conflict", "no_operation"}
+    assert "[JPLAN][MODULE_D][POLICY] route=simple_schedule_command add_ops=0 active_before=6 is_apply_operations=true reason=skipped_simple_edit" in logs
+    assert "[JPLAN][MODULE_D][SKIP] reason=simple_edit" in logs
+    assert "[JPLAN][MODULE_D][START]" not in logs
+
+
+def test_module_d_relative_add_on_existing_schedule_skips_refinement(capsys):
+    engine = SchedulingEngine(DummyClient())
+    envelope = _evening_schedule_envelope()
+    capsys.readouterr()
+
+    result = engine.apply_operations(
+        envelope=envelope,
+        operations=[{
+            **_dinner_after_grocery_operation(),
+            "_user_message": "add dinner after shopping",
+            "_router_route": "simple_schedule_command",
+        }],
+        base_version=envelope["version"],
+    )
+    logs = capsys.readouterr().out
+
+    assert result["status"] == "success"
+    assert result["envelope"]["preferences"]["refinement_reason"] == "skipped_simple_edit"
+    assert result["envelope"]["refinement_skipped_reason"] == "simple_edit"
+    assert "[JPLAN][MODULE_D][SKIP] reason=simple_edit" in logs
+    assert "[JPLAN][MODULE_D][START]" not in logs
+
+
+def test_module_d_priority_noop_does_not_run_refinement(capsys):
+    engine = SchedulingEngine(DummyClient())
+    envelope = _initial_envelope()
+    capsys.readouterr()
+
+    result = engine.apply_operations(
+        envelope=envelope,
+        operations=[{
+            "op": "update",
+            "title": "FYP Implementation",
+            "priority": "high",
+            "priority_update_only": True,
+            "_user_message": "set FYP implementation priority high",
+        }],
+        base_version=envelope["version"],
+    )
+    logs = capsys.readouterr().out
+
+    assert result["status"] == "no_operation"
+    assert result["reply_reason"] == "priority_already_set"
+    assert "[JPLAN][MODULE_D][START]" not in logs
+
+
+def test_module_d_disabled_by_preference_skips():
+    engine = SchedulingEngine(DummyClient())
+    parsed = _initial_parsed_request()
+    parsed["preferences"] = {"allow_clash": False, "enable_refinement": False}
+
+    envelope = engine.build_schedule_response(
+        parsed=parsed,
+        current_schedule=None,
+        latest_request="Generate a busy workday for me.",
+    )["schedule_data"]
+
+    assert envelope["preferences"]["refinement_reason"] == "disabled_by_preference"
+    assert envelope["refinement_applied"] is False
+    assert envelope["refinement_skipped_reason"] == "disabled_by_preference"
+
+
+def test_module_d_safe_relocation_accepts_score_improvement():
+    engine = SchedulingEngine(DummyClient())
+    timeline = [
+        {
+            "id": "act-meeting",
+            "stable_activity_id": "act-meeting",
+            "title": "Project Meeting",
+            "timing_mode": TimingMode.FIXED,
+            "fixed_start": parse_clock("9:00 AM"),
+            "scheduled_start": parse_clock("9:00 AM"),
+            "scheduled_end": parse_clock("10:00 AM"),
+            "duration_minutes": 60,
+            "priority": "high",
+            "is_mandatory": True,
+            "trace": [],
+        },
+        {
+            "id": "act-focus",
+            "stable_activity_id": "act-focus",
+            "title": "FYP Implementation",
+            "timing_mode": TimingMode.PREFERRED,
+            "preferred_start": parse_clock("10:00 AM"),
+            "scheduled_start": parse_clock("3:00 PM"),
+            "scheduled_end": parse_clock("4:00 PM"),
+            "duration_minutes": 60,
+            "priority": "medium",
+            "is_mandatory": True,
+            "trace": [],
+        },
+        {
+            "id": "act-seminar",
+            "stable_activity_id": "act-seminar",
+            "title": "Seminar",
+            "timing_mode": TimingMode.FIXED,
+            "fixed_start": parse_clock("5:00 PM"),
+            "scheduled_start": parse_clock("5:00 PM"),
+            "scheduled_end": parse_clock("6:00 PM"),
+            "duration_minutes": 60,
+            "priority": "high",
+            "is_mandatory": True,
+            "trace": [],
+        },
+    ]
+
+    refined, unscheduled, meta = engine._apply_module_d_refinement(
+        timeline,
+        [],
+        parse_clock("8:00 AM"),
+        parse_clock("10:00 PM"),
+        0,
+        {"refinement_reason": "initial_generation"},
+    )
+    focus = next(item for item in refined if item["title"] == "FYP Implementation")
+
+    assert unscheduled == []
+    assert meta["refinement_applied"] is True
+    assert meta["refinement_accepted_moves"]
+    assert focus["scheduled_start"] < parse_clock("3:00 PM")
+    assert "Adjusted by Module D refinement" in " ".join(focus["trace"])
+
+
+def test_module_d_score_threshold_rejects_candidate(monkeypatch):
+    import scheduling_engine.module_d_refinement as module_d_refinement
+
+    monkeypatch.setattr(module_d_refinement, "MODULE_D_MIN_IMPROVEMENT", 99999)
+    engine = SchedulingEngine(DummyClient())
+    timeline = [
+        {
+            "id": "act-meeting",
+            "stable_activity_id": "act-meeting",
+            "title": "Project Meeting",
+            "timing_mode": TimingMode.FIXED,
+            "fixed_start": parse_clock("9:00 AM"),
+            "scheduled_start": parse_clock("9:00 AM"),
+            "scheduled_end": parse_clock("10:00 AM"),
+            "duration_minutes": 60,
+            "priority": "high",
+            "is_mandatory": True,
+            "trace": [],
+        },
+        {
+            "id": "act-focus",
+            "stable_activity_id": "act-focus",
+            "title": "FYP Implementation",
+            "timing_mode": TimingMode.PREFERRED,
+            "preferred_start": parse_clock("10:00 AM"),
+            "scheduled_start": parse_clock("3:00 PM"),
+            "scheduled_end": parse_clock("4:00 PM"),
+            "duration_minutes": 60,
+            "priority": "medium",
+            "is_mandatory": True,
+            "trace": [],
+        },
+    ]
+
+    refined, _, meta = engine._apply_module_d_refinement(
+        timeline,
+        [],
+        parse_clock("8:00 AM"),
+        parse_clock("10:00 PM"),
+        0,
+        {"refinement_reason": "initial_generation"},
+    )
+    focus = next(item for item in refined if item["title"] == "FYP Implementation")
+
+    assert meta["refinement_applied"] is False
+    assert focus["scheduled_start"] == parse_clock("3:00 PM")
+
+
+def test_module_d_preserves_dependency_order():
+    engine = SchedulingEngine(DummyClient())
+    parsed = {
+        "intent": "schedule",
+        "reply": "Draft created.",
+        "transcription": "Generate schedule with dependency order.",
+        "date": "2026-05-02",
+        "preferences": {"allow_clash": False},
+        "operations": [
+            {"op": "add", "title": "Lunch", "timing_mode": TimingMode.FIXED, "fixed_start": "13:00", "duration_minutes": 60},
+            {"op": "add", "title": "FYP Implementation", "timing_mode": TimingMode.RELATIVE, "anchor_relation": {"kind": "after", "target_title": "Lunch"}, "duration_minutes": 90},
+            {"op": "add", "title": "Grocery Shopping", "duration_minutes": 45, "location": "store"},
+            {"op": "add", "title": "Dinner", "timing_mode": TimingMode.RELATIVE, "anchor_relation": {"kind": "after", "target_title": "Grocery Shopping"}, "duration_minutes": 60},
+        ],
+    }
+
+    envelope = engine.build_schedule_response(
+        parsed=parsed,
+        current_schedule=None,
+        latest_request="Generate schedule with dependency order.",
+    )["schedule_data"]
+
+    lunch = _activity_by_title(envelope, "Lunch")
+    fyp = _activity_by_title(envelope, "FYP Implementation")
+    grocery = _activity_by_title(envelope, "Grocery Shopping")
+    dinner = _activity_by_title(envelope, "Dinner")
+    assert parse_clock(fyp["startTime"]) >= parse_clock(lunch["endTime"])
+    assert parse_clock(dinner["startTime"]) >= parse_clock(grocery["endTime"])
+
+
+def test_module_d_optimize_request_uses_fast_path_and_runs_refinement():
+    engine = SchedulingEngine(DummyClient())
+    envelope = _initial_envelope()
+
+    parsed = engine.parse_deterministic_fast_path(
+        "optimize my schedule",
+        current_schedule=envelope,
+        history=[],
+        saved_locations=[],
+    )
+    result = engine.apply_operations(
+        envelope=envelope,
+        operations=[{**parsed["operations"][0], "_user_message": "optimize my schedule"}],
+        base_version=envelope["version"],
+    )
+
+    assert parsed["operations"][0]["op"] == "optimize_schedule"
+    if result["status"] == "success":
+        assert result["envelope"]["preferences"]["refinement_reason"] == "explicit_optimize"
+        assert result["envelope"]["refinement_skipped_reason"] is None
+    else:
+        assert result["reply_reason"] == "no_safe_refinement"
+        assert result["planned_result"]["refinement_skipped_reason"] is None
+
+
+def test_module_d_direct_refinement_does_not_call_ors():
+    service = FakeTravelService(route_error=AssertionError("Module D must not call ORS"))
+    engine = SchedulingEngine(DummyClient(), travel_service=service)
+    timeline = [
+        {
+            "id": "act-focus",
+            "stable_activity_id": "act-focus",
+            "title": "FYP Implementation",
+            "timing_mode": TimingMode.PREFERRED,
+            "preferred_start": parse_clock("10:00 AM"),
+            "scheduled_start": parse_clock("3:00 PM"),
+            "scheduled_end": parse_clock("4:00 PM"),
+            "duration_minutes": 60,
+            "priority": "medium",
+            "is_mandatory": True,
+            "trace": [],
+        },
+    ]
+
+    engine._apply_module_d_refinement(
+        timeline,
+        [],
+        parse_clock("8:00 AM"),
+        parse_clock("10:00 PM"),
+        0,
+        {"refinement_reason": "initial_generation"},
+    )
+
+    assert service.route_calls == 0
+
+
 def test_deterministic_fast_path_whole_plan_pronoun_earlier_clarifies():
     engine = SchedulingEngine(DummyClient())
     parsed = engine.parse_deterministic_fast_path(
@@ -3518,7 +4224,7 @@ def test_planning_advice_503_uses_contextual_fallback_without_raw_error(capsys):
     assert reply["reply_source"] == "template"
     assert "503" not in reply["reply"]
     assert "UNAVAILABLE" not in reply["reply"]
-    assert "FYP Implementation is currently scheduled from 02:05 PM to 05:05 PM" in reply["reply"]
+    assert "FYP Implementation is currently scheduled from 02:00 PM to 05:00 PM" in reply["reply"]
     assert "move FYP Implementation to tomorrow" in reply["reply"]
     assert repr(envelope) == before
     assert "[JPLAN][ADVICE][FALLBACK] reason=llm_unavailable target=FYP Implementation" in logs
@@ -3543,7 +4249,7 @@ def test_planning_advice_timeout_uses_contextual_fallback(monkeypatch):
     assert reply["reply_status"] == "advice"
     assert reply["reply_source"] == "template"
     assert reply["llm_fallback_reason"] == "timeout"
-    assert "FYP Implementation is currently scheduled from 02:05 PM to 05:05 PM" in reply["reply"]
+    assert "FYP Implementation is currently scheduled from 02:00 PM to 05:00 PM" in reply["reply"]
 
 
 def test_planning_advice_fallback_without_target_is_generic_and_safe():
