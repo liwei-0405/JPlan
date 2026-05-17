@@ -2809,7 +2809,7 @@ def test_accurate_travel_off_keeps_heuristic_without_location_pending():
     assert envelope["status"] != "location_pending"
 
 
-def test_accurate_travel_on_missing_location_returns_location_pending_with_candidates():
+def test_accurate_travel_on_missing_location_returns_location_pending_without_background_geocode():
     fake_travel = FakeTravelService(geocode_candidates=[
         {
             "display_name": "Supermarket Cyberjaya",
@@ -2839,8 +2839,11 @@ def test_accurate_travel_on_missing_location_returns_location_pending_with_candi
     request = envelope["location_resolution_requests"][0]
     assert request["title"] == "Grocery Shopping"
     assert request["category"] == "supermarket"
-    assert request["geocode_candidates"][0]["display_name"] == "Supermarket Cyberjaya"
-    assert fake_travel.geocode_calls >= 1
+    assert request["location_readiness_status"] == "missing_coordinates"
+    assert request["display_reason"] == "needs exact map location"
+    assert request["geocode_candidates"] == []
+    assert fake_travel.geocode_calls == 0
+    assert fake_travel.route_calls == 0
 
 
 def test_accurate_travel_with_saved_coordinates_uses_route_service():
@@ -2874,6 +2877,81 @@ def test_accurate_travel_with_saved_coordinates_uses_route_service():
     assert transition["travel_estimate_source"] == "routing_service"
     assert transition["route_duration_minutes"] == 18
     assert fake_travel.route_calls == 1
+
+
+def test_accurate_travel_requires_coordinates_not_location_labels_only():
+    fake_travel = FakeTravelService()
+    engine = SchedulingEngine(DummyClient(), travel_service=fake_travel)
+    parsed = {
+        "intent": "add",
+        "reply": "Draft created.",
+        "transcription": "Client meeting at Bangsar followed by dinner at Cheras.",
+        "date": "2026-05-02",
+        "preferences": {"accurate_travel_time": True},
+        "operations": [
+            {"op": "add", "title": "Client Meeting", "timing_mode": TimingMode.FIXED, "fixed_start": "09:00", "duration_minutes": 60, "location": "Bangsar"},
+            {"op": "add", "title": "Dinner", "timing_mode": TimingMode.FIXED, "fixed_start": "11:00", "duration_minutes": 60, "location": "Cheras"},
+        ],
+    }
+    saved_locations = [
+        {"label": "Bangsar", "address": "Bangsar, Kuala Lumpur"},
+        {"label": "Cheras", "address": "Cheras, Kuala Lumpur"},
+    ]
+
+    envelope = engine.build_schedule_response(
+        parsed,
+        None,
+        "Client meeting at Bangsar followed by dinner at Cheras.",
+        saved_locations=saved_locations,
+    )["schedule_data"]
+
+    assert envelope["travel_validation_status"] == "pending_locations"
+    assert envelope["location_resolution_requests"]
+    missing_titles = {request["title"] for request in envelope["location_resolution_requests"]}
+    assert "Client Meeting" in missing_titles
+    assert "Dinner" in missing_titles
+    assert fake_travel.route_calls == 0
+
+
+def test_accurate_travel_readiness_excludes_location_neutral_tasks_and_keeps_physical_missing():
+    fake_travel = FakeTravelService()
+    engine = SchedulingEngine(DummyClient(), travel_service=fake_travel)
+    parsed = {
+        "intent": "add",
+        "reply": "Draft created.",
+        "transcription": (
+            "Client meeting at Mid Valley, deep work, team lunch at Bangsar, "
+            "dentist near Cheras, grocery run, and dinner with parents."
+        ),
+        "date": "2026-05-02",
+        "preferences": {"accurate_travel_time": True},
+        "operations": [
+            {"op": "add", "title": "Client Meeting", "timing_mode": TimingMode.FIXED, "fixed_start": "09:00", "duration_minutes": 60, "location": "Mid Valley"},
+            {"op": "add", "title": "Deep Work", "timing_mode": TimingMode.FIXED, "fixed_start": "10:30", "duration_minutes": 60},
+            {"op": "add", "title": "Team Lunch", "timing_mode": TimingMode.FIXED, "fixed_start": "12:00", "duration_minutes": 60, "location": "Bangsar"},
+            {"op": "add", "title": "Dentist Appointment", "timing_mode": TimingMode.FIXED, "fixed_start": "14:00", "duration_minutes": 60, "location": "Cheras"},
+            {"op": "add", "title": "Grocery Run", "timing_mode": TimingMode.FIXED, "fixed_start": "16:00", "duration_minutes": 45},
+            {"op": "add", "title": "Dinner with Parents", "timing_mode": TimingMode.FIXED, "fixed_start": "18:00", "duration_minutes": 60},
+        ],
+    }
+
+    envelope = engine.build_schedule_response(
+        parsed,
+        None,
+        parsed["transcription"],
+    )["schedule_data"]
+
+    missing_titles = {request["title"] for request in envelope["location_resolution_requests"]}
+    assert envelope["travel_validation_status"] == "pending_locations"
+    assert "Client Meeting" in missing_titles
+    assert "Team Lunch" in missing_titles
+    assert "Dentist Appointment" in missing_titles
+    assert "Grocery Run" in missing_titles
+    assert "Dinner with Parents" in missing_titles
+    assert "Deep Work" not in missing_titles
+    assert _activity_by_title(envelope, "Deep Work")["travel_required"] is False
+    assert fake_travel.geocode_calls == 0
+    assert fake_travel.route_calls == 0
 
 
 def test_accurate_travel_skips_location_neutral_tasks_and_bridges_real_locations():
@@ -3151,10 +3229,12 @@ def test_accurate_route_duration_retimes_transition_and_creates_idle_slack():
     travel = next(block for block in envelope["schedule_blocks"] if block.get("block_type") == "transition")
     new_idle = next(
         block for block in envelope["schedule_blocks"]
-        if block.get("block_type") == "idle" and block.get("start") == "10:40 AM"
+        if block.get("block_type") == "idle" and block.get("start") == "10:30 AM"
     )
     seminar = next(block for block in envelope["schedule_blocks"] if block.get("title") == "Seminar")
 
+    assert sum(1 for block in envelope["schedule_blocks"] if block.get("block_type") == "transition") == 1
+    assert not any(block.get("block_type") == "buffer" for block in envelope["schedule_blocks"])
     assert travel["start"] == "10:56 AM"
     assert travel["end"] == "11:00 AM"
     assert travel["duration_minutes"] == 4
@@ -3163,7 +3243,7 @@ def test_accurate_route_duration_retimes_transition_and_creates_idle_slack():
     assert travel["travel_estimate_source"] == "routing_service"
     assert travel["travel_validation_status"] == "validated"
     assert new_idle["end"] == "10:56 AM"
-    assert new_idle["duration_minutes"] == 16
+    assert new_idle["duration_minutes"] == 26
     assert seminar["start"] == "11:00 AM"
     assert envelope["travel_validation_status"] == "validated"
     assert envelope["location_resolution_requests"] == []
@@ -3171,6 +3251,186 @@ def test_accurate_route_duration_retimes_transition_and_creates_idle_slack():
     assert "Accurate travel time has been validated using the routing service." in envelope["explanations"]
     assert all(activity.get("resolved_location") for activity in envelope["activities"])
     assert all(activity.get("location_status") == "resolved" for activity in envelope["activities"])
+
+
+def test_accurate_route_longer_duration_replaces_stale_support_segment():
+    fake_travel = FakeTravelService(route_minutes=30)
+    engine = SchedulingEngine(DummyClient(), travel_service=fake_travel)
+    pending_envelope = {
+        "date": "2026-05-02",
+        "status": "ok",
+        "schedule_status": "ok",
+        "travel_validation_status": "not_requested",
+        "accurate_travel_time": True,
+        "preferences": {"accurate_travel_time": True},
+        "activities": [],
+        "schedule_blocks": [
+            {
+                "block_type": "activity",
+                "id": "lunch",
+                "stable_activity_id": "lunch",
+                "title": "Team lunch",
+                "start": "12:30 PM",
+                "end": "01:30 PM",
+                "startTime": "12:30 PM",
+                "endTime": "01:30 PM",
+                "location": "Bangsar",
+                "location_label": "Bangsar",
+            },
+            {
+                "block_type": "activity",
+                "id": "deep",
+                "stable_activity_id": "deep",
+                "title": "Deep work",
+                "start": "01:30 PM",
+                "end": "03:30 PM",
+                "startTime": "01:30 PM",
+                "endTime": "03:30 PM",
+                "location_category": "home_or_online",
+                "location_status": "not_required",
+                "travel_required": False,
+            },
+            {
+                "block_type": "idle",
+                "type": "idle",
+                "title": "Free Time",
+                "start": "03:30 PM",
+                "end": "04:35 PM",
+                "startTime": "03:30 PM",
+                "endTime": "04:35 PM",
+                "duration_minutes": 65,
+            },
+            {
+                "block_type": "buffer",
+                "type": "buffer",
+                "title": "Prep / Buffer",
+                "start": "04:35 PM",
+                "end": "04:40 PM",
+                "startTime": "04:35 PM",
+                "endTime": "04:40 PM",
+                "duration_minutes": 5,
+            },
+            {
+                "block_type": "transition",
+                "type": "travel",
+                "title": "Travel to Cheras",
+                "start": "04:40 PM",
+                "end": "05:00 PM",
+                "startTime": "04:40 PM",
+                "endTime": "05:00 PM",
+                "duration_minutes": 20,
+                "from_location": "Bangsar",
+                "to_location": "Cheras",
+            },
+            {
+                "block_type": "activity",
+                "id": "dentist",
+                "stable_activity_id": "dentist",
+                "title": "Dentist appointment",
+                "start": "05:00 PM",
+                "end": "06:00 PM",
+                "startTime": "05:00 PM",
+                "endTime": "06:00 PM",
+                "location": "Cheras",
+                "location_label": "Cheras",
+            },
+        ],
+        "warnings": [],
+        "location_resolution_requests": [],
+    }
+    saved_locations = [
+        {"label": "Bangsar", "address": "Bangsar", "latitude": 3.13, "longitude": 101.67},
+        {"label": "Cheras", "address": "Cheras", "latitude": 3.08, "longitude": 101.74},
+    ]
+
+    envelope = engine._apply_accurate_travel_if_requested(pending_envelope, saved_locations)
+    transitions = [block for block in envelope["schedule_blocks"] if block.get("block_type") == "transition"]
+    buffers = [block for block in envelope["schedule_blocks"] if block.get("block_type") == "buffer"]
+    idle = next(block for block in envelope["schedule_blocks"] if block.get("block_type") == "idle")
+
+    assert envelope["travel_validation_status"] == "validated"
+    assert envelope["route_conflicts"] == []
+    assert len(transitions) == 1
+    assert transitions[0]["title"] == "Travel to Cheras"
+    assert transitions[0]["start"] == "04:30 PM"
+    assert transitions[0]["end"] == "05:00 PM"
+    assert transitions[0]["duration_minutes"] == 30
+    assert transitions[0]["route_duration_minutes"] == 30
+    assert buffers == []
+    assert idle["start"] == "03:30 PM"
+    assert idle["end"] == "04:30 PM"
+
+
+def test_accurate_travel_support_overlap_marks_route_conflict():
+    fake_travel = FakeTravelService(route_minutes=12)
+    engine = SchedulingEngine(DummyClient(), travel_service=fake_travel)
+    resolved = {"latitude": 3.1, "longitude": 101.7, "display_name": "Office"}
+    pending_envelope = {
+        "date": "2026-05-02",
+        "status": "ok",
+        "schedule_status": "ok",
+        "travel_validation_status": "not_requested",
+        "accurate_travel_time": True,
+        "preferences": {"accurate_travel_time": True},
+        "activities": [],
+        "schedule_blocks": [
+            {
+                "block_type": "activity",
+                "id": "a",
+                "stable_activity_id": "a",
+                "title": "Meeting A",
+                "start": "09:00 AM",
+                "end": "10:00 AM",
+                "startTime": "09:00 AM",
+                "endTime": "10:00 AM",
+                "location": "Office",
+                "location_label": "Office",
+                "resolved_location": resolved,
+            },
+            {
+                "block_type": "buffer",
+                "type": "buffer",
+                "title": "Prep / Buffer",
+                "start": "10:00 AM",
+                "end": "10:15 AM",
+                "startTime": "10:00 AM",
+                "endTime": "10:15 AM",
+                "duration_minutes": 15,
+            },
+            {
+                "block_type": "transition",
+                "type": "travel",
+                "title": "Travel to Office",
+                "start": "10:05 AM",
+                "end": "10:20 AM",
+                "startTime": "10:05 AM",
+                "endTime": "10:20 AM",
+                "duration_minutes": 15,
+            },
+            {
+                "block_type": "activity",
+                "id": "b",
+                "stable_activity_id": "b",
+                "title": "Meeting B",
+                "start": "10:30 AM",
+                "end": "11:30 AM",
+                "startTime": "10:30 AM",
+                "endTime": "11:30 AM",
+                "location": "Office",
+                "location_label": "Office",
+                "resolved_location": resolved,
+            },
+        ],
+        "warnings": [],
+        "location_resolution_requests": [],
+    }
+
+    envelope = engine._apply_accurate_travel_if_requested(pending_envelope, saved_locations=[])
+
+    assert envelope["travel_validation_status"] == "route_conflict"
+    assert envelope["schedule_status"] == "route_conflict"
+    assert envelope["route_conflicts"]
+    assert envelope["route_conflicts"][0]["type"] == "support_block_overlap"
 
 
 def test_accurate_travel_with_coordinates_and_ors_failure_uses_fallback_not_location_pending():
@@ -3615,6 +3875,122 @@ def test_chat_api_smoke_returns_schedule_blocks(monkeypatch):
     assert payload["schedule_data"]["schedule_blocks"][0]["title"] == "Reading"
 
 
+def test_chat_accurate_travel_request_validates_current_schedule_without_module_a_or_module_d(monkeypatch):
+    from fastapi.testclient import TestClient
+    import main as backend_main
+
+    class TravelOnlyEngine:
+        def __init__(self):
+            self.validated = False
+
+        def route_chat_request(self, message, current_schedule=None):
+            return {
+                "route": "accurate_travel_validation",
+                "confidence": 0.95,
+                "should_mutate_schedule": False,
+                "use_deterministic_parser": False,
+                "use_module_a_llm": False,
+                "use_advisory_llm": False,
+                "reason": "matched_accurate_travel_validation",
+            }
+
+        def parse_deterministic_fast_path(self, *args, **kwargs):
+            raise AssertionError("travel-only request must not use fast path parser")
+
+        def parse_text_request(self, *args, **kwargs):
+            raise AssertionError("travel-only request must not use Module A")
+
+        def apply_operations(self, *args, **kwargs):
+            raise AssertionError("travel-only request must not apply operations or run Module D")
+
+        def _apply_accurate_travel_if_requested(self, envelope, saved_locations):
+            self.validated = True
+            assert envelope["date"] == "2026-05-24"
+            assert envelope["accurate_travel_time"] is True
+            assert envelope["preferences"]["accurate_travel_time"] is True
+            updated = dict(envelope)
+            updated["status"] = "location_pending"
+            updated["schedule_status"] = "location_pending"
+            updated["travel_validation_status"] = "pending_locations"
+            updated["location_resolution_requests"] = [
+                {"title": "Dinner", "current_guess": "Bangsar", "requires_coordinate": True}
+            ]
+            return updated
+
+    fake_engine = TravelOnlyEngine()
+    monkeypatch.setattr(backend_main, "scheduling_engine", fake_engine)
+    monkeypatch.setattr(backend_main.database, "get_user_locations", lambda user_id: [])
+    monkeypatch.setattr(backend_main.database, "_parse_schedule_payload", lambda payload, user_id, date: payload)
+
+    response = TestClient(backend_main.app).post(
+        "/chat",
+        json={
+            "message": "now i want the plan with accurate travel time",
+            "history": [],
+            "user_id": "travel-user",
+            "accurate_travel_time": False,
+            "current_schedule": _evening_schedule_envelope(),
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert fake_engine.validated is True
+    assert payload["reply_status"] == "location_pending"
+    assert payload["reply"] == "Please confirm the exact locations first so I can calculate accurate travel time."
+    assert payload["schedule_data"]["travel_validation_status"] == "pending_locations"
+    assert payload["schedule_data"]["date"] == "2026-05-24"
+
+
+def test_travel_complete_toggle_runs_readiness_without_creating_plan_or_geocoding(monkeypatch):
+    from fastapi.testclient import TestClient
+    import main as backend_main
+
+    class ToggleTravelEngine:
+        def __init__(self):
+            self.calls = 0
+
+        def _apply_accurate_travel_if_requested(self, envelope, saved_locations):
+            self.calls += 1
+            assert envelope["accurate_travel_time"] is True
+            assert envelope["preferences"]["accurate_travel_time"] is True
+            updated = dict(envelope)
+            updated["status"] = "location_pending"
+            updated["schedule_status"] = "location_pending"
+            updated["travel_validation_status"] = "pending_locations"
+            updated["location_resolution_requests"] = [
+                {
+                    "activity_id": "act-dinner",
+                    "title": "Dinner",
+                    "current_guess": "Bangsar",
+                    "requires_coordinate": True,
+                    "location_readiness_status": "missing_coordinates",
+                    "geocode_candidates": [],
+                }
+            ]
+            return updated
+
+    fake_engine = ToggleTravelEngine()
+    monkeypatch.setattr(backend_main, "scheduling_engine", fake_engine)
+    monkeypatch.setattr(backend_main.database, "get_user_locations", lambda user_id: [])
+
+    response = TestClient(backend_main.app).post(
+        "/api/travel/complete",
+        json={
+            "user_id": "travel-user",
+            "source": "toggle",
+            "schedule": _evening_schedule_envelope(),
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert fake_engine.calls == 1
+    assert payload["travel_validation_status"] == "pending_locations"
+    assert payload["location_resolution_requests"][0]["geocode_candidates"] == []
+    assert payload["version"] == _evening_schedule_envelope()["version"]
+
+
 def test_module_0_router_classifies_latency_paths():
     engine = SchedulingEngine(DummyClient())
     envelope = _initial_envelope()
@@ -3631,6 +4007,23 @@ def test_module_0_router_classifies_latency_paths():
     assert engine.route_chat_request("do you think my schedule is too packed", envelope)["route"] == "planning_advice"
     assert engine.route_chat_request("Generate a busy workday for me with meeting, lunch, gym and grocery", envelope)["route"] == "complex_schedule_command"
     assert engine.route_chat_request("hello", envelope)["route"] == "general_chat"
+
+
+def test_module_0_router_detects_accurate_travel_validation_before_optimize():
+    engine = SchedulingEngine(DummyClient())
+    envelope = _initial_envelope()
+
+    route = engine.route_chat_request("now i want the plan with accurate travel time", envelope)
+    actual_route = engine.route_chat_request("now i want my travel time to be actual", envelope)
+    regenerate_route = engine.route_chat_request("regenerate the whole plan please with accurate travel time", envelope)
+
+    assert route["route"] == "accurate_travel_validation"
+    assert route["use_module_a_llm"] is False
+    assert route["use_deterministic_parser"] is False
+    assert actual_route["route"] == "accurate_travel_validation"
+    assert actual_route["use_module_a_llm"] is False
+    assert regenerate_route["route"] == "accurate_travel_validation"
+    assert regenerate_route["reason"] == "matched_accurate_travel_validation"
 
 
 def test_module_0_router_classifies_natural_schedule_wording():
@@ -3709,6 +4102,112 @@ def test_deterministic_fast_path_arrange_patterns_create_relative_update():
     assert operation["title"] == "Grocery Shopping"
     assert operation["anchor_relation"]["kind"] == "after"
     assert operation["anchor_relation"]["target_title"] == "Gym Workout"
+
+
+def test_deterministic_fast_path_arrange_duration_cleans_title():
+    engine = SchedulingEngine(DummyClient())
+    envelope = _custom_envelope([
+        {
+            "op": "add",
+            "title": "Client Meeting",
+            "timing_mode": TimingMode.FIXED,
+            "fixed_start": "09:00",
+            "duration_minutes": 60,
+        },
+    ])
+
+    parsed = engine.parse_deterministic_fast_path(
+        "Put a 20-minute coffee catch-up right after my client meeting.",
+        current_schedule=envelope,
+        history=[],
+        saved_locations=[],
+    )
+
+    operation = parsed["operations"][0]
+    assert operation["op"] == "add"
+    assert operation["title"] == "Coffee catch-up"
+    assert operation["duration_minutes"] == 20
+    assert operation["anchor_relation"]["kind"] == "after"
+    assert operation["anchor_relation"]["target_title"] == "Client Meeting"
+
+
+def test_relative_add_inherits_anchor_location_for_coffee_catch_up():
+    engine = SchedulingEngine(DummyClient())
+    envelope = _custom_envelope([
+        {
+            "op": "add",
+            "title": "Client Meeting",
+            "timing_mode": TimingMode.FIXED,
+            "fixed_start": "09:00",
+            "duration_minutes": 60,
+            "location": "Mid Valley",
+        },
+    ])
+    anchor_location = {
+        "display_name": "Mid Valley Megamall",
+        "latitude": 3.1184,
+        "longitude": 101.6778,
+        "source": "event_confirmed",
+        "confirmed_by_user": True,
+    }
+    _activity_by_title(envelope, "Client Meeting")["resolved_location"] = dict(anchor_location)
+    _activity_by_title(envelope, "Client Meeting")["location_status"] = "resolved"
+    for block in envelope["schedule_blocks"]:
+        if block.get("title") == "Client Meeting":
+            block["resolved_location"] = dict(anchor_location)
+            block["location_status"] = "resolved"
+
+    parsed = engine.parse_deterministic_fast_path(
+        "Put a 20-minute coffee catch-up right after my client meeting.",
+        current_schedule=envelope,
+        history=[],
+        saved_locations=[],
+    )
+    result = engine.apply_operations(
+        envelope=envelope,
+        operations=parsed["operations"],
+        base_version=envelope["version"],
+    )
+
+    assert result["status"] == "success"
+    coffee = _activity_by_title(result["envelope"], "Coffee catch-up")
+    assert coffee["duration_minutes"] == 20
+    assert coffee["location"] == "Mid Valley"
+    assert coffee["location_label"] == "Mid Valley"
+    assert coffee["location_source"] == "inferred_from_anchor"
+    assert coffee["same_location_as"] == "Client Meeting"
+    assert coffee["resolved_location"] == anchor_location
+    assert coffee["location_status"] == "resolved"
+
+
+def test_deterministic_fast_path_relative_add_duration_variants():
+    engine = SchedulingEngine(DummyClient())
+
+    call = engine.parse_deterministic_fast_path(
+        "Add a 30 min call after lunch.",
+        current_schedule=_initial_envelope(),
+        history=[],
+        saved_locations=[],
+    )["operations"][0]
+    review = engine.parse_deterministic_fast_path(
+        "Add half-hour review after class.",
+        current_schedule=_initial_envelope(),
+        history=[],
+        saved_locations=[],
+    )["operations"][0]
+    gym = engine.parse_deterministic_fast_path(
+        "Schedule a 1-hour gym session after work.",
+        current_schedule=_initial_envelope(),
+        history=[],
+        saved_locations=[],
+    )["operations"][0]
+
+    assert call["title"] == "Call"
+    assert call["duration_minutes"] == 30
+    assert review["title"] == "Review"
+    assert review["duration_minutes"] == 30
+    assert gym["title"] == "Gym session"
+    assert gym["duration_minutes"] == 60
 
 
 def test_deterministic_fast_path_place_new_activity_before_anchor():

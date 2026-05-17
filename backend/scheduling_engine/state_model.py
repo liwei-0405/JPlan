@@ -347,6 +347,8 @@ class StateModelMixin:
             "explicit_user_location": bool(raw.get("explicit_user_location", False)),
             "location_warning": raw.get("location_warning"),
             "area_preference": raw.get("area_preference"),
+            "same_location_as": raw.get("same_location_as"),
+            "inherited_from_activity_id": raw.get("inherited_from_activity_id"),
             "travel_required": travel_required,
             "status": raw.get("status") or "active",
             "source_turn": raw.get("source_turn") if raw.get("source_turn") is not None else (source_turn or 0),

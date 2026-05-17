@@ -33,6 +33,7 @@ export type ChatResponse = {
     llm_fallback_reason?: string | null;
     patch?: PatchResponse;
     full_schedule?: DailySchedule;
+    schedule_data?: DailySchedule;
     transcription?: string;
 };
 
@@ -232,11 +233,15 @@ export async function resolveLocation(payload: {
     return await response.json();
 }
 
-export async function completeTravelValidation(schedule: DailySchedule, userId: string): Promise<DailySchedule> {
+export async function completeTravelValidation(
+    schedule: DailySchedule,
+    userId: string,
+    source: 'toggle' | 'chat' | 'manual' = 'manual',
+): Promise<DailySchedule> {
     const response = await fetch(`${API_BASE_URL}/api/travel/complete`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ user_id: userId, schedule }),
+        body: JSON.stringify({ user_id: userId, schedule, source }),
     });
     if (!response.ok) {
         const error = await response.json().catch(() => ({ detail: 'Travel validation failed' }));

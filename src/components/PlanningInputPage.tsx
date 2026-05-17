@@ -44,6 +44,10 @@ type LocationResolutionRequest = {
   current_guess?: string;
   expanded_query?: string;
   reason?: string;
+  display_reason?: string;
+  same_location_as?: string;
+  related_activity_ids?: string[];
+  related_titles?: string[];
   saved_matches?: GeocodeCandidate[];
   geocode_candidates?: GeocodeCandidate[];
   affected_transitions?: Array<{
@@ -472,7 +476,57 @@ export function PlanningInputPage({
     const requestId = String(request.activity_id || "");
     const itemId = String(item.stable_activity_id || item.id || "");
     if (requestId && itemId && requestId === itemId) return true;
+    if (itemId && (request.related_activity_ids || []).map(String).includes(itemId)) return true;
     return normalizeLocationTarget(item.title) === normalizeLocationTarget(request.title);
+  };
+
+  const travelValidationMessage = (schedule: DailySchedule) => {
+    if ((schedule.location_resolution_requests || []).length > 0 || schedule.travel_validation_status === "pending_locations") {
+      return {
+        message: "Please confirm the exact locations first so I can calculate accurate travel time.",
+        status: "location_pending" as const,
+      };
+    }
+    if (schedule.schedule_status === "route_conflict" || schedule.status === "route_conflict") {
+      return {
+        message: "Accurate travel time creates a timing conflict in this draft, so I marked the affected route.",
+        status: "conflict" as const,
+      };
+    }
+    if (schedule.travel_validation_status === "fallback_used") {
+      return {
+        message: "I couldn't get live route data, so I kept the draft using fallback travel estimates.",
+        status: "warning" as const,
+      };
+    }
+    if (schedule.travel_validation_status === "validated") {
+      return {
+        message: "Accurate travel time is now applied to this plan.",
+        status: "success" as const,
+      };
+    }
+    return {
+      message: "I checked the travel timing for this plan.",
+      status: "success" as const,
+    };
+  };
+
+  const formatLocationCardTitle = (request: LocationResolutionRequest) => {
+    const titles = [request.title, ...(request.related_titles || [])].filter(Boolean);
+    const uniqueTitles = Array.from(new Set(titles));
+    const titleText = uniqueTitles.join(", ");
+    const guess = request.current_guess ? ` — ${request.current_guess}` : "";
+    if (request.same_location_as) {
+      return `${titleText}${guess} needs exact map location`;
+    }
+    return `${titleText}${guess} needs exact map location`;
+  };
+
+  const formatLocationCardHint = (request: LocationResolutionRequest) => {
+    if (request.same_location_as) {
+      return `You can confirm the same place as ${request.same_location_as}, or choose a more exact place.`;
+    }
+    return "Please choose an exact place on the map or from saved places.";
   };
 
   const attachResolvedLocation = (
@@ -602,8 +656,17 @@ export function PlanningInputPage({
     }
   };
 
-  const handleCompleteTravelValidation = async () => {
-    if (!previewSchedule || !user?.id) return;
+  const runTravelValidation = async (source: "toggle" | "manual" = "manual") => {
+    const hasScheduleItems = Boolean((previewSchedule?.schedule_blocks?.length || 0) || (previewSchedule?.activities?.length || 0));
+    if (!previewSchedule || !user?.id || !hasScheduleItems) {
+      setAccurateTravelTime(false);
+      setConversationHistory(prev => [...prev, {
+        role: "assistant",
+        message: "Create or select a plan first, then I can calculate accurate travel time.",
+        status: "clarification_needed",
+      }]);
+      return;
+    }
     setIsProcessing(true);
     setProgressSteps(["Checking travel and buffer time...", "Preparing explanation..."]);
     setActiveProgressIndex(0);
@@ -615,18 +678,17 @@ export function PlanningInputPage({
           ...(previewSchedule.preferences || {}),
           accurate_travel_time: true,
         },
-      }, user.id);
+      }, user.id, source);
       setPreviewSchedule({
         ...validated,
         allow_clash: allowClash,
         accurate_travel_time: true,
       });
+      const reply = travelValidationMessage(validated);
       setConversationHistory(prev => [...prev, {
         role: "assistant",
-        message: validated.travel_validation_status === "validated"
-          ? "Travel-aware validation is complete with accurate route timing."
-          : "I rechecked travel timing. Some route timing still needs attention, so I marked it in the draft.",
-        status: validated.schedule_status === "route_conflict" ? "conflict" : validated.travel_validation_status === "fallback_used" ? "warning" : "success",
+        message: reply.message,
+        status: reply.status,
       }]);
     } catch (error) {
       setConversationHistory(prev => [...prev, {
@@ -639,6 +701,19 @@ export function PlanningInputPage({
       setProgressSteps([]);
       setActiveProgressIndex(0);
     }
+  };
+
+  const handleCompleteTravelValidation = async () => {
+    await runTravelValidation("manual");
+  };
+
+  const handleAccurateTravelToggle = async (checked: boolean) => {
+    if (!checked) {
+      setAccurateTravelTime(false);
+      return;
+    }
+    setAccurateTravelTime(true);
+    await runTravelValidation("toggle");
   };
 
   const manualLocationCandidate: GeocodeCandidate | null = manualResolvedLocation
@@ -837,7 +912,7 @@ export function PlanningInputPage({
                 <span className="text-xs text-muted-foreground">Accurate</span>
                 <Switch
                   checked={accurateTravelTime}
-                  onCheckedChange={setAccurateTravelTime}
+                  onCheckedChange={handleAccurateTravelToggle}
                   disabled={isProcessing}
                   aria-label="Accurate travel time"
                 />
@@ -867,8 +942,8 @@ export function PlanningInputPage({
                               <div className="flex items-start gap-2">
                                 <MapPin size={16} className="mt-0.5 shrink-0" />
                                 <div className="min-w-0 flex-1">
-                                  <p className="font-medium">Select location for {request.title}</p>
-                                  <p className="text-xs text-yellow-800">{request.reason}</p>
+                                  <p className="font-medium">{formatLocationCardTitle(request)}</p>
+                                  <p className="text-xs text-yellow-800">{formatLocationCardHint(request)}</p>
                                   {request.affected_transitions?.length ? (
                                     <p className="mt-1 text-xs text-yellow-800">
                                       Affects: {request.affected_transitions.map(t => `${t.from_activity || "Previous"} → ${t.to_activity || "Next"}`).join(", ")}

@@ -32,10 +32,15 @@ export function TimelineGrid({
   showEditIcon = false,
   compact = false,
 }: TimelineGridProps) {
-  if (activities.length === 0) return null;
+  const visibleActivities = useMemo(
+    () => dedupeSupportBlocks(activities).filter((activity) => getTimelineBlockKind(activity) !== "free_time"),
+    [activities],
+  );
 
-  const groups = useMemo(() => buildCollisionGroups(activities), [activities]);
-  const collidingIds = useMemo(() => getCollidingIds(activities), [activities]);
+  const groups = useMemo(() => buildCollisionGroups(visibleActivities), [visibleActivities]);
+  const collidingIds = useMemo(() => getCollidingIds(visibleActivities), [visibleActivities]);
+
+  if (visibleActivities.length === 0) return null;
 
   return (
     <div className="space-y-2">
@@ -73,10 +78,13 @@ function CollisionGroupRow({
 
   if (!isCollision) {
     const act = group.activities[0];
-    const bType = act.block_type || act.type;
+    const blockKind = getTimelineBlockKind(act);
     
-    if (bType && bType !== "activity") {
-      return <TravelBufferBlock activity={act} />;
+    if (blockKind === "free_time") {
+      return null;
+    }
+    if (blockKind !== "activity") {
+      return <SupportTimelineBlock activity={act} kind={blockKind} />;
     }
     return (
       <ActivityCard
@@ -96,7 +104,12 @@ function CollisionGroupRow({
     MIN_BLOCK_HEIGHT,
     groupDuration * PIXELS_PER_MINUTE
   );
-  const clashCount = group.activities.filter((act) => (act.block_type || act.type) === "activity").length;
+  const mainActivityCount = group.activities.filter((act) => getTimelineBlockKind(act) === "activity").length;
+  const conflictLabel = mainActivityCount >= 2
+    ? `Time Clash — ${mainActivityCount} overlapping events`
+    : mainActivityCount === 0
+      ? "Route timing conflict — overlapping travel/buffer blocks"
+      : "Route timing conflict — travel/buffer overlaps an activity";
 
   return (
     <div className="relative group/group-row">
@@ -114,7 +127,7 @@ function CollisionGroupRow({
           <span className="relative inline-flex rounded-full h-2 w-2 bg-red-600"></span>
         </span>
         <span style={{ fontSize: "12px", fontWeight: 700, color: "#dc2626" }}>
-          ⚡ Time Clash — {clashCount} overlapping events
+          ⚡ {conflictLabel}
         </span>
       </div>
 
@@ -140,13 +153,16 @@ function CollisionGroupRow({
           if (normalizedStart < 0) normalizedStart += 24 * 60;
           const topOffset = (normalizedStart / groupDuration) * containerHeight;
 
-          const bType = act.block_type || act.type;
+          const blockKind = getTimelineBlockKind(act);
 
-          if (bType && bType !== "activity") {
+          if (blockKind === "free_time") {
+            return null;
+          }
+          if (blockKind !== "activity") {
             return (
               <div key={act.id || act.title} style={{ position: "relative", height: `${containerHeight}px` }}>
                 <div style={{ position: "absolute", top: `${topOffset}px`, width: "100%" }}>
-                  <TravelBufferBlock activity={act} />
+                  <SupportTimelineBlock activity={act} kind={blockKind} />
                 </div>
               </div>
             );
@@ -311,33 +327,142 @@ function ActivityCard({
   );
 }
 
-function TravelBufferBlock({ activity }: { activity: ActivityBlock }) {
-  const bType = activity.block_type || activity.type;
-  const st = activity.startTime || activity.start;
-  const et = activity.endTime || activity.end;
+type TimelineBlockKind = "activity" | "travel" | "buffer" | "free_time";
 
-  let colorClass = "from-indigo-50 to-white border-indigo-500 text-indigo-800";
-  let dotClass = "bg-indigo-500";
-  let timeClass = "text-indigo-600";
+function normalizedBlockText(value: unknown): string {
+  return String(value || "").trim().toLowerCase();
+}
 
-  if (bType === "buffer") {
-    colorClass = "from-emerald-50 to-white border-emerald-500 text-emerald-800";
-    dotClass = "bg-emerald-500";
-    timeClass = "text-emerald-600";
-  } else if (bType === "idle") {
-    colorClass = "from-slate-50 to-white border-slate-300 text-slate-500 border-dashed";
-    dotClass = "bg-slate-300";
-    timeClass = "text-slate-400";
+function getTimelineBlockKind(activity: ActivityBlock): TimelineBlockKind {
+  const title = normalizedBlockText(activity.title);
+  const blockType = normalizedBlockText(activity.block_type || activity.type);
+  const category = normalizedBlockText((activity as ActivityBlock & { category?: string; block_category?: string }).category || (activity as ActivityBlock & { category?: string; block_category?: string }).block_category);
+
+  if (
+    title === "free time" ||
+    blockType === "idle" ||
+    blockType === "free_time" ||
+    category === "idle" ||
+    category === "free_time"
+  ) {
+    return "free_time";
   }
 
+  if (
+    title.startsWith("travel to") ||
+    blockType === "travel" ||
+    blockType === "transition" ||
+    category === "travel" ||
+    category === "transition"
+  ) {
+    return "travel";
+  }
+
+  if (
+    title.includes("prep / buffer") ||
+    title.includes("buffer") ||
+    blockType === "buffer" ||
+    blockType === "prep" ||
+    category === "buffer" ||
+    category === "prep"
+  ) {
+    return "buffer";
+  }
+
+  return "activity";
+}
+
+function dedupeSupportBlocks(activities: ActivityBlock[]): ActivityBlock[] {
+  const result: ActivityBlock[] = [];
+  const supportIndexByKey = new Map<string, number>();
+
+  for (const activity of activities || []) {
+    const kind = getTimelineBlockKind(activity);
+    const key = getSupportDedupeKey(activity, kind);
+    if (!key) {
+      result.push(activity);
+      continue;
+    }
+
+    const existingIndex = supportIndexByKey.get(key);
+    if (existingIndex === undefined) {
+      supportIndexByKey.set(key, result.length);
+      result.push(activity);
+      continue;
+    }
+
+    if (shouldPreferSupportBlock(activity, result[existingIndex])) {
+      result[existingIndex] = activity;
+    }
+  }
+
+  return result;
+}
+
+function getSupportDedupeKey(activity: ActivityBlock, kind: TimelineBlockKind): string | null {
+  if (kind === "travel") {
+    const destination = normalizedTravelDestination(activity);
+    const end = normalizedBlockText(activity.endTime || activity.end);
+    if (!destination || !end) return null;
+    return `travel:${destination}:${end}`;
+  }
+  if (kind === "buffer") {
+    const start = normalizedBlockText(activity.startTime || activity.start);
+    const end = normalizedBlockText(activity.endTime || activity.end);
+    if (!start || !end) return null;
+    return `buffer:${start}:${end}`;
+  }
+  return null;
+}
+
+function normalizedTravelDestination(activity: ActivityBlock): string {
+  return normalizedBlockText(
+    activity.location ||
+    activity.title.replace(/^travel to\s+/i, ""),
+  );
+}
+
+function shouldPreferSupportBlock(candidate: ActivityBlock, existing: ActivityBlock): boolean {
+  const score = (activity: ActivityBlock) => {
+    const source = normalizedBlockText(activity.travel_estimate_source);
+    const status = normalizedBlockText(activity.travel_validation_status);
+    const start = timeToMinutes(activity.startTime || activity.start || "00:00");
+    const elapsed = getDurationMinutes(activity);
+    const declared = Number(activity.duration_minutes || activity.route_duration_minutes || elapsed);
+    let value = 0;
+    if (source === "routing_service") value += 100;
+    if (status === "validated") value += 50;
+    if (declared === elapsed) value += 25;
+    value += Math.max(0, elapsed);
+    value -= start / 10000;
+    return value;
+  };
+
+  return score(candidate) > score(existing);
+}
+
+function SupportTimelineBlock({ activity, kind }: { activity: ActivityBlock; kind: Exclude<TimelineBlockKind, "activity" | "free_time"> }) {
+  const st = activity.startTime || activity.start;
+  const et = activity.endTime || activity.end;
+  const duration = activity.duration_minutes || getDurationMinutes(activity);
+  const destination = activity.title.replace(/^travel to\s+/i, "").trim();
+  const label = kind === "travel"
+    ? `${duration} min travel${destination ? ` to ${destination}` : ""}`
+    : `${duration} min buffer`;
+
+  const colorClass = kind === "travel"
+    ? "border-indigo-200 bg-indigo-50/70 text-indigo-800"
+    : "border-emerald-200 bg-emerald-50/60 text-emerald-800";
+  const iconClass = kind === "travel" ? "text-indigo-500" : "text-emerald-500";
+
   return (
-    <div className={`border-l-4 rounded-xl p-4 shadow-sm bg-gradient-to-r ${colorClass}`}>
-      <div className="flex items-center justify-between">
-        <span className={`flex items-center gap-2 font-bold text-base ${colorClass.split(" ").pop()}`}>
-          <div className={`w-2.5 h-2.5 rounded-full ${dotClass}`} />
-          {activity.title}
+    <div className={`rounded-xl border px-3 py-2 shadow-sm ${colorClass}`}>
+      <div className="flex items-center justify-between gap-3">
+        <span className="flex items-center gap-2 text-xs font-semibold">
+          {kind === "travel" ? <MapPin className={`h-3.5 w-3.5 ${iconClass}`} /> : <Clock className={`h-3.5 w-3.5 ${iconClass}`} />}
+          {label}
         </span>
-        <span className={`text-sm font-semibold ${timeClass}`}>
+        <span className="text-xs font-medium opacity-75 whitespace-nowrap">
           {st} – {et}
         </span>
       </div>

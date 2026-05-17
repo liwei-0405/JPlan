@@ -532,7 +532,7 @@ class ModuleAParserMixin:
             parsed = self._fallback_parse_soft_adjustment(request, schedule_date, current_schedule, history or [])
 
         if parsed is None:
-            parsed = self._fallback_parse_relative_add(request, schedule_date)
+            parsed = self._fallback_parse_relative_add(request, schedule_date, current_schedule)
 
         if parsed is None:
             parsed = self._fallback_parse_fixed_time_update(request, schedule_date, current_schedule, history or [])
@@ -637,6 +637,49 @@ class ModuleAParserMixin:
             return resolution["activity"].get("title") or title, True
         return title, False
 
+    def _extract_fast_path_duration(self, value: str) -> Tuple[Optional[int], Optional[str]]:
+        text = value or ""
+        half_match = re.search(r"\b(?:half[-\s]*hour|half\s+an\s+hour)\b", text, flags=re.IGNORECASE)
+        if half_match:
+            raw = half_match.group(0)
+            jlog("FAST_PATH", f'raw="{raw}" duration_minutes=30', "DURATION")
+            return 30, raw
+        match = re.search(
+            r"\b(?:for\s+)?(?P<amount>\d{1,3})\s*(?:-| )?\s*(?P<unit>minutes?|mins?|min|hours?|hrs?|hr)\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return None, None
+        amount = int(match.group("amount"))
+        unit = clean_title(match.group("unit"))
+        minutes = amount * 60 if unit in {"hour", "hours", "hr", "hrs"} else amount
+        raw = match.group(0)
+        jlog("FAST_PATH", f'raw="{raw}" duration_minutes={minutes}', "DURATION")
+        return minutes, raw
+
+    def _remove_fast_path_duration_phrase(self, value: str) -> str:
+        text = value or ""
+        text = re.sub(
+            r"\b(?:for\s+)?\d{1,3}\s*(?:-| )?\s*(?:minutes?|mins?|min|hours?|hrs?|hr)\b",
+            " ",
+            text,
+            flags=re.IGNORECASE,
+        )
+        text = re.sub(r"\b(?:half[-\s]*hour|half\s+an\s+hour)\b", " ", text, flags=re.IGNORECASE)
+        return re.sub(r"\s+", " ", text).strip()
+
+    def _clean_fast_path_new_activity_title(self, value: str) -> str:
+        title = self._clean_fallback_activity_title(value)
+        if not title:
+            return ""
+        if clean_title(title) == "coffee break":
+            return "Coffee Break"
+        if " " in title or "-" in title:
+            title = title[:1].upper() + title[1:].lower()
+        title = re.sub(r"\bfyp\b", "FYP", title, flags=re.IGNORECASE)
+        return title
+
     def _fallback_parse_arrange_relation(
         self,
         request: str,
@@ -650,7 +693,7 @@ class ModuleAParserMixin:
         )
         match = pattern.search(request)
         if not match:
-            if clean_title(request).startswith("add "):
+            if re.match(r"^(?:add|schedule)\s+", clean_title(request)):
                 return None
             bare = re.search(
                 r"\b(?P<title>.+?)\s+(?P<kind>after|before)\s+(?P<anchor>.+?)(?:\.|$)",
@@ -664,26 +707,37 @@ class ModuleAParserMixin:
                 return None
             match = bare
 
-        raw_title = self._clean_fallback_activity_title(match.group("title"))
+        raw_title_text = match.group("title")
+        duration_minutes, _duration_raw = self._extract_fast_path_duration(raw_title_text)
+        title_without_duration = self._remove_fast_path_duration_phrase(raw_title_text)
+        before_title = self._clean_fallback_activity_title(raw_title_text)
+        raw_title = self._clean_fallback_activity_title(title_without_duration)
         raw_anchor = self._clean_fallback_activity_title(match.group("anchor"))
         if not raw_title or not raw_anchor:
             return None
         title, target_exists = self._resolve_fast_path_title(raw_title, current_schedule)
+        if not target_exists:
+            title = self._clean_fast_path_new_activity_title(title_without_duration)
+        if before_title and title and before_title != title:
+            jlog("FAST_PATH", f'before="{before_title}" after="{title}"', "TITLE_CLEAN")
         anchor, _ = self._resolve_fast_path_title(raw_anchor, current_schedule)
         kind = clean_title(match.group("kind")).replace("right ", "")
         op_type = "update" if target_exists else "add"
         jlog("FAST_PATH", f"parsed arrange_{kind} target={title} anchor={anchor}", None)
+        operation = {
+            "op": op_type,
+            "title": title,
+            "timing_mode": TimingMode.RELATIVE,
+            "anchor_relation": {"kind": kind, "target_title": anchor},
+        }
+        if duration_minutes:
+            operation["duration_minutes"] = duration_minutes
         return {
             "intent": "edit",
             "reply": f"I understood this as arranging {title} {kind} {anchor}.",
             "transcription": request,
             "date": schedule_date,
-            "operations": [{
-                "op": op_type,
-                "title": title,
-                "timing_mode": TimingMode.RELATIVE,
-                "anchor_relation": {"kind": kind, "target_title": anchor},
-            }],
+            "operations": [operation],
             "activities": [],
             "preferences": {},
         }
@@ -795,16 +849,15 @@ class ModuleAParserMixin:
             "preferences": {},
         }
 
-    def _fallback_parse_relative_add(self, request: str, schedule_date: str) -> Optional[Dict[str, Any]]:
-        text = clean_title(request)
-        duration_minutes: Optional[int] = None
-        duration_match = re.search(r"\b(?P<duration>\d{1,3})[-\s]*minute\b", text)
-        if duration_match:
-            duration_minutes = int(duration_match.group("duration"))
-
+    def _fallback_parse_relative_add(
+        self,
+        request: str,
+        schedule_date: str,
+        current_schedule: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
         patterns = [
             re.compile(
-                r"\badd\s+(?:a\s+|an\s+)?(?:quick\s+)?(?:(?P<duration>\d{1,3})[-\s]*minute\s+)?(?P<title>.+?)\s+(?P<kind>right\s+after|right\s+before|after|before)\s+(?:the\s+|my\s+)?(?P<anchor>.+?)(?:\.|$)",
+                r"\b(?:add|schedule)\s+(?:a\s+|an\s+)?(?:quick\s+)?(?P<title>.+?)\s+(?P<kind>right\s+after|right\s+before|after|before)\s+(?:the\s+|my\s+)?(?P<anchor>.+?)(?:\.|$)",
                 re.IGNORECASE,
             ),
             re.compile(
@@ -816,12 +869,16 @@ class ModuleAParserMixin:
         if not match:
             return None
 
-        title = self._clean_fallback_activity_title(match.group("title"))
+        raw_title_text = match.group("title")
+        duration_minutes, _duration_raw = self._extract_fast_path_duration(raw_title_text)
+        title_without_duration = self._remove_fast_path_duration_phrase(raw_title_text)
+        before_title = self._clean_fallback_activity_title(raw_title_text)
+        title = self._clean_fast_path_new_activity_title(title_without_duration)
+        if before_title and title and before_title != title:
+            jlog("FAST_PATH", f'before="{before_title}" after="{title}"', "TITLE_CLEAN")
         anchor = self._clean_fallback_activity_title(match.group("anchor"))
         if not title or not anchor:
             return None
-        if match.groupdict().get("duration"):
-            duration_minutes = int(match.group("duration"))
 
         kind = clean_title(match.group("kind")).replace("right ", "")
         operation = {
@@ -1031,7 +1088,7 @@ class ModuleAParserMixin:
         return None
 
     def _clean_fallback_activity_title(self, value: str) -> str:
-        text = re.sub(r"\b(right|quick|my|the)\b", " ", value or "", flags=re.IGNORECASE)
+        text = re.sub(r"\b(right|quick|my|the|a|an)\b", " ", value or "", flags=re.IGNORECASE)
         text = re.sub(r"\s+", " ", text).strip(" .")
         return text.title() if text else ""
 

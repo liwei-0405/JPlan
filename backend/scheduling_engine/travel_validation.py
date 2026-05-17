@@ -39,6 +39,11 @@ class TravelValidationMixin:
             updated["status"] = "location_pending"
             updated["travel_validation_status"] = "pending_locations"
             updated["location_resolution_requests"] = location_requests
+            missing_coordinates = [
+                req.get("title") or req.get("current_guess") or "activity"
+                for req in location_requests
+            ]
+            jlog("TRAVEL_VALIDATION", f"missing_coordinates={missing_coordinates}", "LOCATION_PENDING")
             updated.setdefault("validation_issues", [])
             pending_titles = ", ".join(req.get("title", "activity") for req in location_requests[:4])
             updated["validation_issues"] = list(dict.fromkeys(updated["validation_issues"] + [
@@ -192,9 +197,11 @@ class TravelValidationMixin:
     ) -> List[Dict[str, Any]]:
         requests: List[Dict[str, Any]] = []
         seen_ids: set[str] = set()
-        blocks = list(envelope.get("schedule_blocks") or [])
+        grouped_by_location: Dict[str, Dict[str, Any]] = {}
+        blocks = list(envelope.get("schedule_blocks") or envelope.get("activities") or [])
         for index, block in enumerate(blocks):
-            if block.get("block_type") != "activity":
+            block_type = block.get("block_type") or block.get("type")
+            if block_type and block_type != "activity":
                 continue
             if not self._activity_needs_coordinate_resolution(block, saved_locations):
                 continue
@@ -207,28 +214,38 @@ class TravelValidationMixin:
             saved_matches = [
                 self.travel_service.format_saved_match(match)
                 for match in self.travel_service.saved_location_matches(current_guess, category, saved_locations)
+                if coordinate_from_saved_location(match)
             ][:5]
             query = self.travel_service.expand_alias(current_guess or block.get("title") or category or "", category)
-            geocode_candidates: List[Dict[str, Any]] = []
-            try:
-                geocode_candidates = self.travel_service.geocode_candidates(query, limit=5)
-            except Exception as exc:
-                self._debug(f"[TRAVEL] Geocoding skipped/failed for {block.get('title')}: {exc}")
             self._debug(
                 f"[TRAVEL][LOCATION_PENDING] {block.get('title')} requires {category or 'unknown'} location for accurate travel"
             )
-            requests.append({
+            location_key = clean_title(current_guess or "")
+            if location_key and location_key in grouped_by_location:
+                grouped = grouped_by_location[location_key]
+                grouped.setdefault("related_activity_ids", []).append(activity_id)
+                grouped.setdefault("related_titles", []).append(block.get("title"))
+                continue
+            request = {
                 "activity_id": activity_id,
                 "title": block.get("title"),
                 "category": category,
                 "current_guess": current_guess,
                 "expanded_query": query,
                 "requires_coordinate": True,
+                "location_readiness_status": "missing_coordinates",
                 "affected_transitions": self._affected_transitions_for_activity(blocks, index),
-                "reason": "Accurate travel time needs a confirmed coordinate for this activity.",
+                "reason": "Needs exact map location for accurate travel time.",
+                "display_reason": "needs exact map location",
                 "saved_matches": saved_matches,
-                "geocode_candidates": geocode_candidates[:5],
-            })
+                "geocode_candidates": [],
+                "same_location_as": block.get("same_location_as"),
+                "related_activity_ids": [],
+                "related_titles": [],
+            }
+            requests.append(request)
+            if location_key:
+                grouped_by_location[location_key] = request
         return requests
 
     def _activity_needs_coordinate_resolution(
@@ -525,12 +542,13 @@ class TravelValidationMixin:
                 })
                 continue
 
-            replacement_start = right_index
-            if transition_index is not None:
-                old_transition_start = parse_clock(transition.get("start") or transition.get("startTime") or "")
-                route_start = right_start - route_minutes
-                if old_transition_start is not None and route_start >= old_transition_start:
-                    replacement_start = transition_index
+            replacement_start = self._support_segment_start_before(blocks, right_index)
+            old_blocks_removed = max(0, right_index - replacement_start)
+            jlog(
+                "TRAVEL_BLOCK",
+                f"from={left.get('title')} to={right.get('title')} old_blocks_removed={old_blocks_removed}",
+                "REPLACE",
+            )
 
             replacement = self._route_timing_replacement_blocks(
                 blocks=blocks,
@@ -550,6 +568,11 @@ class TravelValidationMixin:
 
         for start, end, replacement in sorted(replacements, key=lambda item: item[0], reverse=True):
             blocks[start:end] = replacement
+
+        support_overlaps = self._support_block_overlaps(blocks)
+        jlog("SUPPORT_BLOCK", f"overlaps_found={len(support_overlaps)}", "OVERLAP_CHECK")
+        if support_overlaps:
+            route_conflicts.extend(support_overlaps)
 
         status = "route_conflict" if route_conflicts else ("fallback_used" if fallback_used else "validated")
         return {
@@ -626,5 +649,70 @@ class TravelValidationMixin:
         self._debug(
             f"[TRAVEL][TIMING] Updated transition {transition.get('title')}: {transition['start']}-{transition['end']}"
         )
+        jlog(
+            "TRAVEL_BLOCK",
+            (
+                f"from={left.get('title')} to={right.get('title')} "
+                f"start={transition['start']} end={transition['end']} duration={route_minutes}"
+            ),
+            "FINAL",
+        )
         return replacement
+
+    def _support_segment_start_before(
+        self,
+        blocks: List[Dict[str, Any]],
+        right_index: int,
+    ) -> int:
+        index = right_index - 1
+        while index >= 0 and self._is_support_block(blocks[index]):
+            index -= 1
+        return index + 1
+
+    def _is_support_block(self, block: Dict[str, Any]) -> bool:
+        block_type = clean_title(block.get("block_type") or block.get("type") or "")
+        title = clean_title(block.get("title") or "")
+        return (
+            block_type in {"idle", "free_time", "buffer", "prep", "transition", "travel"}
+            or title == "free time"
+            or "prep buffer" in title
+            or title.startswith("travel to")
+        )
+
+    def _block_time_bounds(self, block: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
+        start = parse_clock(block.get("start") or block.get("startTime") or "")
+        end = parse_clock(block.get("end") or block.get("endTime") or "")
+        if start is not None and end is not None and end <= start:
+            end += 24 * 60
+        return start, end
+
+    def _support_block_overlaps(self, blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        timed: List[Tuple[int, int, Dict[str, Any], bool]] = []
+        for block in blocks or []:
+            start, end = self._block_time_bounds(block)
+            if start is None or end is None:
+                continue
+            timed.append((start, end, block, self._is_support_block(block)))
+        timed.sort(key=lambda item: (item[0], item[1]))
+
+        overlaps: List[Dict[str, Any]] = []
+        for index, (start, end, block, is_support) in enumerate(timed):
+            for previous_start, previous_end, previous, previous_is_support in timed[:index]:
+                if previous_end <= start:
+                    continue
+                if not (is_support or previous_is_support):
+                    continue
+                overlaps.append({
+                    "type": "support_block_overlap",
+                    "from_activity": previous.get("title"),
+                    "to_activity": block.get("title"),
+                    "available_minutes": max(0, start - previous_start),
+                    "required_route_minutes": max(0, previous_end - start),
+                    "reason": (
+                        f"Support block timing overlaps between {previous.get('title')} "
+                        f"and {block.get('title')}."
+                    ),
+                })
+                break
+        return overlaps
 

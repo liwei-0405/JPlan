@@ -170,7 +170,7 @@ class SchedulingEngine(
                     if not operation.get("location") and self._should_inherit_anchor_location(operation):
                         anchor_activity = self._find_activity_by_stable_id(existing_active + canonical_activities, resolved_anchor.get("target_activity_id"))
                         if anchor_activity and not operation.get("location"):
-                            operation["location"] = anchor_activity.get("location")
+                            self._copy_anchor_location_to_operation(operation, anchor_activity)
             canonical_activities.append(
                 self._canonicalize_activity(
                     operation,

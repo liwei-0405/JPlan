@@ -76,6 +76,30 @@ class StateOperationsMixin:
             return False
         return True
 
+    def _copy_anchor_location_to_operation(
+        self,
+        operation: Dict[str, Any],
+        anchor_activity: Optional[Dict[str, Any]],
+    ) -> None:
+        if not anchor_activity:
+            return
+        operation["location"] = anchor_activity.get("location")
+        operation["location_label"] = anchor_activity.get("location_label") or anchor_activity.get("location")
+        operation["location_category"] = anchor_activity.get("location_category") or operation.get("location_category")
+        operation["location_normalized"] = anchor_activity.get("location_normalized")
+        operation["location_source"] = "inferred_from_anchor"
+        operation["same_location_as"] = anchor_activity.get("title")
+        operation["inherited_from_activity_id"] = (
+            anchor_activity.get("stable_activity_id")
+            or anchor_activity.get("id")
+            or anchor_activity.get("activity_id")
+        )
+        if anchor_activity.get("resolved_location"):
+            operation["resolved_location"] = deepcopy(anchor_activity.get("resolved_location"))
+            operation["location_status"] = "resolved"
+        else:
+            operation["location_status"] = anchor_activity.get("location_status") or operation.get("location_status")
+
     def _conflict_identity(self, conflict: Dict[str, Any]) -> Optional[str]:
         activity_ids = conflict.get("activity_ids") or []
         if len(activity_ids) < 2:
@@ -643,8 +667,7 @@ class StateOperationsMixin:
             if updated.get("location") is None and resolved_anchor and self._should_inherit_anchor_location(operation):
                 anchor_activity = self._find_activity_by_stable_id(anchor_pool, resolved_anchor.get("target_activity_id"))
                 if anchor_activity:
-                    updated["location"] = anchor_activity.get("location")
-                    updated["location_normalized"] = anchor_activity.get("location_normalized")
+                    self._copy_anchor_location_to_operation(updated, anchor_activity)
         elif explicit_fixed_start is not None or explicit_fixed_end is not None:
             if explicit_fixed_start is not None:
                 updated["requested_fixed_start"] = explicit_fixed_start
@@ -1057,7 +1080,7 @@ class StateOperationsMixin:
                         if not operation.get("location") and self._should_inherit_anchor_location(operation):
                             anchor_activity = self._find_activity_by_stable_id(active_pool, resolved_anchor.get("target_activity_id"))
                             if anchor_activity:
-                                operation["location"] = anchor_activity.get("location")
+                                self._copy_anchor_location_to_operation(operation, anchor_activity)
                 new_activity = self._canonicalize_activity(
                     operation,
                     source_turn=source_turn,
@@ -1489,6 +1512,8 @@ class StateOperationsMixin:
             "explicit_user_location": bool(item.get("explicit_user_location", False)),
             "location_warning": item.get("location_warning"),
             "area_preference": item.get("area_preference"),
+            "same_location_as": item.get("same_location_as"),
+            "inherited_from_activity_id": item.get("inherited_from_activity_id"),
             "travel_required": travel_required,
             "duration": item.get("duration") or self._duration_label(item.get("duration_minutes") or (s_end_val - s_start_val)),
             "duration_minutes": int(item.get("duration_minutes") or (s_end_val - s_start_val)),

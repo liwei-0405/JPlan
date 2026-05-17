@@ -1,6 +1,7 @@
 import os
 import json
 import time
+from copy import deepcopy
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -216,6 +217,7 @@ class LocationResolveRequest(BaseModel):
 class TravelCompleteRequest(BaseModel):
     user_id: str
     schedule: ScheduleEnvelope
+    source: Optional[str] = "manual"
 
 
 def debug_log(message: str) -> None:
@@ -257,6 +259,49 @@ def log_total_token_usage(parsed: Dict[str, Any], reply_meta: Optional[Dict[str,
     total = int(parser_usage.get("total", 0) or 0) + int(reply_usage.get("total", 0) or 0)
     if total:
         jlog("API", f"Prompt={total_prompt} | Candidates={total_candidates} | Total={total}", "TOKEN_TOTAL")
+
+def travel_validation_reply_meta(envelope: Dict[str, Any]) -> Dict[str, Any]:
+    status = envelope.get("travel_validation_status") or "not_requested"
+    requests = envelope.get("location_resolution_requests") or []
+    route_conflicts = envelope.get("route_conflicts") or []
+
+    if requests:
+        return {
+            "reply": "Please confirm the exact locations first so I can calculate accurate travel time.",
+            "reply_status": "location_pending",
+            "reply_reason": "accurate_travel_location_pending",
+        }
+
+    if status == "route_conflict" or route_conflicts:
+        conflict = route_conflicts[0] if route_conflicts else {}
+        reason = conflict.get("reason") or "Accurate travel time creates a timing conflict in the current plan."
+        return {
+            "reply": f"I checked accurate travel time, but it creates a travel conflict: {reason}",
+            "reply_status": "warning",
+            "reply_reason": reason,
+        }
+
+    if status == "fallback_used":
+        return {
+            "reply": "I could not get route data right now, so I kept the current schedule or used fallback travel estimates.",
+            "reply_status": "warning",
+            "reply_reason": "accurate_travel_fallback_used",
+        }
+
+    if status == "validated":
+        updated = int(envelope.get("updated_transition_count") or 0)
+        suffix = f" Updated {updated} travel transition{'s' if updated != 1 else ''}." if updated else ""
+        return {
+            "reply": f"I updated the plan using accurate travel time.{suffix}",
+            "reply_status": "success",
+            "reply_reason": "accurate_travel_validated",
+        }
+
+    return {
+        "reply": "I checked the current plan, but accurate travel validation was not applied.",
+        "reply_status": "warning",
+        "reply_reason": status,
+    }
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat_with_llm(request: ChatRequest):
@@ -333,6 +378,58 @@ async def chat_with_llm(request: ChatRequest):
                 schedule_data=request.current_schedule,
                 transcription=request.message,
                 reply_status="advice",
+            )
+
+        if route.get("route") == "accurate_travel_validation":
+            jlog("TRAVEL_REQUEST", "source=chat route=validate_existing_schedule accurate_travel_time=true")
+            if not current_envelope:
+                log_total_timer()
+                return ChatResponse(
+                    reply="I need a current schedule before I can calculate accurate travel time.",
+                    transcription=request.message,
+                    reply_status="clarification_needed",
+                    reply_reason="missing_current_schedule",
+                )
+
+            saved_locations = database.get_user_locations(request.user_id)
+            travel_envelope = deepcopy(current_envelope)
+            travel_envelope["accurate_travel_time"] = True
+            travel_envelope.setdefault("preferences", {})
+            travel_envelope["preferences"]["accurate_travel_time"] = True
+            schedule_id = travel_envelope.get("scheduleId") or travel_envelope.get("schedule_id") or "(draft)"
+            jlog(
+                "TRAVEL_VALIDATION",
+                f"schedule_id={schedule_id} date={travel_envelope.get('date')}",
+                "START",
+            )
+            validated = scheduling_engine._apply_accurate_travel_if_requested(travel_envelope, saved_locations)
+            pending_requests = validated.get("location_resolution_requests") or []
+            if pending_requests:
+                missing = [
+                    request.get("title") or request.get("current_guess") or "activity"
+                    for request in pending_requests
+                ]
+                jlog("TRAVEL_VALIDATION", f"missing={missing}", "LOCATION_PENDING")
+            updated_count = int(validated.get("updated_transition_count") or 0)
+            if updated_count:
+                jlog("TRAVEL_VALIDATION", f"transitions={updated_count}", "UPDATED")
+            jlog(
+                "TRAVEL_VALIDATION",
+                f"status={validated.get('travel_validation_status')}",
+                "DONE",
+            )
+
+            envelope_dict = database._parse_schedule_payload(validated, request.user_id, validated.get("date"))
+            full_envelope = ScheduleEnvelope(**envelope_dict)
+            reply_meta = travel_validation_reply_meta(envelope_dict)
+            log_total_timer()
+            return ChatResponse(
+                reply=reply_meta["reply"],
+                full_schedule=full_envelope,
+                schedule_data=full_envelope,
+                transcription=request.message,
+                reply_status=reply_meta.get("reply_status"),
+                reply_reason=reply_meta.get("reply_reason"),
             )
 
         # Fetch saved locations for the user to provide context to parsing/location normalization.
@@ -782,7 +879,10 @@ async def add_location(user_id: str, label: str, address: str, lat: float = None
 async def geocode_location(query: str, category: Optional[str] = None):
     expanded = travel_service.expand_alias(query, category)
     try:
+        jlog("LOCATION_SEARCH", f"query={expanded}", "ORS")
         geocode_result = travel_service.geocode_candidates_with_metadata(expanded, category=category, limit=5)
+        if "nominatim" in (geocode_result.get("providers_used") or []):
+            jlog("LOCATION_SEARCH", f"query={expanded} reason=ors_no_result", "NOMINATIM")
         return {
             "query": query,
             "expanded_query": expanded,
@@ -837,6 +937,10 @@ async def complete_travel_validation(request: TravelCompleteRequest):
     envelope.setdefault("preferences", {})
     envelope["preferences"]["accurate_travel_time"] = True
     schedule_id = envelope.get("scheduleId") or envelope.get("schedule_id") or "(draft)"
+    jlog(
+        "TRAVEL_REQUEST",
+        f"source={request.source or 'manual'} route=validate_existing_schedule accurate_travel_time=true",
+    )
     jlog(
         "TRAVEL_SERVICE",
         f"Starting accurate travel validation schedule_id={schedule_id} date={envelope.get('date')}",

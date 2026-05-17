@@ -32,7 +32,7 @@ class Module0RouterMixin:
         r"shopping|grocery|groceries|fyp|study|project|plan|schedule)\b"
     )
     _ROUTER_ACTION_PATTERN = (
-        r"\b(?:move|update|change|shift|add|remove|delete|cancel|arrange|rearrange|put|place|set|fit|"
+        r"\b(?:move|update|change|shift|add|schedule|remove|delete|cancel|arrange|rearrange|put|place|set|fit|"
         r"make|reschedule|delay|postpone|swap|switch)\b|"
         r"\b(?:bring|move|push)\s+(?:forward|backward|back)\b|"
         r"\bshift\s+(?:earlier|later)\b|"
@@ -44,6 +44,14 @@ class Module0RouterMixin:
         r"a\s+bit\s+earlier|a\s+little\s+earlier)\b"
     )
     _ROUTER_RELATION_PATTERN = r"\b(?:after|before|right\s+after|right\s+before|around|at)\b"
+    _ACCURATE_TRAVEL_REQUEST_PATTERN = (
+        r"\b(?:accurate|actual|real|route(?:-|\s*)aware)\s+(?:travel|route|commute)\s+time\b|"
+        r"\b(?:travel|route|commute)\s+time\s+(?:to\s+be\s+)?(?:accurate|actual|real)\b|"
+        r"\b(?:make|set)\s+(?:my\s+|the\s+)?(?:travel|route|commute)\s+time\s+(?:accurate|actual|real)\b|"
+        r"\b(?:add|include|consider|use|with|calculate)\s+(?:the\s+)?(?:accurate|actual|real)?\s*(?:travel|route|commute)\s+time\b|"
+        r"\b(?:recalculate|recompute|validate|check|update)\s+(?:the\s+)?(?:travel|route|commute)\s+time\b|"
+        r"\b(?:regenerate|rebuild|refresh)\b.*\b(?:accurate|actual|real)\s+(?:travel|route|commute)\s+time\b"
+    )
 
     def route_chat_request(
         self,
@@ -79,6 +87,18 @@ class Module0RouterMixin:
                 "confidence": 0.95,
                 "use_module_a_llm": False,
                 "reason": "matched_general_chat",
+            })
+            return self._log_route_decision(route)
+
+        if self._is_accurate_travel_validation_request(clean, current_schedule):
+            route.update({
+                "route": "accurate_travel_validation",
+                "confidence": 0.95,
+                "should_mutate_schedule": False,
+                "use_deterministic_parser": False,
+                "use_module_a_llm": False,
+                "use_advisory_llm": False,
+                "reason": "matched_accurate_travel_validation",
             })
             return self._log_route_decision(route)
 
@@ -182,7 +202,7 @@ class Module0RouterMixin:
             return self._log_route_decision(route)
 
         arrange_after = bool(re.search(
-            r"\b(?:arrange|rearrange|put|place|make|set)\s+(?:the\s+|my\s+)?[a-z][a-z\s]{1,40}?\s+(?:after|before)\s+(?:the\s+|my\s+)?[a-z][a-z\s]{1,40}\b",
+            r"\b(?:arrange|rearrange|put|place|make|set)\s+(?:the\s+|my\s+|a\s+|an\s+)?[a-z0-9][a-z0-9\s\-]{1,60}?\s+(?:right\s+after|right\s+before|after|before)\s+(?:the\s+|my\s+)?[a-z][a-z\s]{1,40}\b",
             clean,
         ))
         swap_order = bool(re.search(
@@ -222,7 +242,7 @@ class Module0RouterMixin:
 
         simple_patterns = (
             r"\b(?:can you\s+)?(?:move|update|change|shift)\s+(?:my\s+|the\s+)?(?:it|this|that|[a-z][a-z\s]{1,40}?)\s+to\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b",
-            r"\badd\s+.+\s+(?:right\s+after|right\s+before|after|before)\s+.+",
+            r"\b(?:add|schedule|put|place)\s+.+\s+(?:right\s+after|right\s+before|after|before)\s+.+",
             r"\b(?:after|before)\s+.+\s+add\s+.+",
             r"\b(?:remove|delete|cancel)\s+.+",
             r"\b(?:lower|raise|set|make)\s+.+\s+priority\b|\bpriority\s+(?:low|medium|high)\b",
@@ -268,6 +288,21 @@ class Module0RouterMixin:
             "reason": "no_schedule_action_detected",
         })
         return self._log_route_decision(route)
+
+    def _is_accurate_travel_validation_request(
+        self,
+        clean: str,
+        current_schedule: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        if re.search(self._ACCURATE_TRAVEL_REQUEST_PATTERN, clean):
+            return True
+        accurate_enabled = bool(
+            (current_schedule or {}).get("accurate_travel_time")
+            or ((current_schedule or {}).get("preferences") or {}).get("accurate_travel_time")
+        )
+        if accurate_enabled and re.search(r"\b(?:travel|route|commute)\b", clean):
+            return bool(re.search(r"\b(?:now|want|make|use|check|validate|calculate|recalculate|include|add|actual|accurate|real)\b", clean))
+        return False
 
     def _router_first_activity_entity(self, clean: str) -> Optional[str]:
         match = re.search(self._ROUTER_ACTIVITY_PATTERN, clean)
