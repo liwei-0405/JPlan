@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+from copy import deepcopy
 
 import pytest
 
@@ -253,10 +254,11 @@ class EmptyEditParserClient:
 
 
 class FakeTravelService:
-    def __init__(self, route_minutes=12, route_error=None, geocode_candidates=None):
+    def __init__(self, route_minutes=12, route_error=None, geocode_candidates=None, route_minutes_by_pair=None):
         self.route_minutes_value = route_minutes
         self.route_error = route_error
         self.geocode_candidates_value = geocode_candidates or []
+        self.route_minutes_by_pair = route_minutes_by_pair or {}
         self.route_calls = 0
         self.geocode_calls = 0
 
@@ -299,7 +301,34 @@ class FakeTravelService:
         self.route_calls += 1
         if self.route_error:
             raise self.route_error
+        key = (
+            round(float(from_coord[0]), 5),
+            round(float(from_coord[1]), 5),
+            round(float(to_coord[0]), 5),
+            round(float(to_coord[1]), 5),
+        )
+        if key in self.route_minutes_by_pair:
+            return self.route_minutes_by_pair[key]
         return self.route_minutes_value
+
+
+def _default_start_location():
+    return {
+        "label": "Home",
+        "display_name": "Home",
+        "address": "Home",
+        "latitude": 2.88,
+        "longitude": 101.58,
+        "source": "saved_location",
+    }
+
+
+def _accurate_preferences(**extra):
+    return {
+        "accurate_travel_time": True,
+        "default_start_location": _default_start_location(),
+        **extra,
+    }
 
 
 def _initial_parsed_request():
@@ -2246,9 +2275,20 @@ def test_location_normalizer_overrides_llm_home_for_grocery_without_explicit_hom
     assert grocery["location_status"] == "needs_resolution"
     assert grocery["raw_llm_location"] == "home"
     assert grocery["explicit_user_location"] is False
-    assert "[JPLAN][LOCATION] Grocery Shopping" in captured
-    assert "raw_llm_location=home" in captured
-    assert "normalized=store" in captured
+    assert "[JPLAN][LOCATION][SUMMARY]" in captured
+    assert "Grocery Shopping -> store (needs coordinates)" in captured
+
+
+def test_verbose_logging_gate_keeps_diagnostics_available(monkeypatch, capsys):
+    from jplan_logging import jlog_verbose
+
+    monkeypatch.delenv("JPLAN_VERBOSE_LOGS", raising=False)
+    jlog_verbose("TEST", "hidden diagnostic", "DETAIL")
+    assert "hidden diagnostic" not in capsys.readouterr().out
+
+    monkeypatch.setenv("JPLAN_VERBOSE_LOGS", "1")
+    jlog_verbose("TEST", "shown diagnostic", "DETAIL")
+    assert "[JPLAN][TEST][DETAIL] shown diagnostic" in capsys.readouterr().out
 
 
 def test_location_normalizer_keeps_explicit_grocery_at_home():
@@ -2664,8 +2704,8 @@ def test_apply_operations_scans_original_request_for_natural_preferences(capsys)
     assert "[JPLAN][IMPLICIT_LUNCH][CHECK] existing_lunch=false existing_meal_dinner_ignored=true" in logs
     assert "[JPLAN][IMPLICIT_LUNCH][ADD] title=Lunch Break window=12:00 PM-02:00 PM" in logs
     assert "[JPLAN][NORMALIZED_OPS] count=10" in logs
-    assert "[JPLAN][SOFT_PREF] FYP Implementation preferred_window=after_lunch preferred_order=after Lunch Break" in logs
-    assert "[JPLAN][SOFT_PREF] Call Parents preferred_window=night" in logs
+    assert "FYP Implementation -> preferred_window=after_lunch; preferred_order=after Lunch Break" in logs
+    assert "Call Parents -> preferred_window=night" in logs
     assert fyp["preferred_time_window"] == "after_lunch"
     assert any(order["target_title"] == "Lunch Break" for order in fyp["preferred_orders"])
     assert fyp["scheduled_start"] >= lunch["scheduled_end"]
@@ -2809,6 +2849,619 @@ def test_accurate_travel_off_keeps_heuristic_without_location_pending():
     assert envelope["status"] != "location_pending"
 
 
+def test_day_boundary_preferences_are_used_by_module_c():
+    engine = SchedulingEngine(DummyClient(), travel_service=FakeTravelService())
+    parsed = {
+        "intent": "add",
+        "reply": "Draft created.",
+        "transcription": "Plan focused work.",
+        "date": "2026-05-02",
+        "preferences": {"day_start_time": "10:00", "day_end_time": "12:00"},
+        "operations": [
+            {"op": "add", "title": "Focused Work", "duration_minutes": 60},
+        ],
+    }
+
+    envelope = engine.build_schedule_response(parsed, None, "Plan focused work.")["schedule_data"]
+    work = _activity_by_title(envelope, "Focused Work")
+
+    assert envelope["preferences"]["day_start"] == "10:00"
+    assert envelope["preferences"]["day_end"] == "12:00"
+    assert work["startTime"] == "10:00 AM"
+
+
+def test_accurate_travel_missing_default_start_returns_start_location_request_without_ors():
+    fake_travel = FakeTravelService(route_minutes=15)
+    engine = SchedulingEngine(DummyClient(), travel_service=fake_travel)
+    envelope = {
+        "date": "2026-05-02",
+        "status": "ok",
+        "schedule_status": "ok",
+        "travel_validation_status": "not_requested",
+        "accurate_travel_time": True,
+        "preferences": {"accurate_travel_time": True},
+        "activities": [],
+        "schedule_blocks": [
+            {
+                "block_type": "activity",
+                "id": "meeting",
+                "stable_activity_id": "meeting",
+                "title": "Client Meeting",
+                "start": "09:00 AM",
+                "end": "10:00 AM",
+                "startTime": "09:00 AM",
+                "endTime": "10:00 AM",
+                "location": "office",
+                "location_label": "office",
+                "resolved_location": {
+                    "display_name": "Office",
+                    "latitude": 2.9,
+                    "longitude": 101.6,
+                    "source": "event_confirmed",
+                },
+            },
+        ],
+        "warnings": [],
+        "location_resolution_requests": [],
+    }
+
+    updated = engine._apply_accurate_travel_if_requested(envelope, saved_locations=[])
+
+    assert updated["travel_validation_status"] == "pending_locations"
+    assert updated["schedule_status"] == "location_pending"
+    assert updated["location_resolution_requests"][0]["request_type"] == "start_location"
+    assert updated["location_resolution_requests"][0]["title"] == "Where are you starting from for this plan?"
+    assert fake_travel.route_calls == 0
+
+
+def test_default_start_location_calculates_route_to_first_physical_event():
+    fake_travel = FakeTravelService(route_minutes=17)
+    engine = SchedulingEngine(DummyClient(), travel_service=fake_travel)
+    envelope = {
+        "date": "2026-05-02",
+        "status": "ok",
+        "schedule_status": "ok",
+        "travel_validation_status": "not_requested",
+        "accurate_travel_time": True,
+        "preferences": _accurate_preferences(day_start_time="08:00", day_end_time="22:00"),
+        "activities": [],
+        "schedule_blocks": [
+            {
+                "block_type": "idle",
+                "type": "idle",
+                "title": "Free Time",
+                "start": "08:00 AM",
+                "end": "09:00 AM",
+                "startTime": "08:00 AM",
+                "endTime": "09:00 AM",
+                "duration_minutes": 60,
+            },
+            {
+                "block_type": "activity",
+                "id": "meeting",
+                "stable_activity_id": "meeting",
+                "title": "Client Meeting",
+                "start": "09:00 AM",
+                "end": "10:00 AM",
+                "startTime": "09:00 AM",
+                "endTime": "10:00 AM",
+                "location": "office",
+                "location_label": "office",
+            },
+        ],
+        "warnings": [],
+        "location_resolution_requests": [],
+    }
+    saved_locations = [
+        {"label": "office", "address": "Office", "latitude": 2.9, "longitude": 101.6},
+    ]
+
+    updated = engine._apply_accurate_travel_if_requested(envelope, saved_locations=saved_locations)
+
+    assert updated["travel_validation_status"] == "validated"
+    assert not any(block.get("block_type") == "transition" for block in updated["schedule_blocks"])
+    assert updated["start_route_summary"]["start_location"] == "Home"
+    assert updated["start_route_summary"]["first_physical_event"] == "Client Meeting"
+    assert updated["start_route_summary"]["leave_by"] == "08:43 AM"
+    assert fake_travel.route_calls == 1
+
+
+def test_route_context_excludes_non_physical_activities_from_matrix():
+    engine = SchedulingEngine(DummyClient(), travel_service=FakeTravelService(route_minutes=9))
+    physical_a = {
+        "id": "client",
+        "stable_activity_id": "client",
+        "title": "Client Meeting",
+        "location": "office",
+        "location_label": "office",
+        "travel_required": True,
+    }
+    home_task = {
+        "id": "deep",
+        "stable_activity_id": "deep",
+        "title": "Deep Work",
+        "location_category": "home_or_online",
+        "location_status": "not_required",
+        "travel_required": False,
+    }
+    physical_b = {
+        "id": "dinner",
+        "stable_activity_id": "dinner",
+        "title": "Dinner",
+        "location": "Dinner Place",
+        "location_label": "Dinner Place",
+        "location_category": "meal_place",
+        "travel_required": True,
+    }
+    saved_locations = [
+        {"label": "office", "address": "Office", "latitude": 2.9, "longitude": 101.6},
+        {"label": "Dinner Place", "address": "Dinner Place", "latitude": 3.1, "longitude": 101.7},
+    ]
+
+    context = engine._build_route_context(
+        {"date": "2026-05-02", "preferences": _accurate_preferences()},
+        [physical_a, home_task, physical_b],
+        saved_locations,
+    )
+
+    assert set(context["nodes"].keys()) == {"id:client", "id:dinner"}
+    assert "id:deep" not in context["nodes"]
+    assert set(context["pairs"].keys()) == {"id:client->id:dinner", "id:dinner->id:client"}
+
+
+def test_route_context_precomputes_non_neighbor_physical_pairs_for_reorder():
+    engine = SchedulingEngine(DummyClient(), travel_service=FakeTravelService(route_minutes=11))
+    activities = [
+        {"id": "a", "stable_activity_id": "a", "title": "A", "location": "A", "location_label": "A", "travel_required": True},
+        {"id": "b", "stable_activity_id": "b", "title": "B", "location": "B", "location_label": "B", "travel_required": True},
+        {"id": "c", "stable_activity_id": "c", "title": "C", "location": "C", "location_label": "C", "travel_required": True},
+    ]
+    saved_locations = [
+        {"label": "A", "address": "A", "latitude": 2.90, "longitude": 101.60},
+        {"label": "B", "address": "B", "latitude": 2.91, "longitude": 101.61},
+        {"label": "C", "address": "C", "latitude": 2.92, "longitude": 101.62},
+    ]
+
+    context = engine._build_route_context(
+        {"date": "2026-05-02", "preferences": _accurate_preferences()},
+        activities,
+        saved_locations,
+    )
+
+    assert len(context["pairs"]) == 6
+    assert context["pairs"]["id:a->id:c"]["duration_minutes"] == 11
+    assert context["pairs"]["id:c->id:a"]["duration_minutes"] == 11
+
+
+def test_route_context_detects_same_location_groups_and_excludes_non_physical(capsys):
+    engine = SchedulingEngine(DummyClient(), travel_service=FakeTravelService(route_minutes=9))
+    activities = [
+        {"id": "client", "stable_activity_id": "client", "title": "Client Meeting", "location": "Mid Valley", "location_label": "Mid Valley", "travel_required": True},
+        {"id": "grocery", "stable_activity_id": "grocery", "title": "Grocery Run", "location": "Mid Valley", "location_label": "Mid Valley", "travel_required": True},
+        {"id": "deep", "stable_activity_id": "deep", "title": "Deep Work", "location_category": "home_or_online", "travel_required": False},
+    ]
+    saved_locations = [
+        {"label": "Mid Valley", "address": "Mid Valley", "latitude": 3.118, "longitude": 101.677},
+    ]
+
+    context = engine._build_route_context(
+        {"date": "2026-05-02", "preferences": _accurate_preferences()},
+        activities,
+        saved_locations,
+    )
+    logs = capsys.readouterr().out
+
+    assert set(context["nodes"]) == {"id:client", "id:grocery"}
+    assert context["same_location_groups"]
+    assert set(context["same_location_groups"][0]["titles"]) == {"Client Meeting", "Grocery Run"}
+    assert "[JPLAN][MODULE_C][SAME_LOCATION_GROUP]" in logs
+
+
+def _same_location_route_context():
+    def node(activity_id, title, lat, lng, location):
+        return {
+            "key": f"id:{activity_id}",
+            "activity_id": activity_id,
+            "title": title,
+            "location": location,
+            "location_label": location,
+            "coordinate": {"latitude": lat, "longitude": lng},
+        }
+
+    nodes = {
+        "id:client": node("client", "Client Meeting", 3.118, 101.677, "Mid Valley"),
+        "id:grocery": node("grocery", "Grocery Run", 3.118, 101.677, "Mid Valley"),
+        "id:team": node("team", "Team Lunch", 3.129, 101.670, "Bangsar"),
+    }
+
+    def pair(left, right, minutes):
+        return {
+            "from_key": f"id:{left}",
+            "to_key": f"id:{right}",
+            "from_title": nodes[f"id:{left}"]["title"],
+            "to_title": nodes[f"id:{right}"]["title"],
+            "duration_minutes": minutes,
+            "source": "routing_service" if minutes else "same_location",
+        }
+
+    return {
+        "enabled": True,
+        "nodes": nodes,
+        "pairs": {
+            "id:client->id:grocery": pair("client", "grocery", 0),
+            "id:grocery->id:client": pair("grocery", "client", 0),
+            "id:client->id:team": pair("client", "team", 10),
+            "id:team->id:client": pair("team", "client", 10),
+            "id:grocery->id:team": pair("grocery", "team", 10),
+            "id:team->id:grocery": pair("team", "grocery", 10),
+        },
+        "start_routes": {},
+        "same_location_groups": [{
+            "keys": ["id:client", "id:grocery"],
+            "titles": ["Client Meeting", "Grocery Run"],
+            "travel_minutes": 0,
+        }],
+        "missing": [],
+    }
+
+
+def _route_efficiency_activity(activity_id, title, start, end, location, *, fixed=False, priority="medium"):
+    return {
+        "id": activity_id,
+        "stable_activity_id": activity_id,
+        "title": title,
+        "scheduled_start": start,
+        "scheduled_end": end,
+        "duration_minutes": end - start,
+        "startTime": format_minutes_for_test(start),
+        "endTime": format_minutes_for_test(end),
+        "timing_mode": TimingMode.FIXED if fixed else TimingMode.UNSPECIFIED,
+        "fixed_start": start if fixed else None,
+        "fixed_end": end if fixed else None,
+        "is_user_fixed": fixed,
+        "locked_fixed": fixed,
+        "priority": priority,
+        "location": location,
+        "location_label": location,
+        "travel_required": True,
+    }
+
+
+def format_minutes_for_test(minutes):
+    hour = (minutes // 60) % 24
+    minute = minutes % 60
+    suffix = "AM" if hour < 12 else "PM"
+    display_hour = hour % 12 or 12
+    return f"{display_hour:02d}:{minute:02d} {suffix}"
+
+
+def test_module_d_same_location_cluster_moves_only_flexible_and_records_efficiency(capsys):
+    engine = SchedulingEngine(DummyClient(), travel_service=FakeTravelService())
+    engine._current_route_context = _same_location_route_context()
+    timeline = [
+        _route_efficiency_activity("client", "Client Meeting", 540, 600, "Mid Valley", fixed=True),
+        _route_efficiency_activity("team", "Team Lunch", 750, 810, "Bangsar", fixed=True),
+        _route_efficiency_activity("grocery", "Grocery Run", 840, 885, "Mid Valley", priority="low"),
+    ]
+
+    repaired, _, meta = engine._apply_module_d_refinement(
+        timeline,
+        [],
+        480,
+        1320,
+        0,
+        {"refinement_reason": "explicit_optimize"},
+    )
+    logs = capsys.readouterr().out
+    engine._current_route_context = None
+
+    client = next(item for item in repaired if item["stable_activity_id"] == "client")
+    team = next(item for item in repaired if item["stable_activity_id"] == "team")
+    grocery = next(item for item in repaired if item["stable_activity_id"] == "grocery")
+
+    assert client["scheduled_start"] == 540
+    assert team["scheduled_start"] == 750
+    assert grocery["scheduled_start"] != 840
+    gap_after_client = grocery["scheduled_start"] - client["scheduled_end"]
+    gap_before_client = client["scheduled_start"] - grocery["scheduled_end"]
+    assert (
+        0 <= gap_after_client <= 20
+        or 0 <= gap_before_client <= 20
+    )
+    assert meta["refinement_applied"] is True
+    assert meta["route_efficiency"]["route_total_after"] < meta["route_efficiency"]["route_total_before"]
+    assert meta["route_efficiency"]["same_location_split_penalty_after"] < meta["route_efficiency"]["same_location_split_penalty_before"]
+    assert "[JPLAN][MODULE_D][CANDIDATE] type=same_location_cluster target=Grocery Run anchor=Client Meeting" in logs
+    assert "[JPLAN][MODULE_D][SCORE_BREAKDOWN]" in logs
+    assert "[JPLAN][MODULE_D][SAME_LOCATION_ORDER]" in logs
+
+
+def test_route_breakdown_penalizes_revisit_more_than_clustered_order():
+    engine = SchedulingEngine(DummyClient(), travel_service=FakeTravelService())
+    engine._current_route_context = _same_location_route_context()
+    a = _route_efficiency_activity("client", "Client Meeting", 540, 600, "Mid Valley", fixed=True)
+    b = _route_efficiency_activity("team", "Team Lunch", 750, 810, "Bangsar", fixed=True)
+    a2 = _route_efficiency_activity("grocery", "Grocery Run", 840, 885, "Mid Valley")
+    split = engine._module_d_route_breakdown([a, b, a2], [], 480, 1320, 0)
+    clustered_grocery = deepcopy(a2)
+    clustered_grocery["scheduled_start"] = 605
+    clustered_grocery["scheduled_end"] = 650
+    clustered = engine._module_d_route_breakdown([a, clustered_grocery, b], [], 480, 1320, 0)
+    engine._current_route_context = None
+
+    assert split["revisit_location_penalty"] > clustered["revisit_location_penalty"]
+    assert split["same_location_split_penalty"] > clustered["same_location_split_penalty"]
+    assert split["total_travel_minutes"] > clustered["total_travel_minutes"]
+
+
+def test_same_location_cluster_rejection_logs_reason(capsys):
+    engine = SchedulingEngine(DummyClient(), travel_service=FakeTravelService())
+    engine._current_route_context = _same_location_route_context()
+    timeline = [
+        _route_efficiency_activity("client", "Client Meeting", 540, 600, "Mid Valley", fixed=True),
+        _route_efficiency_activity("team", "Team Lunch", 620, 680, "Bangsar", fixed=True),
+        _route_efficiency_activity("grocery", "Grocery Run", 720, 765, "Mid Valley", priority="low"),
+    ]
+
+    engine._apply_module_d_refinement(
+        timeline,
+        [],
+        540,
+        780,
+        0,
+        {"refinement_reason": "explicit_optimize"},
+    )
+    logs = capsys.readouterr().out
+    engine._current_route_context = None
+
+    assert "[JPLAN][MODULE_D][REJECT] type=same_location_cluster reason=" in logs
+
+
+def test_start_route_constraint_moves_or_unfits_pre_first_event_task(capsys):
+    fake_travel = FakeTravelService(route_minutes=31)
+    engine = SchedulingEngine(DummyClient(), travel_service=fake_travel)
+    deep_work = {
+        "id": "deep",
+        "stable_activity_id": "deep",
+        "title": "Deep Work",
+        "startTime": "07:00 AM",
+        "endTime": "09:00 AM",
+        "scheduled_start": 420,
+        "scheduled_end": 540,
+        "duration_minutes": 120,
+        "priority": "high",
+        "timing_mode": TimingMode.UNSPECIFIED,
+        "original_timing_mode": TimingMode.UNSPECIFIED,
+        "is_user_fixed": False,
+        "is_system_scheduled": True,
+        "can_move_for_repair": True,
+        "location_category": "home_or_online",
+        "location_status": "not_required",
+        "travel_required": False,
+    }
+    client = {
+        "id": "client",
+        "stable_activity_id": "client",
+        "title": "Client Meeting",
+        "startTime": "09:00 AM",
+        "endTime": "10:00 AM",
+        "scheduled_start": 540,
+        "scheduled_end": 600,
+        "duration_minutes": 60,
+        "timing_mode": TimingMode.FIXED,
+        "original_timing_mode": TimingMode.FIXED,
+        "fixed_start": 540,
+        "fixed_end": 600,
+        "is_user_fixed": True,
+        "user_fixed_start": 540,
+        "can_move_for_repair": False,
+        "location": "office",
+        "location_label": "office",
+    }
+    envelope = {
+        "date": "2026-05-02",
+        "status": "ok",
+        "schedule_status": "ok",
+        "travel_validation_status": "not_requested",
+        "accurate_travel_time": True,
+        "preferences": _accurate_preferences(day_start_time="07:00", day_end_time="22:00"),
+        "activities": [deep_work, client],
+        "schedule_blocks": [
+            {"block_type": "activity", "start": "07:00 AM", "end": "09:00 AM", **deep_work},
+            {"block_type": "activity", "start": "09:00 AM", "end": "10:00 AM", **client},
+        ],
+        "warnings": [],
+        "location_resolution_requests": [],
+    }
+    saved_locations = [
+        {"label": "office", "address": "Office", "latitude": 2.9, "longitude": 101.6},
+    ]
+
+    updated = engine._apply_accurate_travel_if_requested(envelope, saved_locations=saved_locations)
+    logs = capsys.readouterr().out
+
+    assert updated["start_route_summary"]["leave_by"] == "08:29 AM"
+    assert "[JPLAN][START_ROUTE][CONSTRAINT]" in logs
+    assert "[JPLAN][MODULE_D][START_BURDEN]" in logs
+    assert updated["travel_validation_status"] in {"validated", "fallback_used", "partial_feasible_with_unfit", "repaired_validated"}
+    deep = _activity_by_title(updated, "Deep Work")
+    if deep:
+        deep_start = parse_clock(deep["startTime"])
+        deep_end = parse_clock(deep["endTime"])
+        assert deep_end <= 509 or deep_start >= 600
+    else:
+        assert any(item["title"] == "Deep Work" for item in updated.get("unfit_activities", []))
+
+
+def test_accurate_travel_validation_recognizes_type_only_activity_blocks():
+    fake_travel = FakeTravelService(route_minutes=12)
+    engine = SchedulingEngine(DummyClient(), travel_service=fake_travel)
+    client = {
+        "id": "client",
+        "stable_activity_id": "client",
+        "type": "activity",
+        "title": "Client Meeting",
+        "start": "09:00 AM",
+        "end": "10:00 AM",
+        "startTime": "09:00 AM",
+        "endTime": "10:00 AM",
+        "duration_minutes": 60,
+        "timing_mode": TimingMode.FIXED,
+        "fixed_start": 540,
+        "fixed_end": 600,
+        "is_user_fixed": True,
+        "location": "Mid Valley",
+        "location_label": "Mid Valley",
+        "travel_required": True,
+    }
+    dentist = {
+        "id": "dentist",
+        "stable_activity_id": "dentist",
+        "type": "activity",
+        "title": "Dentist Appointment",
+        "start": "05:00 PM",
+        "end": "06:00 PM",
+        "startTime": "05:00 PM",
+        "endTime": "06:00 PM",
+        "duration_minutes": 60,
+        "timing_mode": TimingMode.FIXED,
+        "fixed_start": 1020,
+        "fixed_end": 1080,
+        "is_user_fixed": True,
+        "location": "Cheras",
+        "location_label": "Cheras",
+        "travel_required": True,
+    }
+    envelope = {
+        "date": "2026-05-02",
+        "status": "ok",
+        "schedule_status": "ok",
+        "travel_validation_status": "not_requested",
+        "accurate_travel_time": True,
+        "preferences": _accurate_preferences(day_start_time="08:00", day_end_time="22:00"),
+        "activities": [client, dentist],
+        "schedule_blocks": [
+            client,
+            {"type": "travel", "title": "Travel to Cheras", "start": "04:40 PM", "end": "05:00 PM", "duration_minutes": 20},
+            dentist,
+        ],
+        "warnings": [],
+        "location_resolution_requests": [],
+    }
+    saved_locations = [
+        {"label": "Mid Valley", "address": "Mid Valley", "latitude": 3.118, "longitude": 101.677},
+        {"label": "Cheras", "address": "Cheras", "latitude": 3.08, "longitude": 101.74},
+    ]
+
+    updated = engine._apply_accurate_travel_if_requested(envelope, saved_locations)
+
+    assert updated["start_route_summary"]["first_physical_event"] == "Client Meeting"
+    assert updated["travel_validation_status"] in {"validated", "fallback_used"}
+    travel_blocks = [
+        block for block in updated["schedule_blocks"]
+        if block.get("type") in {"travel", "transition"} or block.get("block_type") == "transition"
+    ]
+    assert len(travel_blocks) == 1
+    assert travel_blocks[0]["duration_minutes"] == 12
+
+
+def test_start_route_unfit_uses_partial_feasible_status():
+    fake_travel = FakeTravelService(route_minutes=31)
+    engine = SchedulingEngine(DummyClient(), travel_service=fake_travel)
+    envelope = {
+        "date": "2026-05-02",
+        "status": "ok",
+        "schedule_status": "ok",
+        "travel_validation_status": "not_requested",
+        "accurate_travel_time": True,
+        "preferences": _accurate_preferences(day_start_time="07:00", day_end_time="11:00"),
+        "activities": [
+            {
+                "id": "deep",
+                "stable_activity_id": "deep",
+                "title": "Deep Work",
+                "startTime": "07:00 AM",
+                "endTime": "09:00 AM",
+                "scheduled_start": 420,
+                "scheduled_end": 540,
+                "duration_minutes": 120,
+                "priority": "low",
+                "timing_mode": TimingMode.UNSPECIFIED,
+                "is_user_fixed": False,
+                "is_system_scheduled": True,
+                "can_move_for_repair": True,
+                "location_category": "home_or_online",
+                "location_status": "not_required",
+                "travel_required": False,
+            },
+            {
+                "id": "client",
+                "stable_activity_id": "client",
+                "title": "Client Meeting",
+                "startTime": "09:00 AM",
+                "endTime": "10:00 AM",
+                "scheduled_start": 540,
+                "scheduled_end": 600,
+                "duration_minutes": 60,
+                "timing_mode": TimingMode.FIXED,
+                "fixed_start": 540,
+                "fixed_end": 600,
+                "is_user_fixed": True,
+                "user_fixed_start": 540,
+                "can_move_for_repair": False,
+                "location": "office",
+                "location_label": "office",
+            },
+        ],
+        "schedule_blocks": [
+            {
+                "block_type": "activity",
+                "id": "deep",
+                "stable_activity_id": "deep",
+                "title": "Deep Work",
+                "start": "07:00 AM",
+                "end": "09:00 AM",
+                "startTime": "07:00 AM",
+                "endTime": "09:00 AM",
+                "duration_minutes": 120,
+                "location_category": "home_or_online",
+                "location_status": "not_required",
+                "travel_required": False,
+            },
+            {
+                "block_type": "activity",
+                "id": "client",
+                "stable_activity_id": "client",
+                "title": "Client Meeting",
+                "start": "09:00 AM",
+                "end": "10:00 AM",
+                "startTime": "09:00 AM",
+                "endTime": "10:00 AM",
+                "duration_minutes": 60,
+                "timing_mode": TimingMode.FIXED,
+                "fixed_start": 540,
+                "fixed_end": 600,
+                "is_user_fixed": True,
+                "user_fixed_start": 540,
+                "can_move_for_repair": False,
+                "location": "office",
+                "location_label": "office",
+            },
+        ],
+        "warnings": [],
+        "location_resolution_requests": [],
+    }
+
+    updated = engine._apply_accurate_travel_if_requested(
+        envelope,
+        saved_locations=[{"label": "office", "address": "Office", "latitude": 2.9, "longitude": 101.6}],
+    )
+
+    assert updated["travel_validation_status"] == "partial_feasible_with_unfit"
+    assert updated["schedule_status"] == "partial"
+    assert any(item["title"] == "Deep Work" for item in updated["unfit_activities"])
+
+
 def test_accurate_travel_on_missing_location_returns_location_pending_without_background_geocode():
     fake_travel = FakeTravelService(geocode_candidates=[
         {
@@ -2825,7 +3478,7 @@ def test_accurate_travel_on_missing_location_returns_location_pending_without_ba
         "reply": "Draft created.",
         "transcription": "Fit in a grocery shopping trip.",
         "date": "2026-05-02",
-        "preferences": {"accurate_travel_time": True},
+        "preferences": _accurate_preferences(),
         "operations": [
             {"op": "add", "title": "Grocery Shopping", "duration_minutes": 45, "location": "home"},
         ],
@@ -2854,7 +3507,7 @@ def test_accurate_travel_with_saved_coordinates_uses_route_service():
         "reply": "Draft created.",
         "transcription": "Meeting at Main Office followed by Seminar at Library.",
         "date": "2026-05-02",
-        "preferences": {"accurate_travel_time": True},
+        "preferences": _accurate_preferences(),
         "operations": [
             {"op": "add", "title": "Meeting", "timing_mode": TimingMode.FIXED, "fixed_start": "09:00", "duration_minutes": 60, "location": "office"},
             {"op": "add", "title": "Seminar", "timing_mode": TimingMode.FIXED, "fixed_start": "10:30", "duration_minutes": 60, "location": "library"},
@@ -2876,7 +3529,7 @@ def test_accurate_travel_with_saved_coordinates_uses_route_service():
     assert envelope["travel_validation_status"] == "validated"
     assert transition["travel_estimate_source"] == "routing_service"
     assert transition["route_duration_minutes"] == 18
-    assert fake_travel.route_calls == 1
+    assert fake_travel.route_calls == 2
 
 
 def test_accurate_travel_requires_coordinates_not_location_labels_only():
@@ -2887,7 +3540,7 @@ def test_accurate_travel_requires_coordinates_not_location_labels_only():
         "reply": "Draft created.",
         "transcription": "Client meeting at Bangsar followed by dinner at Cheras.",
         "date": "2026-05-02",
-        "preferences": {"accurate_travel_time": True},
+        "preferences": _accurate_preferences(),
         "operations": [
             {"op": "add", "title": "Client Meeting", "timing_mode": TimingMode.FIXED, "fixed_start": "09:00", "duration_minutes": 60, "location": "Bangsar"},
             {"op": "add", "title": "Dinner", "timing_mode": TimingMode.FIXED, "fixed_start": "11:00", "duration_minutes": 60, "location": "Cheras"},
@@ -2924,7 +3577,7 @@ def test_accurate_travel_readiness_excludes_location_neutral_tasks_and_keeps_phy
             "dentist near Cheras, grocery run, and dinner with parents."
         ),
         "date": "2026-05-02",
-        "preferences": {"accurate_travel_time": True},
+        "preferences": _accurate_preferences(),
         "operations": [
             {"op": "add", "title": "Client Meeting", "timing_mode": TimingMode.FIXED, "fixed_start": "09:00", "duration_minutes": 60, "location": "Mid Valley"},
             {"op": "add", "title": "Deep Work", "timing_mode": TimingMode.FIXED, "fixed_start": "10:30", "duration_minutes": 60},
@@ -2962,7 +3615,7 @@ def test_accurate_travel_skips_location_neutral_tasks_and_bridges_real_locations
         "reply": "Draft created.",
         "transcription": "Study at Library, then review assignment, then go to gym.",
         "date": "2026-05-02",
-        "preferences": {"accurate_travel_time": True},
+        "preferences": _accurate_preferences(),
         "operations": [
             {"op": "add", "title": "Study at library", "timing_mode": TimingMode.FIXED, "fixed_start": "09:00", "duration_minutes": 60, "location": "library"},
             {"op": "add", "title": "Review assignment", "timing_mode": TimingMode.FIXED, "fixed_start": "10:00", "duration_minutes": 30},
@@ -2981,7 +3634,10 @@ def test_accurate_travel_skips_location_neutral_tasks_and_bridges_real_locations
         saved_locations=saved_locations,
     )["schedule_data"]
     review = _activity_by_title(envelope, "Review assignment")
-    transition = next(block for block in envelope["schedule_blocks"] if block.get("block_type") == "transition")
+    transition = next(
+        block for block in envelope["schedule_blocks"]
+        if block.get("block_type") == "transition" and block.get("to_location") == "gym"
+    )
 
     assert review["location_status"] == "not_required"
     assert review["travel_required"] is False
@@ -2990,7 +3646,7 @@ def test_accurate_travel_skips_location_neutral_tasks_and_bridges_real_locations
     assert transition["from_location"] == "library"
     assert transition["to_location"] == "gym"
     assert transition["route_duration_minutes"] == 12
-    assert fake_travel.route_calls == 1
+    assert fake_travel.route_calls == 2
 
 
 def test_complete_travel_validation_clears_location_pending_state():
@@ -3002,7 +3658,7 @@ def test_complete_travel_validation_clears_location_pending_state():
         "schedule_status": "location_pending",
         "travel_validation_status": "pending_locations",
         "accurate_travel_time": True,
-        "preferences": {"accurate_travel_time": True},
+        "preferences": _accurate_preferences(),
         "location_resolution_requests": [
             {"activity_id": "meeting", "title": "Meeting"},
         ],
@@ -3064,7 +3720,7 @@ def test_complete_travel_validation_uses_event_level_resolved_locations():
         "schedule_status": "location_pending",
         "travel_validation_status": "pending_locations",
         "accurate_travel_time": True,
-        "preferences": {"accurate_travel_time": True},
+        "preferences": _accurate_preferences(),
         "location_resolution_requests": [
             {"activity_id": "meeting", "title": "Meeting"},
             {"activity_id": "seminar", "title": "Seminar"},
@@ -3121,7 +3777,10 @@ def test_complete_travel_validation_uses_event_level_resolved_locations():
     }
 
     envelope = engine._apply_accurate_travel_if_requested(pending_envelope, saved_locations=[])
-    transition = next(block for block in envelope["schedule_blocks"] if block.get("block_type") == "transition")
+    transition = next(
+        block for block in envelope["schedule_blocks"]
+        if block.get("block_type") == "transition" and block.get("to_location") == "Library map point"
+    )
 
     assert envelope["travel_validation_status"] == "validated"
     assert envelope["schedule_status"] == "ok"
@@ -3129,7 +3788,7 @@ def test_complete_travel_validation_uses_event_level_resolved_locations():
     assert transition["travel_estimate_source"] == "routing_service"
     assert transition["from_coordinate"] == {"latitude": 2.9, "longitude": 101.6}
     assert transition["to_coordinate"] == {"latitude": 2.91, "longitude": 101.61}
-    assert fake_travel.route_calls == 1
+    assert fake_travel.route_calls == 2
 
 
 def test_accurate_route_duration_retimes_transition_and_creates_idle_slack():
@@ -3141,7 +3800,7 @@ def test_accurate_route_duration_retimes_transition_and_creates_idle_slack():
         "schedule_status": "location_pending",
         "travel_validation_status": "pending_locations",
         "accurate_travel_time": True,
-        "preferences": {"accurate_travel_time": True},
+        "preferences": _accurate_preferences(),
         "location_resolution_requests": [],
         "validation_issues": [
             "Accurate travel time is pending location confirmation for Seminar.",
@@ -3226,7 +3885,10 @@ def test_accurate_route_duration_retimes_transition_and_creates_idle_slack():
     ]
 
     envelope = engine._apply_accurate_travel_if_requested(pending_envelope, saved_locations)
-    travel = next(block for block in envelope["schedule_blocks"] if block.get("block_type") == "transition")
+    travel = next(
+        block for block in envelope["schedule_blocks"]
+        if block.get("block_type") == "transition" and block.get("to_location") == "library"
+    )
     new_idle = next(
         block for block in envelope["schedule_blocks"]
         if block.get("block_type") == "idle" and block.get("start") == "10:30 AM"
@@ -3262,7 +3924,7 @@ def test_accurate_route_longer_duration_replaces_stale_support_segment():
         "schedule_status": "ok",
         "travel_validation_status": "not_requested",
         "accurate_travel_time": True,
-        "preferences": {"accurate_travel_time": True},
+        "preferences": _accurate_preferences(),
         "activities": [],
         "schedule_blocks": [
             {
@@ -3344,9 +4006,15 @@ def test_accurate_route_longer_duration_replaces_stale_support_segment():
     ]
 
     envelope = engine._apply_accurate_travel_if_requested(pending_envelope, saved_locations)
-    transitions = [block for block in envelope["schedule_blocks"] if block.get("block_type") == "transition"]
+    transitions = [
+        block for block in envelope["schedule_blocks"]
+        if block.get("block_type") == "transition" and block.get("to_location") == "Cheras"
+    ]
     buffers = [block for block in envelope["schedule_blocks"] if block.get("block_type") == "buffer"]
-    idle = next(block for block in envelope["schedule_blocks"] if block.get("block_type") == "idle")
+    idle = next(
+        block for block in envelope["schedule_blocks"]
+        if block.get("block_type") == "idle" and block.get("start") == "03:30 PM"
+    )
 
     assert envelope["travel_validation_status"] == "validated"
     assert envelope["route_conflicts"] == []
@@ -3361,6 +4029,296 @@ def test_accurate_route_longer_duration_replaces_stale_support_segment():
     assert idle["end"] == "04:30 PM"
 
 
+def _route_repair_dentist_dinner_envelope():
+    return {
+        "date": "2026-05-02",
+        "version": 3,
+        "status": "ok",
+        "schedule_status": "ok",
+        "travel_validation_status": "not_requested",
+        "accurate_travel_time": True,
+        "preferences": _accurate_preferences(),
+        "activities": [
+            {
+                "id": "dentist",
+                "stable_activity_id": "dentist",
+                "title": "Dentist Appointment",
+                "startTime": "05:00 PM",
+                "endTime": "06:00 PM",
+                "scheduled_start": 1020,
+                "scheduled_end": 1080,
+                "duration_minutes": 60,
+                "timing_mode": TimingMode.FIXED,
+                "original_timing_mode": TimingMode.FIXED,
+                "fixed_start": 1020,
+                "fixed_end": 1080,
+                "is_user_fixed": True,
+                "user_fixed_start": 1020,
+                "can_move_for_repair": False,
+                "location": "Cheras",
+                "location_label": "Cheras",
+            },
+            {
+                "id": "dinner",
+                "stable_activity_id": "dinner",
+                "title": "Dinner with Parents",
+                "startTime": "06:00 PM",
+                "endTime": "07:30 PM",
+                "scheduled_start": 1080,
+                "scheduled_end": 1170,
+                "duration_minutes": 90,
+                "timing_mode": TimingMode.UNSPECIFIED,
+                "original_timing_mode": TimingMode.UNSPECIFIED,
+                "is_user_fixed": False,
+                "is_system_scheduled": True,
+                "can_move_for_repair": True,
+                "preferred_time_window": "evening",
+                "preferred_window_start": 1080,
+                "preferred_window_end": 1260,
+                "location": "Dinner Place",
+                "location_label": "Dinner Place",
+                "location_category": "meal_place",
+            },
+        ],
+        "schedule_blocks": [
+            {
+                "block_type": "activity",
+                "id": "dentist",
+                "stable_activity_id": "dentist",
+                "title": "Dentist Appointment",
+                "start": "05:00 PM",
+                "end": "06:00 PM",
+                "startTime": "05:00 PM",
+                "endTime": "06:00 PM",
+                "duration_minutes": 60,
+                "timing_mode": TimingMode.FIXED,
+                "original_timing_mode": TimingMode.FIXED,
+                "fixed_start": 1020,
+                "fixed_end": 1080,
+                "is_user_fixed": True,
+                "user_fixed_start": 1020,
+                "can_move_for_repair": False,
+                "location": "Cheras",
+                "location_label": "Cheras",
+            },
+            {
+                "block_type": "activity",
+                "id": "dinner",
+                "stable_activity_id": "dinner",
+                "title": "Dinner with Parents",
+                "start": "06:00 PM",
+                "end": "07:30 PM",
+                "startTime": "06:00 PM",
+                "endTime": "07:30 PM",
+                "duration_minutes": 90,
+                "timing_mode": TimingMode.UNSPECIFIED,
+                "original_timing_mode": TimingMode.UNSPECIFIED,
+                "is_user_fixed": False,
+                "is_system_scheduled": True,
+                "can_move_for_repair": True,
+                "preferred_time_window": "evening",
+                "preferred_window_start": 1080,
+                "preferred_window_end": 1260,
+                "location": "Dinner Place",
+                "location_label": "Dinner Place",
+                "location_category": "meal_place",
+            },
+        ],
+        "warnings": [],
+        "location_resolution_requests": [],
+    }
+
+
+def _route_repair_locations():
+    return [
+        {"label": "Cheras", "address": "Cheras", "latitude": 3.08, "longitude": 101.74},
+        {"label": "Dinner Place", "address": "Dinner Place", "latitude": 3.16, "longitude": 101.71},
+    ]
+
+
+def _route_repair_fixed_dinner_envelope():
+    envelope = _route_repair_dentist_dinner_envelope()
+    for collection in (envelope["activities"], envelope["schedule_blocks"]):
+        for item in collection:
+            if item.get("stable_activity_id") != "dinner":
+                continue
+            item.update({
+                "timing_mode": TimingMode.FIXED,
+                "original_timing_mode": TimingMode.FIXED,
+                "fixed_start": 1080,
+                "fixed_end": 1170,
+                "is_user_fixed": True,
+                "user_fixed_start": 1080,
+                "can_move_for_repair": False,
+                "repair_protection": "fixed",
+            })
+    return envelope
+
+
+def test_accurate_travel_auto_repairs_flexible_dinner_without_confirmation(capsys):
+    fake_travel = FakeTravelService(route_minutes=35)
+    engine = SchedulingEngine(DummyClient(), travel_service=fake_travel)
+
+    envelope = engine._apply_accurate_travel_if_requested(
+        _route_repair_dentist_dinner_envelope(),
+        _route_repair_locations(),
+    )
+    logs = capsys.readouterr().out
+
+    dinner = _activity_by_title(envelope, "Dinner with Parents")
+
+    assert envelope["travel_validation_status"] == "repaired_validated"
+    assert envelope["schedule_status"] == "ok"
+    assert envelope["route_conflicts"] == []
+    assert envelope["pending_repair_suggestions"] == []
+    assert envelope["route_repair_actions"]
+    assert envelope["route_repair_actions"][0]["title"] == "Dinner with Parents"
+    assert dinner["startTime"] == "06:40 PM"
+    assert dinner["repair_protection"] == "protected_social"
+    assert dinner["can_move_for_repair"] is True
+    assert "[JPLAN][ROUTE_REPAIR_ACTIONS]" in logs
+    assert "[JPLAN][SUMMARY][REPAIRED_FINAL]" in logs
+
+
+def test_protected_dinner_repair_candidate_before_evening_is_rejected():
+    engine = SchedulingEngine(DummyClient(), travel_service=FakeTravelService(route_minutes=35))
+    original = _route_repair_dentist_dinner_envelope()
+    repaired = deepcopy(original)
+    for collection in (repaired["activities"], repaired["schedule_blocks"]):
+        for item in collection:
+            if item.get("stable_activity_id") == "dinner":
+                item["startTime"] = "02:00 PM"
+                item["endTime"] = "03:30 PM"
+                item["start"] = "02:00 PM"
+                item["end"] = "03:30 PM"
+
+    violations = engine._protected_semantic_violations(original, repaired)
+
+    assert violations
+    assert violations[0]["reason_code"] == "violates_evening_or_social_commitment"
+
+
+def test_final_route_validation_rejects_dirty_fixed_event_move():
+    engine = SchedulingEngine(DummyClient(), travel_service=FakeTravelService(route_minutes=12))
+    original = _route_repair_dentist_dinner_envelope()
+    repaired = deepcopy(original)
+    for collection in (repaired["activities"], repaired["schedule_blocks"]):
+        for item in collection:
+            if item.get("stable_activity_id") == "dentist":
+                item["startTime"] = "05:30 PM"
+                item["endTime"] = "06:30 PM"
+                item["start"] = "05:30 PM"
+                item["end"] = "06:30 PM"
+                item["scheduled_start"] = 1050
+                item["scheduled_end"] = 1110
+    context = engine._build_route_context(repaired, engine._load_canonical_activities(repaired), _route_repair_locations())
+
+    validation = engine._final_validate_route_aware_repair(original, repaired, context)
+
+    assert validation["travel_validation_status"] == "route_conflict"
+    assert any(conflict.get("reason_code") == "fixed_event_moved" for conflict in validation["route_conflicts"])
+
+
+def test_pending_repair_yes_confirmation_applies_suggestion_and_reruns_validation():
+    fake_travel = FakeTravelService(route_minutes=35)
+    engine = SchedulingEngine(DummyClient(), travel_service=fake_travel)
+    envelope = engine._apply_accurate_travel_if_requested(
+        _route_repair_fixed_dinner_envelope(),
+        _route_repair_locations(),
+    )
+
+    result = engine.handle_pending_repair_confirmation("yes", envelope, _route_repair_locations())
+    updated = result["envelope"]
+    dinner = _activity_by_title(updated, "Dinner with Parents")
+
+    assert result["reply_status"] == "success"
+    assert dinner["startTime"] == "06:35 PM"
+    assert updated["pending_repair_suggestions"] == []
+    assert updated["travel_validation_status"] == "validated"
+    assert updated["route_conflicts"] == []
+
+
+def test_pending_repair_no_confirmation_keeps_schedule_and_conflict_visible():
+    fake_travel = FakeTravelService(route_minutes=35)
+    engine = SchedulingEngine(DummyClient(), travel_service=fake_travel)
+    envelope = engine._apply_accurate_travel_if_requested(
+        _route_repair_fixed_dinner_envelope(),
+        _route_repair_locations(),
+    )
+
+    result = engine.handle_pending_repair_confirmation("no", envelope, _route_repair_locations())
+    updated = result["envelope"]
+    dinner = _activity_by_title(updated, "Dinner with Parents")
+
+    assert result["reply_status"] == "warning"
+    assert dinner["startTime"] == "06:00 PM"
+    assert updated["pending_repair_suggestions"] == []
+    assert updated["route_conflicts"]
+    assert updated["schedule_status"] == "warning"
+
+
+def test_accurate_travel_unfit_fallback_lists_low_score_flexible_activity():
+    fake_travel = FakeTravelService(route_minutes=35)
+    engine = SchedulingEngine(DummyClient(), travel_service=fake_travel)
+    envelope = _route_repair_fixed_dinner_envelope()
+    envelope["activities"][1]["title"] = "Fixed Dinner"
+    envelope["schedule_blocks"][1]["title"] = "Fixed Dinner"
+    grocery = {
+        "id": "grocery",
+        "stable_activity_id": "grocery",
+        "title": "Grocery Run",
+        "startTime": "02:00 PM",
+        "endTime": "02:45 PM",
+        "scheduled_start": 840,
+        "scheduled_end": 885,
+        "duration_minutes": 45,
+        "priority": "low",
+        "timing_mode": TimingMode.UNSPECIFIED,
+        "is_user_fixed": False,
+        "is_system_scheduled": True,
+        "can_move_for_repair": True,
+        "location": "Store",
+        "location_label": "Store",
+    }
+    envelope["activities"].append(grocery)
+
+    updated = engine._apply_accurate_travel_if_requested(envelope, _route_repair_locations())
+
+    assert updated["travel_validation_status"] == "repair_suggestion_pending"
+    assert updated["pending_repair_suggestions"]
+    assert updated["unfit_activities"]
+    assert updated["unfit_activities"][0]["title"] == "Grocery Run"
+
+
+def test_canonicalize_preserves_system_scheduled_flexible_activity_as_movable():
+    engine = SchedulingEngine(DummyClient(), travel_service=FakeTravelService())
+
+    flexible = engine._canonicalize_activity({
+        "id": "dinner",
+        "title": "Dinner with Parents",
+        "timing_mode": TimingMode.UNSPECIFIED,
+        "startTime": "06:00 PM",
+        "endTime": "07:30 PM",
+        "duration_minutes": 90,
+    })
+    fixed = engine._canonicalize_activity({
+        "id": "dentist",
+        "title": "Dentist Appointment",
+        "timing_mode": TimingMode.FIXED,
+        "startTime": "05:00 PM",
+        "endTime": "06:00 PM",
+        "duration_minutes": 60,
+    })
+
+    assert flexible["fixed_start"] is None
+    assert flexible["scheduled_start"] == 1080
+    assert flexible["is_user_fixed"] is False
+    assert flexible["can_move_for_repair"] is True
+    assert fixed["fixed_start"] == 1020
+    assert fixed["is_user_fixed"] is True
+    assert fixed["can_move_for_repair"] is False
+
+
 def test_accurate_travel_support_overlap_marks_route_conflict():
     fake_travel = FakeTravelService(route_minutes=12)
     engine = SchedulingEngine(DummyClient(), travel_service=fake_travel)
@@ -3371,7 +4329,7 @@ def test_accurate_travel_support_overlap_marks_route_conflict():
         "schedule_status": "ok",
         "travel_validation_status": "not_requested",
         "accurate_travel_time": True,
-        "preferences": {"accurate_travel_time": True},
+        "preferences": _accurate_preferences(),
         "activities": [],
         "schedule_blocks": [
             {
@@ -3441,7 +4399,7 @@ def test_accurate_travel_with_coordinates_and_ors_failure_uses_fallback_not_loca
         "reply": "Draft created.",
         "transcription": "Meeting at Main Office followed by Seminar at Library.",
         "date": "2026-05-02",
-        "preferences": {"accurate_travel_time": True},
+        "preferences": _accurate_preferences(),
         "operations": [
             {"op": "add", "title": "Meeting", "timing_mode": TimingMode.FIXED, "fixed_start": "09:00", "duration_minutes": 60, "location": "office"},
             {"op": "add", "title": "Seminar", "timing_mode": TimingMode.FIXED, "fixed_start": "10:30", "duration_minutes": 60, "location": "library"},
@@ -3991,6 +4949,56 @@ def test_travel_complete_toggle_runs_readiness_without_creating_plan_or_geocodin
     assert payload["version"] == _evening_schedule_envelope()["version"]
 
 
+def test_persisted_preferences_fill_missing_schedule_preferences(monkeypatch):
+    import main as backend_main
+
+    persisted = {
+        "day_start_time": "09:00",
+        "day_end_time": "21:00",
+        "use_day_boundary_preferences": True,
+        "default_start_location": _default_start_location(),
+    }
+    monkeypatch.setattr(backend_main.database, "get_user_preferences", lambda user_id: persisted)
+
+    envelope = _evening_schedule_envelope()
+    merged = backend_main._merge_user_preferences_into_envelope(envelope, "pref-user")
+
+    assert merged["preferences"]["day_start_time"] == "09:00"
+    assert merged["preferences"]["day_end_time"] == "21:00"
+    assert merged["preferences"]["day_start"] == "09:00"
+    assert merged["preferences"]["day_end"] == "21:00"
+    assert merged["preferences"]["default_start_location"]["label"] == "Home"
+
+
+def test_schedule_override_wins_over_persisted_preferences(monkeypatch):
+    import main as backend_main
+
+    persisted = {
+        "day_start_time": "09:00",
+        "day_end_time": "21:00",
+        "use_day_boundary_preferences": True,
+        "default_start_location": _default_start_location(),
+    }
+    override = {
+        "label": "Campus",
+        "display_name": "Campus",
+        "address": "Campus",
+        "latitude": 2.91,
+        "longitude": 101.65,
+        "source": "day_override",
+    }
+    monkeypatch.setattr(backend_main.database, "get_user_preferences", lambda user_id: persisted)
+
+    envelope = _evening_schedule_envelope()
+    envelope["preferences"]["day_start_time"] = "08:30"
+    envelope["preferences"]["day_start_location_override"] = override
+    merged = backend_main._merge_user_preferences_into_envelope(envelope, "pref-user")
+
+    assert merged["preferences"]["day_start_time"] == "08:30"
+    assert merged["preferences"]["day_start_location_override"]["label"] == "Campus"
+    assert merged["preferences"]["default_start_location"]["label"] == "Home"
+
+
 def test_module_0_router_classifies_latency_paths():
     engine = SchedulingEngine(DummyClient())
     envelope = _initial_envelope()
@@ -4102,6 +5110,331 @@ def test_deterministic_fast_path_arrange_patterns_create_relative_update():
     assert operation["title"] == "Grocery Shopping"
     assert operation["anchor_relation"]["kind"] == "after"
     assert operation["anchor_relation"]["target_title"] == "Gym Workout"
+
+
+def test_deterministic_fast_path_natural_rationale_edit_falls_back_to_module_a_and_updates_existing():
+    message = "i want the grocery run after the client meeting, cause i dont want to carry so much stuff to meet my client"
+
+    class NaturalRelativeEditClient:
+        class models:
+            @staticmethod
+            def generate_content(*args, **kwargs):
+                contents = kwargs.get("contents") or args[1]
+                assert "CURRENT_ACTIVITY_INDEX" in contents
+                assert "Grocery Run" in contents
+                assert "Client Meeting" in contents
+                return ParserJsonResponse(
+                    """
+                    {
+                      "intent": "edit",
+                      "reply": "I will move Grocery Run after Client Meeting.",
+                      "transcription": "i want the grocery run after the client meeting, cause i dont want to carry so much stuff to meet my client",
+                      "date": "2026-05-02",
+                      "operations": [
+                        {
+                          "op": "add",
+                          "title": "Grocery Run",
+                          "timing_mode": "relative",
+                          "anchor_relation": {"kind": "after", "target_title": "Client Meeting"},
+                          "edit_reason": "does not want to carry so much stuff to meet client"
+                        }
+                      ],
+                      "activities": [],
+                      "preferences": {}
+                    }
+                    """
+                )
+
+    envelope = _custom_envelope([
+        {
+            "op": "add",
+            "title": "Client Meeting",
+            "timing_mode": TimingMode.FIXED,
+            "fixed_start": "09:00",
+            "duration_minutes": 60,
+            "location": "Mid Valley",
+        },
+        {
+            "op": "add",
+            "title": "Grocery Run",
+            "timing_mode": "flexible",
+            "duration_minutes": 45,
+            "location": "store",
+        },
+    ])
+    engine = SchedulingEngine(NaturalRelativeEditClient())
+
+    fast_path = engine.parse_deterministic_fast_path(
+        message,
+        current_schedule=envelope,
+        history=[],
+        saved_locations=[],
+    )
+
+    assert fast_path is None
+    assert engine._last_fast_path_fallback_reason == "natural_edit_wording"
+
+    parsed = engine.parse_text_request(
+        message,
+        current_schedule=envelope,
+        history=[],
+        saved_locations=[],
+        disable_deterministic_fallback=True,
+        fallback_reason=engine._last_fast_path_fallback_reason,
+    )
+
+    operation = parsed["operations"][0]
+    assert operation["op"] == "update"
+    assert operation["title"] == "Grocery Run"
+    assert operation["preserve_existing_fields"] is True
+    assert operation["edit_reason"] == "does not want to carry so much stuff to meet client"
+
+    result = engine.apply_operations(
+        envelope=envelope,
+        operations=parsed["operations"],
+        base_version=envelope["version"],
+    )
+
+    assert result["status"] in {"success", "no_operation"}
+    updated = result["envelope"]
+    assert _count_title(updated, "Grocery Run") == 1
+    grocery = _activity_by_title(updated, "Grocery Run")
+    assert grocery["duration_minutes"] == 45
+    assert grocery["location"] == "store"
+
+
+def test_natural_question_relative_edit_skips_fast_path_to_module_a():
+    engine = SchedulingEngine(DummyClient())
+    envelope = _custom_envelope([
+        {
+            "op": "add",
+            "title": "Client Meeting",
+            "timing_mode": TimingMode.FIXED,
+            "fixed_start": "09:00",
+            "duration_minutes": 60,
+        },
+        {
+            "op": "add",
+            "title": "Grocery Run",
+            "timing_mode": "flexible",
+            "duration_minutes": 45,
+        },
+    ])
+
+    route = engine.route_chat_request("how about grocery run after client meeting?", envelope)
+    parsed = engine.parse_deterministic_fast_path(
+        "how about grocery run after client meeting?",
+        current_schedule=envelope,
+        history=[],
+        saved_locations=[],
+    )
+
+    assert route["use_deterministic_parser"] is False
+    assert route["use_module_a_llm"] is True
+    assert route["reason"] == "natural_edit_wording"
+    assert parsed is None
+    assert engine._last_fast_path_fallback_reason == "natural_edit_wording"
+
+
+def test_tentative_relative_edit_skips_fast_path_to_module_a():
+    engine = SchedulingEngine(DummyClient())
+    envelope = _custom_envelope([
+        {
+            "op": "add",
+            "title": "Client Meeting",
+            "timing_mode": TimingMode.FIXED,
+            "fixed_start": "09:00",
+            "duration_minutes": 60,
+        },
+        {
+            "op": "add",
+            "title": "Grocery Run",
+            "timing_mode": "flexible",
+            "duration_minutes": 45,
+        },
+    ])
+
+    parsed = engine.parse_deterministic_fast_path(
+        "maybe grocery run after client meeting",
+        current_schedule=envelope,
+        history=[],
+        saved_locations=[],
+    )
+
+    assert parsed is None
+    assert engine._last_fast_path_fallback_reason == "natural_edit_wording"
+
+
+def test_deterministic_fast_path_keeps_clean_relative_edit_deterministic():
+    engine = SchedulingEngine(DummyClient())
+    envelope = _custom_envelope([
+        {
+            "op": "add",
+            "title": "Client Meeting",
+            "timing_mode": TimingMode.FIXED,
+            "fixed_start": "09:00",
+            "duration_minutes": 60,
+        },
+        {
+            "op": "add",
+            "title": "Grocery Run",
+            "timing_mode": "flexible",
+            "duration_minutes": 45,
+        },
+    ])
+
+    parsed = engine.parse_deterministic_fast_path(
+        "put grocery run after client meeting",
+        current_schedule=envelope,
+        history=[],
+        saved_locations=[],
+    )
+
+    assert parsed["_reply_source"] == "deterministic_fast_path"
+    operation = parsed["operations"][0]
+    assert operation["op"] == "update"
+    assert operation["title"] == "Grocery Run"
+    assert operation["anchor_relation"]["target_title"] == "Client Meeting"
+
+
+def test_module_a_failure_after_unsafe_fast_path_does_not_use_duplicate_prone_fallback():
+    message = "i want the grocery run after the client meeting, cause i dont want to carry so much stuff to meet my client"
+    envelope = _custom_envelope([
+        {
+            "op": "add",
+            "title": "Client Meeting",
+            "timing_mode": TimingMode.FIXED,
+            "fixed_start": "09:00",
+            "duration_minutes": 60,
+        },
+        {
+            "op": "add",
+            "title": "Grocery Run",
+            "timing_mode": "flexible",
+            "duration_minutes": 45,
+        },
+    ])
+    engine = SchedulingEngine(UnavailableReplyClient())
+
+    fast_path = engine.parse_deterministic_fast_path(
+        message,
+        current_schedule=envelope,
+        history=[],
+        saved_locations=[],
+    )
+    assert fast_path is None
+
+    parsed = engine.parse_text_request(
+        message,
+        current_schedule=envelope,
+        history=[],
+        saved_locations=[],
+        disable_deterministic_fallback=True,
+        fallback_reason=engine._last_fast_path_fallback_reason,
+    )
+
+    assert parsed["intent"] == "chat"
+    assert parsed["operations"] == []
+    assert parsed["_failure_type"] == "module_a_unavailable"
+
+
+def test_duplicate_guard_converts_add_with_wrapper_title_to_existing_update():
+    engine = SchedulingEngine(DummyClient())
+    envelope = _custom_envelope([
+        {
+            "op": "add",
+            "title": "Client Meeting",
+            "timing_mode": TimingMode.FIXED,
+            "fixed_start": "09:00",
+            "duration_minutes": 60,
+        },
+        {
+            "op": "add",
+            "title": "Grocery Run",
+            "timing_mode": "flexible",
+            "duration_minutes": 45,
+            "priority": "low",
+            "location": "KB01 Mid Valley",
+        },
+    ])
+    grocery = _activity_by_title(envelope, "Grocery Run")
+    grocery["location"] = "KB01 Mid Valley"
+    grocery["location_label"] = "KB01 Mid Valley"
+    grocery["location_source"] = "event_confirmed"
+    grocery["resolved_location"] = {
+        "display_name": "KB01 Mid Valley",
+        "latitude": 3.1184,
+        "longitude": 101.6778,
+        "source": "event_confirmed",
+    }
+    grocery["location_status"] = "resolved"
+
+    result = engine.apply_operations(
+        envelope=envelope,
+        operations=[{
+            "op": "add",
+            "title": "How about grocery run",
+            "timing_mode": TimingMode.RELATIVE,
+            "duration_minutes": 60,
+            "location": "store",
+            "anchor_relation": {"kind": "after", "target_title": "Client Meeting"},
+            "_user_message": "how about grocery run after client meeting?",
+        }],
+        base_version=envelope["version"],
+    )
+
+    updated = result["envelope"]
+    updated_grocery = _activity_by_title(updated, "Grocery Run")
+    assert result["status"] in {"success", "no_operation"}
+    assert _count_title(updated, "Grocery Run") == 1
+    assert _count_title(updated, "How about grocery run") == 0
+    assert updated_grocery["duration_minutes"] == 45
+    assert updated_grocery["priority"] == "low"
+    assert updated_grocery["location"] == "KB01 Mid Valley"
+    assert updated_grocery["resolved_location"]["latitude"] == 3.1184
+
+
+def test_duplicate_guard_ambiguous_existing_match_clarifies_without_adding():
+    engine = SchedulingEngine(DummyClient())
+    envelope = _custom_envelope([
+        {
+            "op": "add",
+            "title": "Client Meeting",
+            "timing_mode": TimingMode.FIXED,
+            "fixed_start": "09:00",
+            "duration_minutes": 60,
+        },
+        {
+            "op": "add",
+            "title": "Grocery Run",
+            "timing_mode": "flexible",
+            "duration_minutes": 45,
+        },
+        {
+            "op": "add",
+            "title": "Grocery Shopping",
+            "timing_mode": "flexible",
+            "duration_minutes": 45,
+        },
+    ])
+
+    result = engine.apply_operations(
+        envelope=envelope,
+        operations=[{
+            "op": "add",
+            "title": "grocery",
+            "timing_mode": TimingMode.RELATIVE,
+            "anchor_relation": {"kind": "after", "target_title": "Client Meeting"},
+            "_user_message": "how about grocery after client meeting?",
+        }],
+        base_version=envelope["version"],
+    )
+
+    assert result["status"] == "no_operation"
+    assert result["reply_reason"] == "duplicate_guard_ambiguous_target"
+    assert _count_title(result["envelope"], "grocery") == 0
+    assert _count_title(result["envelope"], "Grocery Run") == 1
+    assert _count_title(result["envelope"], "Grocery Shopping") == 1
 
 
 def test_deterministic_fast_path_arrange_duration_cleans_title():

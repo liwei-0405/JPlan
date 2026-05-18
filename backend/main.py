@@ -73,6 +73,12 @@ class ScheduleItem(BaseModel):
     priority: Optional[str] = "medium"
     isMandatory: Optional[bool] = True
     timing_mode: Optional[str] = None
+    original_timing_mode: Optional[str] = None
+    is_user_fixed: Optional[bool] = False
+    is_system_scheduled: Optional[bool] = False
+    user_fixed_start: Optional[int] = None
+    can_move_for_repair: Optional[bool] = None
+    repair_protection: Optional[str] = None
     fixed_start: Optional[int] = None
     fixed_end: Optional[int] = None
     earliest_start: Optional[int] = None
@@ -128,6 +134,19 @@ class ScheduleEnvelope(BaseModel):
     warnings: Optional[List[Dict[str, Any]]] = []
     location_resolution_requests: Optional[List[Dict[str, Any]]] = []
     route_conflicts: Optional[List[Dict[str, Any]]] = []
+    pending_repair_suggestions: Optional[List[Dict[str, Any]]] = []
+    unfit_activities: Optional[List[Dict[str, Any]]] = []
+    route_repair_actions: Optional[List[Dict[str, Any]]] = []
+    route_efficiency: Optional[Dict[str, Any]] = {}
+    route_total_before: Optional[int] = None
+    route_total_after: Optional[int] = None
+    route_minutes_saved: Optional[int] = None
+    location_revisits_count: Optional[int] = None
+    same_location_split_penalty_before: Optional[int] = None
+    same_location_split_penalty_after: Optional[int] = None
+    revisit_penalty_before: Optional[int] = None
+    revisit_penalty_after: Optional[int] = None
+    start_route_summary: Optional[Dict[str, Any]] = None
     unmet_items: Optional[List[Dict[str, Any]]] = []
     validation_issues: Optional[List[str]] = []
 
@@ -190,12 +209,26 @@ class PlanRequest(BaseModel):
     planning_mode: Optional[str] = "feasibility_first"
     allow_clash: bool = False
     accurate_travel_time: bool = False
+    preferences: Optional[Dict[str, Any]] = {}
     schedule_status: Optional[str] = None
     travel_validation_status: Optional[str] = None
     conflicts: Optional[List[Dict[str, Any]]] = []
     warnings: Optional[List[Dict[str, Any]]] = []
     location_resolution_requests: Optional[List[Dict[str, Any]]] = []
     route_conflicts: Optional[List[Dict[str, Any]]] = []
+    pending_repair_suggestions: Optional[List[Dict[str, Any]]] = []
+    unfit_activities: Optional[List[Dict[str, Any]]] = []
+    route_repair_actions: Optional[List[Dict[str, Any]]] = []
+    route_efficiency: Optional[Dict[str, Any]] = {}
+    route_total_before: Optional[int] = None
+    route_total_after: Optional[int] = None
+    route_minutes_saved: Optional[int] = None
+    location_revisits_count: Optional[int] = None
+    same_location_split_penalty_before: Optional[int] = None
+    same_location_split_penalty_after: Optional[int] = None
+    revisit_penalty_before: Optional[int] = None
+    revisit_penalty_after: Optional[int] = None
+    start_route_summary: Optional[Dict[str, Any]] = None
     unmet_items: Optional[List[Dict[str, Any]]] = []
     validation_issues: Optional[List[str]] = []
 
@@ -219,6 +252,17 @@ class TravelCompleteRequest(BaseModel):
     schedule: ScheduleEnvelope
     source: Optional[str] = "manual"
 
+class UserPreferencesRequest(BaseModel):
+    user_id: str
+    day_start_time: Optional[str] = "08:00"
+    day_end_time: Optional[str] = "22:00"
+    use_day_boundary_preferences: Optional[bool] = True
+    default_start_location: Optional[Dict[str, Any]] = None
+
+class RecentLocationRequest(BaseModel):
+    user_id: str
+    location: Dict[str, Any]
+
 
 def debug_log(message: str) -> None:
     jlog("API", message)
@@ -226,6 +270,61 @@ def debug_log(message: str) -> None:
 
 def debug_json(label: str, payload: Any) -> None:
     jjson("API", label, payload)
+
+
+def _location_has_coordinates(location: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(location, dict):
+        return False
+    try:
+        lat = float(location.get("latitude"))
+        lng = float(location.get("longitude"))
+        return -90 <= lat <= 90 and -180 <= lng <= 180
+    except (TypeError, ValueError):
+        return False
+
+
+def _merge_user_preferences_into_envelope(
+    envelope: Optional[Dict[str, Any]],
+    user_id: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """Fill missing schedule preferences from persisted user preferences.
+
+    Precedence is preserved: per-day override/schedule values win, persisted
+    preferences only fill gaps, and defaults stay in the database helper.
+    """
+    if envelope is None:
+        return None
+    updated = deepcopy(envelope)
+    prefs = updated.setdefault("preferences", {})
+    if not user_id:
+        return updated
+
+    persisted = database.get_user_preferences(user_id)
+    if not persisted:
+        return updated
+
+    if "use_day_boundary_preferences" not in prefs:
+        prefs["use_day_boundary_preferences"] = persisted.get("use_day_boundary_preferences", True)
+
+    use_boundaries = bool(prefs.get("use_day_boundary_preferences", True))
+    for key in ("day_start_time", "day_end_time"):
+        if not prefs.get(key) and persisted.get(key):
+            prefs[key] = persisted[key]
+
+    if use_boundaries:
+        if not prefs.get("day_start") and prefs.get("day_start_time"):
+            prefs["day_start"] = prefs["day_start_time"]
+        if not prefs.get("day_end") and prefs.get("day_end_time"):
+            prefs["day_end"] = prefs["day_end_time"]
+
+    if not prefs.get("default_start_location") and persisted.get("default_start_location"):
+        prefs["default_start_location"] = persisted.get("default_start_location")
+
+    start_location = prefs.get("day_start_location_override") or prefs.get("default_start_location")
+    if _location_has_coordinates(start_location):
+        label = start_location.get("label") or start_location.get("display_name") or start_location.get("address")
+        jlog("DEFAULT_LOCATION", f"start={label or 'configured'}")
+    return updated
 
 
 def summarize_envelope(envelope: ScheduleEnvelope | dict | None) -> dict:
@@ -264,12 +363,24 @@ def travel_validation_reply_meta(envelope: Dict[str, Any]) -> Dict[str, Any]:
     status = envelope.get("travel_validation_status") or "not_requested"
     requests = envelope.get("location_resolution_requests") or []
     route_conflicts = envelope.get("route_conflicts") or []
+    repair_suggestions = envelope.get("pending_repair_suggestions") or []
 
     if requests:
         return {
             "reply": "Please confirm the exact locations first so I can calculate accurate travel time.",
             "reply_status": "location_pending",
             "reply_reason": "accurate_travel_location_pending",
+        }
+
+    if repair_suggestions:
+        suggestion = repair_suggestions[0]
+        title = suggestion.get("title") or "that activity"
+        to_time = suggestion.get("to") or "a later time"
+        reason = suggestion.get("reason") or "accurate travel time needs more room"
+        return {
+            "reply": f"Accurate travel time found a conflict. {title} needs to start around {to_time} because {reason}. Apply this change?",
+            "reply_status": "warning",
+            "reply_reason": "pending_repair_confirmation",
         }
 
     if status == "route_conflict" or route_conflicts:
@@ -279,6 +390,15 @@ def travel_validation_reply_meta(envelope: Dict[str, Any]) -> Dict[str, Any]:
             "reply": f"I checked accurate travel time, but it creates a travel conflict: {reason}",
             "reply_status": "warning",
             "reply_reason": reason,
+        }
+
+    if status == "partial_feasible_with_unfit":
+        unfit = (envelope.get("unfit_activities") or [{}])[0]
+        title = unfit.get("title") or "one flexible activity"
+        return {
+            "reply": f"Most of the plan is feasible with accurate travel time, but {title} could not fit.",
+            "reply_status": "warning",
+            "reply_reason": "accurate_travel_partial_feasible_with_unfit",
         }
 
     if status == "fallback_used":
@@ -323,12 +443,37 @@ async def chat_with_llm(request: ChatRequest):
     try:
         # Full envelope for internal processing
         current_envelope = request.current_schedule.model_dump() if request.current_schedule else None
+        current_envelope = _merge_user_preferences_into_envelope(current_envelope, request.user_id)
         if current_envelope is not None:
             current_envelope["allow_clash"] = bool(request.allow_clash)
             current_envelope["accurate_travel_time"] = bool(request.accurate_travel_time)
             current_envelope.setdefault("preferences", {})
             current_envelope["preferences"]["allow_clash"] = bool(request.allow_clash)
             current_envelope["preferences"]["accurate_travel_time"] = bool(request.accurate_travel_time)
+
+        if current_envelope and current_envelope.get("pending_repair_suggestions"):
+            saved_locations_for_repair = database.get_user_locations(request.user_id) if request.user_id else []
+            pending_repair = scheduling_engine.handle_pending_repair_confirmation(
+                request.message,
+                current_envelope,
+                saved_locations_for_repair,
+            )
+            if pending_repair:
+                envelope_dict = database._parse_schedule_payload(
+                    pending_repair.get("envelope") or current_envelope,
+                    request.user_id or "",
+                    (pending_repair.get("envelope") or current_envelope).get("date"),
+                )
+                full_envelope = ScheduleEnvelope(**envelope_dict)
+                log_total_timer()
+                return ChatResponse(
+                    reply=pending_repair.get("reply", "I kept the current schedule unchanged."),
+                    full_schedule=full_envelope,
+                    schedule_data=full_envelope,
+                    transcription=request.message,
+                    reply_status=pending_repair.get("reply_status"),
+                    reply_reason=pending_repair.get("reply_reason"),
+                )
 
         # Optimization: Create a lightweight context for the LLM
         lightweight_schedule = None
@@ -392,7 +537,7 @@ async def chat_with_llm(request: ChatRequest):
                 )
 
             saved_locations = database.get_user_locations(request.user_id)
-            travel_envelope = deepcopy(current_envelope)
+            travel_envelope = _merge_user_preferences_into_envelope(deepcopy(current_envelope), request.user_id) or deepcopy(current_envelope)
             travel_envelope["accurate_travel_time"] = True
             travel_envelope.setdefault("preferences", {})
             travel_envelope["preferences"]["accurate_travel_time"] = True
@@ -437,6 +582,7 @@ async def chat_with_llm(request: ChatRequest):
 
         module_a_started = time.perf_counter()
         parsed = None
+        fast_path_fallback_reason = None
         if route.get("use_deterministic_parser") and not route.get("use_module_a_llm"):
             parsed = scheduling_engine.parse_deterministic_fast_path(
                 latest_request=request.message,
@@ -445,16 +591,30 @@ async def chat_with_llm(request: ChatRequest):
                 saved_locations=saved_locations,
             )
             if parsed is None:
+                fast_path_fallback_reason = getattr(scheduling_engine, "_last_fast_path_fallback_reason", None)
                 jlog("ROUTER", "fast_path_failed falling_back_to_module_a_llm", "FALLBACK")
         if parsed is None:
-            parsed = scheduling_engine.parse_text_request(
-                message=request.message,
-                history=request.history,
-                current_schedule=lightweight_schedule,
-                saved_locations=saved_locations
-            )
+            parse_kwargs = {
+                "message": request.message,
+                "history": request.history,
+                "current_schedule": lightweight_schedule,
+                "saved_locations": saved_locations,
+            }
+            if fast_path_fallback_reason:
+                parse_kwargs["disable_deterministic_fallback"] = True
+                parse_kwargs["fallback_reason"] = fast_path_fallback_reason
+            parsed = scheduling_engine.parse_text_request(**parse_kwargs)
         jlog("TIMER", f"module_a_total_seconds={elapsed_seconds(module_a_started)}")
         parsed.setdefault("preferences", {})
+        persisted_preferences = database.get_user_preferences(request.user_id) if request.user_id else {}
+        for key in ("day_start_time", "day_end_time", "use_day_boundary_preferences", "default_start_location"):
+            if persisted_preferences.get(key) is not None and key not in parsed["preferences"]:
+                parsed["preferences"][key] = persisted_preferences.get(key)
+        if parsed["preferences"].get("use_day_boundary_preferences", True):
+            if not parsed["preferences"].get("day_start") and parsed["preferences"].get("day_start_time"):
+                parsed["preferences"]["day_start"] = parsed["preferences"]["day_start_time"]
+            if not parsed["preferences"].get("day_end") and parsed["preferences"].get("day_end_time"):
+                parsed["preferences"]["day_end"] = parsed["preferences"]["day_end_time"]
         parsed["preferences"]["allow_clash"] = bool(request.allow_clash)
         parsed["preferences"]["accurate_travel_time"] = bool(request.accurate_travel_time)
         parsed["preferences"]["module_0_route"] = route.get("route")
@@ -653,6 +813,19 @@ async def apply_operations_endpoint(scheduleId: str, request: SchedulePatchReque
             travel_validation_status=updated_envelope.get("travel_validation_status"),
             location_resolution_requests=updated_envelope.get("location_resolution_requests"),
             route_conflicts=updated_envelope.get("route_conflicts"),
+            pending_repair_suggestions=updated_envelope.get("pending_repair_suggestions"),
+            unfit_activities=updated_envelope.get("unfit_activities"),
+            route_repair_actions=updated_envelope.get("route_repair_actions"),
+            route_efficiency=updated_envelope.get("route_efficiency"),
+            route_total_before=updated_envelope.get("route_total_before"),
+            route_total_after=updated_envelope.get("route_total_after"),
+            route_minutes_saved=updated_envelope.get("route_minutes_saved"),
+            location_revisits_count=updated_envelope.get("location_revisits_count"),
+            same_location_split_penalty_before=updated_envelope.get("same_location_split_penalty_before"),
+            same_location_split_penalty_after=updated_envelope.get("same_location_split_penalty_after"),
+            revisit_penalty_before=updated_envelope.get("revisit_penalty_before"),
+            revisit_penalty_after=updated_envelope.get("revisit_penalty_after"),
+            start_route_summary=updated_envelope.get("start_route_summary"),
             unmet_items=updated_envelope.get("unmet_items"),
             validation_issues=updated_envelope.get("validation_issues"),
         )
@@ -720,6 +893,7 @@ async def save_plan_endpoint(plan: PlanRequest):
             version=plan.version,
             schedule_id=plan.scheduleId,
             preferences={
+                **(plan.preferences or {}),
                 "allow_clash": bool(plan.allow_clash),
                 "planning_mode": plan.planning_mode,
                 "accurate_travel_time": bool(plan.accurate_travel_time),
@@ -735,6 +909,19 @@ async def save_plan_endpoint(plan: PlanRequest):
             warnings=plan.warnings,
             location_resolution_requests=plan.location_resolution_requests,
             route_conflicts=plan.route_conflicts,
+            pending_repair_suggestions=plan.pending_repair_suggestions,
+            unfit_activities=plan.unfit_activities,
+            route_repair_actions=plan.route_repair_actions,
+            route_efficiency=plan.route_efficiency,
+            route_total_before=plan.route_total_before,
+            route_total_after=plan.route_total_after,
+            route_minutes_saved=plan.route_minutes_saved,
+            location_revisits_count=plan.location_revisits_count,
+            same_location_split_penalty_before=plan.same_location_split_penalty_before,
+            same_location_split_penalty_after=plan.same_location_split_penalty_after,
+            revisit_penalty_before=plan.revisit_penalty_before,
+            revisit_penalty_after=plan.revisit_penalty_after,
+            start_route_summary=plan.start_route_summary,
             unmet_items=plan.unmet_items,
             validation_issues=plan.validation_issues,
         )
@@ -867,6 +1054,42 @@ async def export_calendar(request: ExportRequest):
 
 # --- Location Management ---
 
+@app.get("/api/preferences")
+async def get_preferences(user_id: str):
+    return database.get_user_preferences(user_id)
+
+@app.post("/api/preferences")
+async def save_preferences(request: UserPreferencesRequest):
+    if request.default_start_location is not None and not _location_has_coordinates(request.default_start_location):
+        raise HTTPException(status_code=400, detail="Default start location must include latitude and longitude")
+    try:
+        return database.save_user_preferences(
+            user_id=request.user_id,
+            day_start_time=request.day_start_time,
+            day_end_time=request.day_end_time,
+            use_day_boundary_preferences=bool(request.use_day_boundary_preferences),
+            default_start_location=request.default_start_location,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+@app.get("/api/recent-locations")
+async def get_recent_locations(user_id: str):
+    return database.get_user_recent_locations(user_id)
+
+@app.post("/api/recent-locations")
+async def add_recent_location(request: RecentLocationRequest):
+    if not _location_has_coordinates(request.location):
+        raise HTTPException(status_code=400, detail="Recent location must include latitude and longitude")
+    try:
+        return database.upsert_user_recent_location(request.user_id, request.location)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
 @app.get("/api/locations")
 async def get_locations(user_id: str):
     return database.get_user_locations(user_id)
@@ -932,7 +1155,7 @@ async def resolve_location(request: LocationResolveRequest):
 
 @app.post("/api/travel/complete", response_model=ScheduleEnvelope)
 async def complete_travel_validation(request: TravelCompleteRequest):
-    envelope = request.schedule.model_dump()
+    envelope = _merge_user_preferences_into_envelope(request.schedule.model_dump(), request.user_id) or request.schedule.model_dump()
     envelope["accurate_travel_time"] = True
     envelope.setdefault("preferences", {})
     envelope["preferences"]["accurate_travel_time"] = True

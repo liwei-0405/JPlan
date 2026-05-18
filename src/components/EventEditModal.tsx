@@ -14,9 +14,20 @@ type EventEditModalProps = {
   onDelete?: () => void;
   allActivities: ActivityBlock[];
   savedLocations?: SavedLocation[];
+  recentLocations?: Array<Partial<SavedLocation>>;
+  onLocationConfirmed?: (candidate: GeocodeCandidate) => void;
 };
 
-export function EventEditModal({ event, onSave, onCancel, onDelete, allActivities, savedLocations = [] }: EventEditModalProps) {
+export function EventEditModal({
+  event,
+  onSave,
+  onCancel,
+  onDelete,
+  allActivities,
+  savedLocations = [],
+  recentLocations = [],
+  onLocationConfirmed,
+}: EventEditModalProps) {
   const [formData, setFormData] = useState(() => normalizeEventForEdit(event));
   const [isConflict, setIsConflict] = useState(false);
   const [isLocationPickerOpen, setIsLocationPickerOpen] = useState(false);
@@ -123,6 +134,7 @@ export function EventEditModal({ event, onSave, onCancel, onDelete, allActivitie
         saved_location_label: candidate.label || formData.saved_location_label,
       },
     });
+    onLocationConfirmed?.(candidate);
     setIsLocationPickerOpen(false);
   };
 
@@ -307,6 +319,7 @@ export function EventEditModal({ event, onSave, onCancel, onDelete, allActivitie
         initialPin={existingLocationPoint}
         candidates={existingLocationCandidate ? [existingLocationCandidate] : []}
         savedLocations={savedLocations}
+        recentLocations={recentLocations}
         initialSearchQuery={formData.location || formData.title || ""}
         searchCategory={formData.location_category}
         confirmLabel="Use this point"

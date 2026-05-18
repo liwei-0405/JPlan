@@ -27,6 +27,14 @@ if supabase_key: supabase_key = supabase_key.strip('"').strip("'")
 supabase: Optional[Client] = None
 SCHEDULE_PAYLOAD_VERSION = 4
 
+DEFAULT_USER_PREFERENCES = {
+    "day_start_time": "08:00",
+    "day_end_time": "22:00",
+    "use_day_boundary_preferences": True,
+    "default_start_location": None,
+    "default_start_location_label": None,
+}
+
 if not supabase_url or not supabase_key:
     jlog("DB", f"Supabase credentials missing: URL={'found' if supabase_url else 'missing'}, key={'found' if supabase_key else 'missing'}", "ERROR")
 else:
@@ -39,6 +47,48 @@ def _generate_schedule_id(user_id: str, date: str) -> str:
     """Generate a stable schedule ID based on user and date."""
     seed = f"{user_id}:{date}"
     return hashlib.md5(seed.encode()).hexdigest()
+
+def _normalize_time_string(value: Any, fallback: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return fallback
+    parts = text.split(":")
+    if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+        return f"{parts[0].zfill(2)}:{parts[1].zfill(2)}"
+    return fallback
+
+def _has_coordinates(location: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(location, dict):
+        return False
+    try:
+        lat = float(location.get("latitude"))
+        lng = float(location.get("longitude"))
+        return -90 <= lat <= 90 and -180 <= lng <= 180
+    except (TypeError, ValueError):
+        return False
+
+def _location_identity_key(location: Dict[str, Any]) -> str:
+    if _has_coordinates(location):
+        return f"coord:{float(location.get('latitude')):.6f}:{float(location.get('longitude')):.6f}"
+    label = (
+        location.get("label")
+        or location.get("display_name")
+        or location.get("address")
+        or ""
+    )
+    return "text:" + " ".join(str(label).strip().lower().split())
+
+def _normalize_preference_row(row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    prefs = dict(DEFAULT_USER_PREFERENCES)
+    if not row:
+        return prefs
+    prefs["day_start_time"] = _normalize_time_string(row.get("day_start_time"), DEFAULT_USER_PREFERENCES["day_start_time"])
+    prefs["day_end_time"] = _normalize_time_string(row.get("day_end_time"), DEFAULT_USER_PREFERENCES["day_end_time"])
+    prefs["use_day_boundary_preferences"] = bool(row.get("use_day_boundary_preferences", True))
+    prefs["default_start_location_label"] = row.get("default_start_location_label")
+    default_start = row.get("default_start_location")
+    prefs["default_start_location"] = default_start if isinstance(default_start, dict) else None
+    return prefs
 
 def _parse_schedule_payload(payload: Any, user_id: str = "", date: str = "") -> Dict[str, Any]:
     """Normalize saved JSONB payload into a ScheduleEnvelope dict."""
@@ -63,6 +113,19 @@ def _parse_schedule_payload(payload: Any, user_id: str = "", date: str = "") -> 
         "warnings": [],
         "location_resolution_requests": [],
         "route_conflicts": [],
+        "pending_repair_suggestions": [],
+        "unfit_activities": [],
+        "route_repair_actions": [],
+        "route_efficiency": {},
+        "route_total_before": None,
+        "route_total_after": None,
+        "route_minutes_saved": None,
+        "location_revisits_count": None,
+        "same_location_split_penalty_before": None,
+        "same_location_split_penalty_after": None,
+        "revisit_penalty_before": None,
+        "revisit_penalty_after": None,
+        "start_route_summary": None,
         "unmet_items": [],
         "validation_issues": [],
     }
@@ -99,6 +162,19 @@ def _parse_schedule_payload(payload: Any, user_id: str = "", date: str = "") -> 
             "warnings": payload.get("warnings") or [],
             "location_resolution_requests": payload.get("location_resolution_requests") or [],
             "route_conflicts": payload.get("route_conflicts") or [],
+            "pending_repair_suggestions": payload.get("pending_repair_suggestions") or [],
+            "unfit_activities": payload.get("unfit_activities") or [],
+            "route_repair_actions": payload.get("route_repair_actions") or [],
+            "route_efficiency": payload.get("route_efficiency") or {},
+            "route_total_before": payload.get("route_total_before"),
+            "route_total_after": payload.get("route_total_after"),
+            "route_minutes_saved": payload.get("route_minutes_saved"),
+            "location_revisits_count": payload.get("location_revisits_count"),
+            "same_location_split_penalty_before": payload.get("same_location_split_penalty_before"),
+            "same_location_split_penalty_after": payload.get("same_location_split_penalty_after"),
+            "revisit_penalty_before": payload.get("revisit_penalty_before"),
+            "revisit_penalty_after": payload.get("revisit_penalty_after"),
+            "start_route_summary": payload.get("start_route_summary"),
             "unmet_items": payload.get("unmet_items") or [],
             "validation_issues": payload.get("validation_issues") or [],
         }
@@ -135,6 +211,19 @@ def _parse_schedule_payload(payload: Any, user_id: str = "", date: str = "") -> 
             "warnings": payload.get("warnings") or [],
             "location_resolution_requests": payload.get("location_resolution_requests") or [],
             "route_conflicts": payload.get("route_conflicts") or [],
+            "pending_repair_suggestions": payload.get("pending_repair_suggestions") or [],
+            "unfit_activities": payload.get("unfit_activities") or [],
+            "route_repair_actions": payload.get("route_repair_actions") or [],
+            "route_efficiency": payload.get("route_efficiency") or {},
+            "route_total_before": payload.get("route_total_before"),
+            "route_total_after": payload.get("route_total_after"),
+            "route_minutes_saved": payload.get("route_minutes_saved"),
+            "location_revisits_count": payload.get("location_revisits_count"),
+            "same_location_split_penalty_before": payload.get("same_location_split_penalty_before"),
+            "same_location_split_penalty_after": payload.get("same_location_split_penalty_after"),
+            "revisit_penalty_before": payload.get("revisit_penalty_before"),
+            "revisit_penalty_after": payload.get("revisit_penalty_after"),
+            "start_route_summary": payload.get("start_route_summary"),
             "unmet_items": payload.get("unmet_items") or [],
             "validation_issues": payload.get("validation_issues") or [],
         }
@@ -185,6 +274,19 @@ def save_plan(
     warnings: Optional[List[Dict[str, Any]]] = None,
     location_resolution_requests: Optional[List[Dict[str, Any]]] = None,
     route_conflicts: Optional[List[Dict[str, Any]]] = None,
+    pending_repair_suggestions: Optional[List[Dict[str, Any]]] = None,
+    unfit_activities: Optional[List[Dict[str, Any]]] = None,
+    route_repair_actions: Optional[List[Dict[str, Any]]] = None,
+    route_efficiency: Optional[Dict[str, Any]] = None,
+    route_total_before: Optional[int] = None,
+    route_total_after: Optional[int] = None,
+    route_minutes_saved: Optional[int] = None,
+    location_revisits_count: Optional[int] = None,
+    same_location_split_penalty_before: Optional[int] = None,
+    same_location_split_penalty_after: Optional[int] = None,
+    revisit_penalty_before: Optional[int] = None,
+    revisit_penalty_after: Optional[int] = None,
+    start_route_summary: Optional[Dict[str, Any]] = None,
     unmet_items: Optional[List[Dict[str, Any]]] = None,
     validation_issues: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
@@ -220,6 +322,19 @@ def save_plan(
         'warnings': warnings or [],
         'location_resolution_requests': location_resolution_requests or [],
         'route_conflicts': route_conflicts or [],
+        'pending_repair_suggestions': pending_repair_suggestions or [],
+        'unfit_activities': unfit_activities or [],
+        'route_repair_actions': route_repair_actions or [],
+        'route_efficiency': route_efficiency or {},
+        'route_total_before': route_total_before,
+        'route_total_after': route_total_after,
+        'route_minutes_saved': route_minutes_saved,
+        'location_revisits_count': location_revisits_count,
+        'same_location_split_penalty_before': same_location_split_penalty_before,
+        'same_location_split_penalty_after': same_location_split_penalty_after,
+        'revisit_penalty_before': revisit_penalty_before,
+        'revisit_penalty_after': revisit_penalty_after,
+        'start_route_summary': start_route_summary,
         'unmet_items': unmet_items or [],
         'validation_issues': validation_issues or [],
     }
@@ -301,6 +416,108 @@ def delete_user_location(user_id: str, label: str) -> bool:
         return True
     except Exception as e:
         jlog("DB", f"Error deleting location: {e}", "ERROR")
+        raise
+
+def get_user_preferences(user_id: str) -> Dict[str, Any]:
+    """Fetch planning preferences. Missing optional table falls back safely."""
+    if not supabase:
+        return dict(DEFAULT_USER_PREFERENCES)
+    try:
+        response = supabase.table('user_preferences').select('*').eq('user_id', user_id).limit(1).execute()
+        row = (response.data or [None])[0]
+        return _normalize_preference_row(row)
+    except Exception as e:
+        jlog("DB", f"User preferences read skipped: {e}", "PREFERENCES")
+        return dict(DEFAULT_USER_PREFERENCES)
+
+def save_user_preferences(
+    user_id: str,
+    day_start_time: Optional[str] = None,
+    day_end_time: Optional[str] = None,
+    use_day_boundary_preferences: bool = True,
+    default_start_location: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Create or update planning preferences for a user."""
+    if not supabase:
+        raise Exception("Supabase client not initialized.")
+    if default_start_location is not None and not _has_coordinates(default_start_location):
+        raise ValueError("Default start location must include latitude and longitude.")
+
+    normalized_start = _normalize_time_string(day_start_time, DEFAULT_USER_PREFERENCES["day_start_time"])
+    normalized_end = _normalize_time_string(day_end_time, DEFAULT_USER_PREFERENCES["day_end_time"])
+    payload = {
+        "user_id": user_id,
+        "day_start_time": normalized_start,
+        "day_end_time": normalized_end,
+        "use_day_boundary_preferences": bool(use_day_boundary_preferences),
+        "default_start_location_label": (default_start_location or {}).get("label") if default_start_location else None,
+        "default_start_location": default_start_location,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        response = supabase.table('user_preferences').upsert(payload, on_conflict='user_id').execute()
+        row = (response.data or [payload])[0]
+        return _normalize_preference_row(row)
+    except Exception as e:
+        jlog("DB", f"Error saving user preferences: {e}", "ERROR")
+        raise
+
+def get_user_recent_locations(user_id: str, limit: int = 5) -> List[Dict[str, Any]]:
+    """Fetch recently confirmed locations, newest first."""
+    if not supabase:
+        return []
+    try:
+        response = (
+            supabase.table('user_recent_locations')
+            .select('*')
+            .eq('user_id', user_id)
+            .order('last_used_at', desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return response.data or []
+    except Exception as e:
+        jlog("DB", f"Recent locations read skipped: {e}", "RECENT_LOCATION")
+        return []
+
+def upsert_user_recent_location(user_id: str, location: Dict[str, Any], limit: int = 5) -> List[Dict[str, Any]]:
+    """Persist a recent location and keep only the newest few entries."""
+    if not supabase:
+        raise Exception("Supabase client not initialized.")
+    if not _has_coordinates(location):
+        raise ValueError("Recent location must include latitude and longitude.")
+
+    now = datetime.now(timezone.utc).isoformat()
+    location_key = _location_identity_key(location)
+    payload = {
+        "user_id": user_id,
+        "location_key": location_key,
+        "label": location.get("label") or location.get("display_name") or location.get("address"),
+        "display_name": location.get("display_name") or location.get("label") or location.get("address"),
+        "address": location.get("address") or location.get("display_name") or location.get("label"),
+        "category": location.get("category"),
+        "latitude": float(location.get("latitude")),
+        "longitude": float(location.get("longitude")),
+        "source": location.get("source") or "recent",
+        "last_used_at": now,
+        "updated_at": now,
+    }
+    try:
+        supabase.table('user_recent_locations').upsert(payload, on_conflict='user_id, location_key').execute()
+        all_rows = (
+            supabase.table('user_recent_locations')
+            .select('id')
+            .eq('user_id', user_id)
+            .order('last_used_at', desc=True)
+            .execute()
+        )
+        stale_ids = [row.get("id") for row in (all_rows.data or [])[limit:] if row.get("id")]
+        for stale_id in stale_ids:
+            supabase.table('user_recent_locations').delete().eq('id', stale_id).execute()
+        jlog("RECENT_LOCATION", f"added={payload['label'] or payload['display_name']}")
+        return get_user_recent_locations(user_id, limit=limit)
+    except Exception as e:
+        jlog("DB", f"Error saving recent location: {e}", "ERROR")
         raise
 
 def _cache_query(normalized_query: str, provider: str, country_hint: Optional[str], category_hint: Optional[str]):

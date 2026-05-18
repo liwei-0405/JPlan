@@ -51,6 +51,224 @@ REFINEMENT_META_KEYS = (
 
 
 class ModuleDRefinementMixin:
+    def _module_d_route_breakdown(
+        self,
+        timeline: List[Dict[str, Any]],
+        unscheduled: List[Dict[str, Any]],
+        day_start: int,
+        day_end: int,
+        min_travel: Optional[int],
+        *,
+        log_revisits: bool = False,
+    ) -> Dict[str, Any]:
+        ordered = sorted(timeline or [], key=lambda item: item.get("scheduled_start") or 0)
+        physical = [item for item in ordered if self._activity_requires_travel(item)]
+        route_violations = self._route_aware_timeline_violations(ordered, day_start, day_end, min_travel)
+
+        total_travel = 0
+        total_buffer = 0
+        revisit_penalty = 0
+        revisit_count = 0
+        same_location_split_penalty = 0
+        left_locations: set[str] = set()
+
+        def location_key(item: Dict[str, Any]) -> str:
+            context = self._active_route_context()
+            node = (context.get("nodes") or {}).get(self._route_context_activity_key(item)) if context else None
+            coord = (node or {}).get("coordinate") or {}
+            if coord.get("latitude") is not None and coord.get("longitude") is not None:
+                return f"{float(coord['latitude']):.5f},{float(coord['longitude']):.5f}"
+            return clean_title(item.get("location_label") or item.get("location") or item.get("title") or "")
+
+        for left, right in zip(physical, physical[1:]):
+            route_entry = self._route_context_entry(left, right)
+            route_minutes = int((route_entry or {}).get("duration_minutes") or 0)
+            total_travel += route_minutes
+            total_buffer += max(
+                int(left.get("prep_buffer", DEFAULT_PREP_BUFFER) or 0),
+                int(right.get("prep_buffer", DEFAULT_PREP_BUFFER) or 0),
+            )
+
+        for index, item in enumerate(physical):
+            key = location_key(item)
+            if not key:
+                continue
+            if key in left_locations:
+                revisit_count += 1
+                revisit_penalty += 350
+                if log_revisits:
+                    jlog("MODULE_D", f"location={key} pattern=revisit", "REVISIT_PENALTY")
+            next_key = location_key(physical[index + 1]) if index + 1 < len(physical) else ""
+            if next_key and next_key != key:
+                left_locations.add(key)
+
+        context = self._active_route_context()
+        same_groups = (context or {}).get("same_location_groups") or []
+        for group in same_groups:
+            keys = set(group.get("keys") or [])
+            positions = [
+                index for index, item in enumerate(physical)
+                if self._route_context_activity_key(item) in keys
+            ]
+            if len(positions) < 2:
+                continue
+            span = max(positions) - min(positions)
+            if span > len(positions) - 1:
+                same_location_split_penalty += 260 * (span - (len(positions) - 1))
+
+        total_idle = 0
+        cursor = day_start
+        for item in ordered:
+            start = int(item.get("scheduled_start") or cursor)
+            total_idle += max(0, start - cursor)
+            cursor = max(cursor, int(item.get("scheduled_end") or cursor))
+        total_idle += max(0, day_end - cursor)
+
+        preferred_penalty = 0
+        fixed_penalty = 0
+        for item in ordered:
+            start = item.get("scheduled_start")
+            end = item.get("scheduled_end")
+            window_start = item.get("preferred_window_start")
+            window_end = item.get("preferred_window_end")
+            if start is not None and end is not None:
+                if window_start is not None and start < int(window_start):
+                    preferred_penalty += int(window_start) - int(start)
+                if window_end is not None and end > int(window_end):
+                    preferred_penalty += int(end) - int(window_end)
+            if item.get("is_user_fixed") and item.get("fixed_start") is not None and start != item.get("fixed_start"):
+                fixed_penalty += 100000
+
+        route_conflict_penalty = 100000 * len(route_violations)
+        final_total = (
+            -float(total_travel)
+            - float(total_buffer) * 0.2
+            - float(total_idle) * 0.03
+            - float(preferred_penalty) * 0.4
+            - float(route_conflict_penalty)
+            - float(same_location_split_penalty)
+            - float(revisit_penalty)
+            - float(fixed_penalty)
+        )
+        return {
+            "total_travel_minutes": total_travel,
+            "total_buffer_minutes": total_buffer,
+            "total_idle_minutes": total_idle,
+            "preferred_window_penalty": preferred_penalty,
+            "route_conflict_penalty": route_conflict_penalty,
+            "same_location_split_penalty": same_location_split_penalty,
+            "revisit_location_penalty": revisit_penalty,
+            "fixed_event_violation_penalty": fixed_penalty,
+            "location_revisits_count": revisit_count,
+            "final_total_score": round(final_total, 4),
+        }
+
+    def _module_d_log_score_breakdown(
+        self,
+        before: Dict[str, Any],
+        after: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        after = after or before
+        route_before = int(before.get("total_travel_minutes") or 0)
+        route_after = int(after.get("total_travel_minutes") or 0)
+        saved = route_before - route_after
+        jlog(
+            "MODULE_D",
+            (
+                f"route_before={route_before} route_after={route_after} saved={saved} "
+                f"same_location_before={before.get('same_location_split_penalty', 0)} "
+                f"same_location_after={after.get('same_location_split_penalty', 0)} "
+                f"revisit_before={before.get('revisit_location_penalty', 0)} "
+                f"revisit_after={after.get('revisit_location_penalty', 0)} "
+                f"idle={after.get('total_idle_minutes', 0)} "
+                f"preferred_penalty={after.get('preferred_window_penalty', 0)} "
+                f"total={after.get('final_total_score', 0)}"
+            ),
+            "SCORE_BREAKDOWN",
+        )
+
+    def _module_d_log_start_burden(
+        self,
+        timeline: List[Dict[str, Any]],
+        day_start: int,
+    ) -> None:
+        context = self._active_route_context()
+        if not context:
+            return
+        ordered = sorted(timeline or [], key=lambda item: item.get("scheduled_start") or 0)
+        physical = [item for item in ordered if self._activity_requires_travel(item)]
+        if not physical:
+            return
+        first = physical[0]
+        start_entry = self._route_context_start_entry(first)
+        if not start_entry:
+            return
+        first_start = int(first.get("scheduled_start") or 0)
+        duration = int(start_entry.get("duration_minutes") or 0)
+        leave_by = first_start - duration
+        blockers = [
+            str(item.get("title") or "Activity")
+            for item in ordered
+            if item is not first
+            and int(item.get("scheduled_end") or 0) > leave_by
+            and int(item.get("scheduled_start") or 0) < first_start
+        ]
+        jlog(
+            "MODULE_D",
+            (
+                f"first_event={first.get('title')} leave_by={format_clock(leave_by)} "
+                f"duration={duration} blockers={blockers} day_start={format_clock(day_start)}"
+            ),
+            "START_BURDEN",
+        )
+
+    def _module_d_log_same_location_order(self, timeline: List[Dict[str, Any]]) -> None:
+        context = self._active_route_context()
+        if not context:
+            return
+        ordered = sorted(timeline or [], key=lambda item: item.get("scheduled_start") or 0)
+        positions = {
+            self._route_context_activity_key(item): index
+            for index, item in enumerate(ordered)
+            if self._route_context_activity_key(item)
+        }
+        for group in context.get("same_location_groups") or []:
+            keys = [key for key in group.get("keys", []) if key in positions]
+            if len(keys) < 2:
+                continue
+            ordered_keys = sorted(keys, key=lambda key: positions[key])
+            titles_by_key = {
+                self._route_context_activity_key(item): str(item.get("title") or "Activity")
+                for item in ordered
+            }
+            ordered_titles = [titles_by_key.get(key, key) for key in ordered_keys]
+            span = max(positions[key] for key in keys) - min(positions[key] for key in keys)
+            split = max(0, span - (len(keys) - 1))
+            jlog(
+                "MODULE_D",
+                f"activities={ordered_titles} split_gap={split}",
+                "SAME_LOCATION_ORDER",
+            )
+
+    def _module_d_route_efficiency_metadata(
+        self,
+        before: Dict[str, Any],
+        after: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        after = after or before
+        route_before = int(before.get("total_travel_minutes") or 0)
+        route_after = int(after.get("total_travel_minutes") or 0)
+        return {
+            "route_total_before": route_before,
+            "route_total_after": route_after,
+            "route_minutes_saved": route_before - route_after,
+            "same_location_split_penalty_before": before.get("same_location_split_penalty", 0),
+            "same_location_split_penalty_after": after.get("same_location_split_penalty", 0),
+            "revisit_penalty_before": before.get("revisit_location_penalty", 0),
+            "revisit_penalty_after": after.get("revisit_location_penalty", 0),
+            "location_revisits_count": after.get("location_revisits_count", 0),
+        }
+
     def _configure_module_d_run_policy(
         self,
         preferences: Dict[str, Any],
@@ -133,10 +351,22 @@ class ModuleDRefinementMixin:
         preferences: Dict[str, Any],
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
         before_score = self._module_d_score(timeline, unscheduled, day_start, day_end, min_travel)
+        before_route_breakdown = self._module_d_route_breakdown(
+            timeline,
+            unscheduled,
+            day_start,
+            day_end,
+            min_travel,
+            log_revisits=True,
+        )
         run, reason, skipped_reason = self._module_d_should_run(preferences)
         if not run:
             log_reason = "simple_edit" if skipped_reason == "skipped_simple_edit" else skipped_reason
             jlog("MODULE_D", f"reason={log_reason}", "SKIP")
+            if self._active_route_context():
+                self._module_d_log_start_burden(timeline, day_start)
+                self._module_d_log_same_location_order(timeline)
+                self._module_d_log_score_breakdown(before_route_breakdown)
             return (
                 timeline,
                 unscheduled,
@@ -146,6 +376,8 @@ class ModuleDRefinementMixin:
                     iterations=0,
                     score_before=before_score,
                     score_after=before_score,
+                    route_efficiency=self._module_d_route_efficiency_metadata(before_route_breakdown)
+                    if self._active_route_context() else None,
                 ),
             )
 
@@ -170,6 +402,8 @@ class ModuleDRefinementMixin:
                     iterations=0,
                     score_before=before_score,
                     score_after=before_score,
+                    route_efficiency=self._module_d_route_efficiency_metadata(before_route_breakdown)
+                    if self._active_route_context() else None,
                 ),
             )
 
@@ -195,6 +429,8 @@ class ModuleDRefinementMixin:
                     iterations=0,
                     score_before=before_score,
                     score_after=before_score,
+                    route_efficiency=self._module_d_route_efficiency_metadata(before_route_breakdown)
+                    if self._active_route_context() else None,
                 ),
             )
 
@@ -213,6 +449,8 @@ class ModuleDRefinementMixin:
                 if not feasible:
                     if len(rejected_moves) < 20:
                         rejected_moves.append({**move, "reason": reject_reason})
+                    if move.get("type") == "same_location_cluster":
+                        jlog("MODULE_D", f"type=same_location_cluster reason={reject_reason} score_delta=0", "REJECT")
                     jlog("MODULE_D", f"reason={reject_reason}", "REJECT")
                     continue
 
@@ -221,6 +459,12 @@ class ModuleDRefinementMixin:
                 if delta <= MODULE_D_MIN_IMPROVEMENT:
                     if len(rejected_moves) < 20:
                         rejected_moves.append({**move, "reason": "score_delta_below_threshold", "score_delta": round(delta, 4)})
+                    if move.get("type") == "same_location_cluster":
+                        jlog(
+                            "MODULE_D",
+                            f"type=same_location_cluster reason=score_delta_below_threshold score_delta={delta:.4f}",
+                            "REJECT",
+                        )
                     continue
                 if best_candidate is None or delta > best_candidate[0]:
                     best_candidate = (delta, candidate_timeline, candidate_unscheduled, move)
@@ -236,9 +480,24 @@ class ModuleDRefinementMixin:
             }
             accepted_moves.append(accepted)
             self._module_d_append_trace(current, move)
+            if self._active_route_context():
+                jlog("MODULE_D", "reason=fixes_route_infeasibility", "ACCEPT")
             jlog("MODULE_D", f"moved={move.get('title')} score_delta={delta:.2f}", "ACCEPT")
 
         after_score = self._module_d_score(current, remaining_unscheduled, day_start, day_end, min_travel)
+        after_route_breakdown = self._module_d_route_breakdown(
+            current,
+            remaining_unscheduled,
+            day_start,
+            day_end,
+            min_travel,
+            log_revisits=True,
+        )
+        if self._active_route_context():
+            self._module_d_log_start_burden(timeline, day_start)
+            self._module_d_log_same_location_order(timeline)
+            self._module_d_log_same_location_order(current)
+            self._module_d_log_score_breakdown(before_route_breakdown, after_route_breakdown)
         applied = bool(accepted_moves)
         if not applied and (has_movable or has_insertable):
             no_candidate_reason = self._module_d_no_candidate_reason(rejected_moves)
@@ -256,6 +515,7 @@ class ModuleDRefinementMixin:
                 score_after=after_score,
                 accepted_moves=accepted_moves,
                 rejected_moves=rejected_moves,
+                route_efficiency=self._module_d_route_efficiency_metadata(before_route_breakdown, after_route_breakdown),
             ),
         )
 
@@ -287,6 +547,7 @@ class ModuleDRefinementMixin:
         score_after: float,
         accepted_moves: Optional[List[Dict[str, Any]]] = None,
         rejected_moves: Optional[List[Dict[str, Any]]] = None,
+        route_efficiency: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         return {
             "refinement_applied": bool(applied),
@@ -296,6 +557,7 @@ class ModuleDRefinementMixin:
             "refinement_score_after": round(float(score_after), 4),
             "refinement_accepted_moves": accepted_moves or [],
             "refinement_rejected_moves": rejected_moves or [],
+            "route_efficiency": route_efficiency or {},
         }
 
     def _module_d_generate_candidates(
@@ -308,6 +570,15 @@ class ModuleDRefinementMixin:
     ) -> List[Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]]:
         candidates: List[Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]] = []
         ordered = sorted(timeline, key=lambda item: item.get("scheduled_start") or 0)
+        candidates.extend(
+            self._module_d_same_location_cluster_candidates(
+                ordered,
+                unscheduled,
+                day_start,
+                day_end,
+                min_travel,
+            )
+        )
         for index, item in enumerate(ordered):
             if not self._module_d_is_movable(item, ordered):
                 continue
@@ -357,6 +628,89 @@ class ModuleDRefinementMixin:
             }))
         return candidates
 
+    def _module_d_same_location_cluster_candidates(
+        self,
+        ordered: List[Dict[str, Any]],
+        unscheduled: List[Dict[str, Any]],
+        day_start: int,
+        day_end: int,
+        min_travel: Optional[int],
+    ) -> List[Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]]:
+        context = self._active_route_context()
+        if not context:
+            return []
+        groups = context.get("same_location_groups") or []
+        if not groups:
+            return []
+
+        by_key = {
+            self._route_context_activity_key(item): item
+            for item in ordered
+            if self._route_context_activity_key(item)
+        }
+        candidates: List[Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]] = []
+        seen: set[Tuple[str, str, int, int]] = set()
+        for group in groups:
+            group_items = [by_key[key] for key in group.get("keys", []) if key in by_key]
+            if len(group_items) < 2:
+                continue
+            for target in group_items:
+                if not self._module_d_is_movable(target, ordered):
+                    continue
+                target_key = self._route_context_activity_key(target)
+                duration = int(target.get("duration_minutes") or ((target.get("scheduled_end") or 0) - (target.get("scheduled_start") or 0)) or 60)
+                for anchor in group_items:
+                    anchor_key = self._route_context_activity_key(anchor)
+                    if anchor_key == target_key:
+                        continue
+                    base = [deepcopy(entry) for entry in ordered if self._route_context_activity_key(entry) != target_key]
+                    anchor_in_base = self._module_d_find_by_id(base, anchor)
+                    if not anchor_in_base:
+                        continue
+                    attempts = [
+                        (
+                            "after",
+                            int(anchor_in_base.get("scheduled_end") or 0) + self._transition_minutes(anchor_in_base, target, min_travel),
+                        ),
+                        (
+                            "before",
+                            int(anchor_in_base.get("scheduled_start") or 0) - self._transition_minutes(target, anchor_in_base, min_travel) - duration,
+                        ),
+                    ]
+                    for position, start in attempts:
+                        end = start + duration
+                        if start < day_start or end > day_end:
+                            continue
+                        candidate_item = deepcopy(target)
+                        candidate_item["scheduled_start"] = start
+                        candidate_item["scheduled_end"] = end
+                        candidate_timeline = sorted(base + [candidate_item], key=lambda item: item.get("scheduled_start") or 0)
+                        key = (target_key, anchor_key, start, end)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        jlog(
+                            "MODULE_D",
+                            f"type=same_location_cluster target={target.get('title')} anchor={anchor.get('title')}",
+                            "CANDIDATE",
+                        )
+                        candidates.append((
+                            candidate_timeline,
+                            deepcopy(unscheduled),
+                            {
+                                "type": "same_location_cluster",
+                                "activity_id": target.get("stable_activity_id") or target.get("id"),
+                                "title": target.get("title"),
+                                "anchor_activity_id": anchor.get("stable_activity_id") or anchor.get("id"),
+                                "anchor_title": anchor.get("title"),
+                                "position": position,
+                                "from": self._module_d_time_range(target),
+                                "to": self._module_d_time_range(candidate_item),
+                                "reason": f"Clustered with same-location {anchor.get('title')}",
+                            },
+                        ))
+        return candidates
+
     def _module_d_is_movable(self, item: Dict[str, Any], timeline: List[Dict[str, Any]]) -> bool:
         movable, _ = self._module_d_movable_reason(item, timeline)
         return movable
@@ -398,7 +752,17 @@ class ModuleDRefinementMixin:
         }
         if not reasons:
             return "no_score_improving_move"
-        infeasible_reasons = {"overlap", "transition_buffer", "dependency_order", "day_boundary", "missing_schedule_time", "no_candidate_slot"}
+        infeasible_reasons = {
+            "overlap",
+            "transition_buffer",
+            "dependency_order",
+            "day_boundary",
+            "missing_schedule_time",
+            "no_candidate_slot",
+            "route_transition",
+            "start_route_blocker",
+            "start_route_before_day_start",
+        }
         if reasons and reasons.issubset(infeasible_reasons):
             return "all_candidates_infeasible"
         return "no_score_improving_move"
@@ -430,6 +794,11 @@ class ModuleDRefinementMixin:
         min_travel: Optional[int],
     ) -> Tuple[bool, str]:
         ordered = sorted(timeline, key=lambda item: item.get("scheduled_start") or 0)
+        route_violations = self._route_aware_timeline_violations(ordered, day_start, day_end, min_travel)
+        if route_violations:
+            reason = clean_title(route_violations[0].get("reason") or "route_infeasible")
+            jlog("MODULE_D", f"reason={reason}", "ROUTE_PENALTY")
+            return False, reason
         for index, item in enumerate(ordered):
             start = item.get("scheduled_start")
             end = item.get("scheduled_end")
@@ -477,6 +846,25 @@ class ModuleDRefinementMixin:
         ordered = sorted(timeline, key=lambda item: item.get("scheduled_start") or 0)
         score = 0.0
         priority_value = {"low": 6.0, "medium": 18.0, "high": 45.0}
+
+        route_violations = self._route_aware_timeline_violations(ordered, day_start, day_end, min_travel)
+        if route_violations:
+            score -= 100000.0 * len(route_violations)
+            first_reason = route_violations[0].get("reason") or "route_infeasible"
+            jlog("MODULE_D", f"reason={first_reason}", "ROUTE_PENALTY")
+        if self._active_route_context():
+            route_breakdown = self._module_d_route_breakdown(
+                ordered,
+                unscheduled,
+                day_start,
+                day_end,
+                min_travel,
+            )
+            score -= float(route_breakdown.get("total_travel_minutes") or 0) * 0.8
+            score -= float(route_breakdown.get("same_location_split_penalty") or 0)
+            score -= float(route_breakdown.get("revisit_location_penalty") or 0)
+            score -= float(route_breakdown.get("preferred_window_penalty") or 0) * 0.2
+            score -= float(route_breakdown.get("fixed_event_violation_penalty") or 0)
 
         for item in ordered:
             priority = clean_title(item.get("priority") or "medium")

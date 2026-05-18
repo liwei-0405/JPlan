@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from jplan_logging import jjson, jlog, jsection
+from jplan_logging import jjson, jlog, jplan_verbose_enabled, jsection
 from travel_service import MissingORSApiKey, TravelService, TravelServiceError, coordinate_from_saved_location
 from .module_d_refinement import REFINEMENT_META_KEYS
 from .types_utils import *
@@ -49,7 +49,7 @@ class StateOperationsMixin:
             normalized["location"] = clean_optional_text(normalized.get("location"))
         normalized["fixed_start"] = raw.get("fixed_start") or raw.get("startTime")
         normalized["fixed_end"] = raw.get("fixed_end") or raw.get("endTime")
-        normalized["target_id"] = raw.get("target_id") or raw.get("stable_activity_id") or raw.get("id")
+        normalized["target_id"] = raw.get("target_id") or raw.get("activity_id") or raw.get("stable_activity_id") or raw.get("id")
         normalized["target_title"] = raw.get("target_title") or raw.get("target") or raw.get("title")
         if raw.get("duration_minutes") is None and raw.get("duration") is not None:
             normalized["duration_minutes"] = parse_duration_minutes(raw.get("duration"))
@@ -232,6 +232,141 @@ class StateOperationsMixin:
                 return {"kind": "after", "target_title": anchor.get("title")}
         return None
 
+    def _operation_has_relation_or_edit_intent(self, operation: Dict[str, Any]) -> bool:
+        timing_mode = clean_title(operation.get("timing_mode") or "")
+        return bool(
+            operation.get("anchor_relation")
+            or timing_mode == TimingMode.RELATIVE
+            or operation.get("preferred_adjustment")
+            or operation.get("move_direction")
+        )
+
+    def _duplicate_guard_allows_new_activity(self, operation: Dict[str, Any]) -> bool:
+        message = clean_title(operation.get("_user_message") or operation.get("_source_text") or "")
+        if re.search(r"\b(?:another|new|second|additional)\b", message):
+            return True
+        return False
+
+    def _message_mentions_duration(self, message: str) -> bool:
+        return bool(re.search(
+            r"\b(?:for\s+)?\d{1,3}\s*(?:-| )?\s*(?:minutes?|mins?|min|hours?|hrs?|hr)\b|"
+            r"\b(?:half[-\s]*hour|half\s+an\s+hour)\b",
+            message or "",
+            flags=re.IGNORECASE,
+        ))
+
+    def _strip_parser_wrapper_from_title(self, title: str) -> str:
+        text = clean_title(title or "")
+        text = re.sub(
+            r"^(?:how about|what about|maybe|what if|i was thinking|i think maybe|"
+            r"would it be better if|would it help if|i want|i need|i would like|can we|could we)\s+",
+            "",
+            text,
+        )
+        text = re.sub(r"\s+(?:is|should|could|would)\s*$", "", text).strip()
+        return text
+
+    def _duplicate_guard_reference_resolution(
+        self,
+        operation: Dict[str, Any],
+        active_pool: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        reference = str(operation.get("title") or operation.get("target_title") or "").strip()
+        resolution = self._resolve_activity_reference(reference, active_pool)
+        if resolution.get("status") in {"resolved", "ambiguous"}:
+            return resolution
+        stripped = self._strip_parser_wrapper_from_title(reference)
+        if stripped and stripped != clean_title(reference):
+            stripped_resolution = self._resolve_activity_reference(stripped, active_pool)
+            if stripped_resolution.get("status") in {"resolved", "ambiguous"}:
+                stripped_resolution["original_user_target"] = reference
+                return stripped_resolution
+        return resolution
+
+    def _apply_duplicate_guard_to_add(
+        self,
+        operation: Dict[str, Any],
+        active_pool: List[Dict[str, Any]],
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        if clean_title(operation.get("op") or "add") != "add":
+            return operation, None
+        if not active_pool or not self._operation_has_relation_or_edit_intent(operation):
+            return operation, None
+        if self._duplicate_guard_allows_new_activity(operation):
+            return operation, None
+
+        resolution = self._duplicate_guard_reference_resolution(operation, active_pool)
+        original = str(operation.get("title") or operation.get("target_title") or "").strip()
+        if resolution.get("status") == "ambiguous":
+            candidates = resolution.get("candidates") or []
+            jlog(
+                "DUPLICATE_GUARD",
+                f"original={original or '?'} candidates={candidates}",
+                "CLARIFY",
+            )
+            return None, {
+                "operation": operation,
+                "target": original,
+                "reason": "duplicate_guard_ambiguous_target",
+                "candidates": candidates,
+            }
+        if resolution.get("status") != "resolved":
+            return operation, None
+
+        confidence = resolution.get("target_resolution_confidence") or "low"
+        if confidence not in {"medium", "high"}:
+            return operation, None
+
+        target = resolution.get("activity") or {}
+        target_id = target.get("stable_activity_id") or target.get("id")
+        converted = deepcopy(operation)
+        converted["op"] = "update"
+        converted["title"] = target.get("title") or converted.get("title")
+        converted["target_title"] = target.get("title") or converted.get("target_title") or converted.get("title")
+        converted["target_id"] = target_id
+        converted["activity_id"] = target_id
+        converted["preserve_existing_fields"] = True
+        converted["_preserve_resolved_title"] = True
+        converted["_duplicate_guard_converted_add_to_update"] = True
+        converted["original_user_target"] = original
+        converted["resolved_target_title"] = target.get("title")
+        converted["target_resolution_confidence"] = confidence
+
+        resolved_anchor = self._resolve_anchor_relation(converted.get("anchor_relation"), active_pool)
+        if resolved_anchor:
+            converted["anchor_relation"] = resolved_anchor
+
+        message = converted.get("_user_message") or ""
+        if not self._message_mentions_duration(message):
+            converted.pop("duration_minutes", None)
+        if not re.search(r"\bpriority\b", clean_title(message)):
+            converted.pop("priority", None)
+        if converted.get("raw_llm_location") is None and not converted.get("explicit_user_location"):
+            for field in (
+                "location",
+                "location_label",
+                "location_category",
+                "location_status",
+                "location_source",
+                "location_confidence",
+                "location_normalized",
+                "location_warning",
+                "resolved_location",
+                "latitude",
+                "longitude",
+                "lat",
+                "lng",
+                "travel_required",
+            ):
+                converted.pop(field, None)
+
+        jlog(
+            "DUPLICATE_GUARD",
+            f"original={original or '?'} resolved={converted.get('title')} confidence={confidence}",
+            "CONVERT_UPDATE",
+        )
+        return converted, None
+
     def _prepare_operations_for_apply(
         self,
         operations: List[Dict[str, Any]],
@@ -248,6 +383,12 @@ class StateOperationsMixin:
                 operation["timing_mode"] = TimingMode.RELATIVE
                 operation["fixed_start"] = None
                 operation["fixed_end"] = None
+
+            guarded_operation, duplicate_guard_ignored = self._apply_duplicate_guard_to_add(operation, active_pool)
+            if duplicate_guard_ignored:
+                ignored.append(duplicate_guard_ignored)
+                continue
+            operation = guarded_operation or operation
 
             target_reference = operation.get("target_id") or operation.get("target_title")
             resolution = self._resolve_activity_reference(target_reference, active_pool) if target_reference else {"status": "missing"}
@@ -528,7 +669,8 @@ class StateOperationsMixin:
     ) -> Dict[str, Any]:
         normalized_reference = clean_title(str(reference or ""))
         if not normalized_reference:
-            self._debug("[STATE] Target resolution failed because the reference was empty")
+            if jplan_verbose_enabled():
+                self._debug("[STATE] Target resolution failed because the reference was empty")
             return {"status": "missing", "reason": "empty_reference"}
 
         active_activities = [item for item in activities if item.get("status") == "active"]
@@ -558,7 +700,8 @@ class StateOperationsMixin:
             scored.append((score, recency_rank, scheduled_rank, activity))
 
         if not scored:
-            self._debug(f"[STATE] Target resolution failed for '{reference}'")
+            if jplan_verbose_enabled():
+                self._debug(f"[STATE] Target resolution failed for '{reference}'")
             return {"status": "not_found", "reason": "no_match", "reference": str(reference)}
 
         scored.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
@@ -622,7 +765,7 @@ class StateOperationsMixin:
         updated.setdefault("trace", [])
 
         priority_update_only = bool(operation.get("priority_update_only")) and operation.get("priority") is not None
-        for field in ("title", "priority", "location", "notes", "sequence_index"):
+        for field in ("title", "priority", "location", "notes", "edit_reason", "sequence_index"):
             if field == "title" and (operation.get("_preserve_resolved_title") or priority_update_only):
                 continue
             if operation.get(field) is not None:
@@ -660,6 +803,10 @@ class StateOperationsMixin:
             if resolved_anchor:
                 updated["anchor_relation"] = resolved_anchor
             updated["timing_mode"] = TimingMode.RELATIVE
+            updated["original_timing_mode"] = updated.get("original_timing_mode") or TimingMode.RELATIVE
+            updated["is_user_fixed"] = False
+            updated["user_fixed_start"] = None
+            updated["can_move_for_repair"] = False
             updated["fixed_start"] = None
             updated["fixed_end"] = None
             updated["scheduled_start"] = None
@@ -671,7 +818,12 @@ class StateOperationsMixin:
         elif explicit_fixed_start is not None or explicit_fixed_end is not None:
             if explicit_fixed_start is not None:
                 updated["requested_fixed_start"] = explicit_fixed_start
+                updated["user_fixed_start"] = explicit_fixed_start
             updated["timing_mode"] = TimingMode.FIXED
+            updated["original_timing_mode"] = TimingMode.FIXED
+            updated["is_user_fixed"] = True
+            updated["is_system_scheduled"] = False
+            updated["can_move_for_repair"] = False
             updated["anchor_relation"] = None
             if explicit_fixed_start is not None:
                 updated["fixed_start"] = explicit_fixed_start
@@ -703,6 +855,9 @@ class StateOperationsMixin:
                 updated["scheduled_start"] = None
                 updated["scheduled_end"] = None
                 updated["preserve_scheduled_time"] = False
+                updated["is_user_fixed"] = False
+                updated["user_fixed_start"] = None
+                updated["can_move_for_repair"] = True
                 updated["preferred_adjustment"] = preferred_adjustment
                 updated["move_direction"] = preferred_adjustment
 
@@ -981,6 +1136,7 @@ class StateOperationsMixin:
             active_pool_for_prepare,
             preferences,
         )
+        self._log_location_and_timing_summary(sanitized_operations, include_locations=False)
         self._log_normalized_operations(sanitized_operations)
         operations_to_apply, ignored_operations = self._prepare_operations_for_apply(
             sanitized_operations,
@@ -995,6 +1151,17 @@ class StateOperationsMixin:
             is_apply_operations=True,
         )
         if not operations_to_apply and ignored_operations:
+            duplicate_guard_ignored = next(
+                (item for item in ignored_operations if item.get("reason") == "duplicate_guard_ambiguous_target"),
+                None,
+            )
+            reply_reason = "All parser operations were ignored because they targeted unrequested fixed events."
+            reply_text = None
+            if duplicate_guard_ignored:
+                candidates = duplicate_guard_ignored.get("candidates") or []
+                candidate_text = ", ".join(str(candidate) for candidate in candidates) or "multiple existing activities"
+                reply_reason = "duplicate_guard_ambiguous_target"
+                reply_text = f"Which activity did you mean: {candidate_text}?"
             return {
                 "status": "no_operation",
                 "applied": False,
@@ -1005,7 +1172,8 @@ class StateOperationsMixin:
                 "deletedItemIds": [],
                 "ignored_operations": ignored_operations,
                 "rejected_changes": [],
-                "reply_reason": "All parser operations were ignored because they targeted unrequested fixed events.",
+                "reply_reason": reply_reason,
+                "reply": reply_text,
             }
         if len(operations_to_apply) == 1:
             satisfied = self._relative_order_already_satisfied(
@@ -1092,7 +1260,8 @@ class StateOperationsMixin:
                 postcondition = self._operation_postcondition(operation, new_activity, active_pool + [new_activity])
                 if postcondition:
                     postconditions.append(postcondition)
-                self._debug(f"[STATE] Created new activity '{new_activity['title']}' with activity_id={new_activity['stable_activity_id']}")
+                if jplan_verbose_enabled():
+                    self._debug(f"[STATE] Created new activity '{new_activity['title']}' with activity_id={new_activity['stable_activity_id']}")
                 continue
 
             target_reference = operation.get("target_id") or operation.get("target_title")
@@ -1520,6 +1689,12 @@ class StateOperationsMixin:
             "priority": item.get("priority", "medium"),
             "isMandatory": bool(item.get("is_mandatory", True) if "is_mandatory" in item else item.get("isMandatory", True)),
             "timing_mode": item.get("timing_mode") or item.get("timingMode") or TimingMode.UNSPECIFIED,
+            "original_timing_mode": item.get("original_timing_mode") or item.get("originalTimingMode") or item.get("timing_mode") or TimingMode.UNSPECIFIED,
+            "is_user_fixed": bool(item.get("is_user_fixed", False)),
+            "is_system_scheduled": bool(item.get("is_system_scheduled", item.get("scheduled_start") is not None and not item.get("is_user_fixed", False))),
+            "user_fixed_start": item.get("user_fixed_start"),
+            "can_move_for_repair": bool(item.get("can_move_for_repair", not (item.get("is_user_fixed") or item.get("timing_mode") == TimingMode.FIXED or item.get("fixed_start") is not None))),
+            "repair_protection": item.get("repair_protection") or item.get("repairProtection") or "flexible",
             "fixed_start": fixed_start,
             "fixed_end": fixed_end,
             "earliest_start": earliest_start,

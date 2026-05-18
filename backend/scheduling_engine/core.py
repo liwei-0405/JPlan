@@ -75,14 +75,18 @@ class SchedulingEngine(
         message: str,
         history: Optional[List[Dict[str, Any]]] = None,
         current_schedule: Optional[Dict[str, Any]] = None,
-        saved_locations: List[Dict[str, Any]] = []
+        saved_locations: List[Dict[str, Any]] = [],
+        disable_deterministic_fallback: bool = False,
+        fallback_reason: Optional[str] = None,
     ) -> Dict[str, Any]:
         return self._parse_request(
             latest_request=message,
             history=history or [],
             current_schedule=current_schedule,
             audio_part=None,
-            saved_locations=saved_locations
+            saved_locations=saved_locations,
+            disable_deterministic_fallback=disable_deterministic_fallback,
+            fallback_reason=fallback_reason,
         )
 
     def parse_audio_request(

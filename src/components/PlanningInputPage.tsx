@@ -1,6 +1,16 @@
 import { useState, useEffect, useRef } from "react";
 import { useParams } from "react-router-dom";
-import { completeTravelValidation, geocodeLocation, getPlanByDate, getSavedLocations, type GeocodeCandidate, type SavedLocation } from "../services/planService";
+import {
+  addRecentLocationRemote,
+  completeTravelValidation,
+  geocodeLocation,
+  getPlanByDate,
+  getPlanningPreferences,
+  getRecentLocations,
+  getSavedLocations,
+  type GeocodeCandidate,
+  type SavedLocation,
+} from "../services/planService";
 import { Button } from "./ui/button";
 import { Textarea } from "./ui/textarea";
 import { Input } from "./ui/input";
@@ -26,6 +36,22 @@ import { EventEditModal } from "./EventEditModal";
 import { useAuth } from "../context/AuthContext";
 import { TimelineGrid } from "./TimelineGrid";
 import { LocationPickerDialog, candidateToMapPoint, type MapPoint } from "./LocationPickerDialog";
+import {
+  addRecentLocation,
+  candidateToPlanningLocation,
+  hasLocationCoordinates,
+  loadPlanningPreferences,
+  loadRecentLocations,
+  mergePlanningPreferences,
+  normalizePlanningPreferences,
+  savePlanningPreferences,
+  saveRecentLocations,
+  savedLocationToPlanningLocation,
+  toCanonicalTime,
+  toDisplayTime,
+  type PlanningLocation,
+  type RecentLocation,
+} from "../utils/planningPreferences";
 
 
 type PlanningInputPageProps = {
@@ -39,6 +65,7 @@ type PlanningInputPageProps = {
 
 type LocationResolutionRequest = {
   activity_id: string;
+  request_type?: string;
   title: string;
   category?: string;
   current_guess?: string;
@@ -59,6 +86,17 @@ type LocationResolutionRequest = {
 };
 
 type ResolvedLocationSnapshot = NonNullable<ActivityBlock["resolved_location"]>;
+
+type RepairSuggestion = {
+  id?: string;
+  type?: string;
+  title?: string;
+  from?: string;
+  to?: string;
+  reason?: string;
+  impact?: string;
+  requires_user_confirmation?: boolean;
+};
 
 export function PlanningInputPage({
   onScheduleGenerated,
@@ -94,6 +132,12 @@ export function PlanningInputPage({
   const [mapPickerCandidate, setMapPickerCandidate] = useState<GeocodeCandidate | null>(null);
   const [isSavingMapPin, setIsSavingMapPin] = useState(false);
   const [savedLocationsForPicker, setSavedLocationsForPicker] = useState<SavedLocation[]>([]);
+  const [recentLocations, setRecentLocations] = useState<RecentLocation[]>([]);
+  const [planningPreferences, setPlanningPreferences] = useState(loadPlanningPreferences(user?.id));
+  const [isEditingPlanSettings, setIsEditingPlanSettings] = useState(false);
+  const [draftDayStart, setDraftDayStart] = useState("08:00");
+  const [draftDayEnd, setDraftDayEnd] = useState("22:00");
+  const [draftStartLocationKey, setDraftStartLocationKey] = useState("__default__");
 
   // Auto-load data on mount/refresh if missing
   useEffect(() => {
@@ -116,10 +160,42 @@ export function PlanningInputPage({
 
   useEffect(() => {
     if (!user?.id) return;
+    const localPrefs = loadPlanningPreferences(user.id);
+    setPlanningPreferences(localPrefs);
+    setRecentLocations(loadRecentLocations(user.id));
     getSavedLocations(user.id)
       .then(setSavedLocationsForPicker)
       .catch((error) => console.error("Failed to fetch saved locations for picker:", error));
+    getPlanningPreferences(user.id)
+      .then((remotePrefs) => {
+        if (!remotePrefs) return;
+        const normalized = normalizePlanningPreferences(remotePrefs);
+        savePlanningPreferences(user.id, normalized);
+        setPlanningPreferences(normalized);
+      })
+      .catch((error) => console.error("Failed to fetch planning preferences:", error));
+    getRecentLocations(user.id)
+      .then((locations) => {
+        if (!locations.length) return;
+        setRecentLocations(saveRecentLocations(user.id, locations));
+      })
+      .catch((error) => console.error("Failed to fetch recent locations:", error));
   }, [user?.id]);
+
+  const withPlanningPreferences = (schedule: DailySchedule): DailySchedule => (
+    mergePlanningPreferences(schedule, user?.id, planningPreferences)
+  );
+
+  const rememberRecentLocation = (location: PlanningLocation) => {
+    setRecentLocations(addRecentLocation(user?.id, location));
+    if (user?.id && hasLocationCoordinates(location)) {
+      addRecentLocationRemote(user.id, location)
+        .then((locations) => {
+          if (locations.length) setRecentLocations(saveRecentLocations(user.id, locations));
+        })
+        .catch((error) => console.error("Failed to save recent location:", error));
+    }
+  };
   // Store the original schedule string for comparison to detect changes
   const originalScheduleJson = useRef(JSON.stringify(initialSchedule || {
     date: isoDateStr,
@@ -129,19 +205,20 @@ export function PlanningInputPage({
   // Sync state with parent whenever it changes
   useEffect(() => {
     if (previewSchedule) {
+      const scheduleWithPrefs = withPlanningPreferences(previewSchedule);
       onUpdateSchedule({
-        ...previewSchedule,
+        ...scheduleWithPrefs,
         allow_clash: allowClash,
         accurate_travel_time: accurateTravelTime,
         preferences: {
-          ...(previewSchedule.preferences || {}),
+          ...(scheduleWithPrefs.preferences || {}),
           allow_clash: allowClash,
           accurate_travel_time: accurateTravelTime,
         },
         planning_mode: allowClash ? "clash_allowed" : "feasibility_first",
       });
     }
-  }, [previewSchedule, onUpdateSchedule, allowClash, accurateTravelTime]);
+  }, [previewSchedule, onUpdateSchedule, allowClash, accurateTravelTime, planningPreferences]);
 
   const [editingEvent, setEditingEvent] = useState<ActivityBlock | null>(null);
   const [showExitConfirmation, setShowExitConfirmation] = useState(false);
@@ -428,7 +505,7 @@ export function PlanningInputPage({
         body: JSON.stringify({
           message: userMessage,
           history: currentHistory, // send full history for context
-          current_schedule: previewSchedule, // send current schedule if any
+          current_schedule: previewSchedule ? withPlanningPreferences(previewSchedule) : previewSchedule, // send current schedule if any
           user_id: user?.id,
           allow_clash: allowClash,
           accurate_travel_time: accurateTravelTime,
@@ -468,11 +545,24 @@ export function PlanningInputPage({
   };
 
   const pendingLocationRequests = (previewSchedule?.location_resolution_requests || []) as LocationResolutionRequest[];
+  const pendingRepairSuggestions = (previewSchedule?.pending_repair_suggestions || []) as RepairSuggestion[];
+  const routeRepairActions = (previewSchedule?.route_repair_actions || []) as Array<Record<string, unknown>>;
+  const routeUnfitActivities = (previewSchedule?.unfit_activities || []) as Array<Record<string, unknown>>;
   const isLocationPending = previewSchedule?.schedule_status === "location_pending" || previewSchedule?.status === "location_pending";
+  const startRouteSummary = (previewSchedule?.start_route_summary || {}) as Record<string, unknown>;
+  const startRouteSummaryText = (() => {
+    const startLocation = String(startRouteSummary.start_location || "").trim();
+    const firstEvent = String(startRouteSummary.first_physical_event || "").trim();
+    const leaveBy = String(startRouteSummary.leave_by || "").trim();
+    const duration = Number(startRouteSummary.travel_duration_minutes || 0);
+    if (!startLocation || !firstEvent || !leaveBy || !duration) return "";
+    return `Leave ${startLocation} by ${leaveBy} · ${duration} min travel to ${firstEvent}`;
+  })();
 
   const normalizeLocationTarget = (value?: string | null) => (value || "").trim().toLowerCase();
 
   const matchesLocationRequest = (item: Partial<ActivityBlock>, request: LocationResolutionRequest) => {
+    if (request.request_type === "start_location") return false;
     const requestId = String(request.activity_id || "");
     const itemId = String(item.stable_activity_id || item.id || "");
     if (requestId && itemId && requestId === itemId) return true;
@@ -481,6 +571,38 @@ export function PlanningInputPage({
   };
 
   const travelValidationMessage = (schedule: DailySchedule) => {
+    const suggestions = (schedule.pending_repair_suggestions || []) as RepairSuggestion[];
+    if (suggestions.length > 0) {
+      const suggestion = suggestions[0];
+      return {
+        message: `Accurate travel time found a route conflict. ${suggestion.title || "One activity"} needs to move to ${suggestion.to || "a later time"}. Apply this change?`,
+        status: "warning" as const,
+      };
+    }
+    if (schedule.travel_validation_status === "repair_suggestion_pending") {
+      return {
+        message: "Accurate travel time found a route conflict that needs your confirmation before I change the plan.",
+        status: "warning" as const,
+      };
+    }
+    if (schedule.travel_validation_status === "partial_feasible_with_unfit") {
+      const firstUnfit = (schedule.unfit_activities || [])[0] as Record<string, unknown> | undefined;
+      return {
+        message: firstUnfit?.title
+          ? `Most of the plan is route-safe, but ${String(firstUnfit.title)} could not fit after accurate travel time.`
+          : "Most of the plan is route-safe, but one flexible activity could not fit after accurate travel time.",
+        status: "warning" as const,
+      };
+    }
+    if (schedule.travel_validation_status === "repaired_validated") {
+      const firstAction = (schedule.route_repair_actions || [])[0] as Record<string, unknown> | undefined;
+      return {
+        message: firstAction?.title
+          ? `Adjusted for accurate travel: ${String(firstAction.title)} shifted to ${String(firstAction.to || "a route-safe time")}.`
+          : "Adjusted the plan for accurate travel time.",
+        status: "success" as const,
+      };
+    }
     if ((schedule.location_resolution_requests || []).length > 0 || schedule.travel_validation_status === "pending_locations") {
       return {
         message: "Please confirm the exact locations first so I can calculate accurate travel time.",
@@ -512,6 +634,9 @@ export function PlanningInputPage({
   };
 
   const formatLocationCardTitle = (request: LocationResolutionRequest) => {
+    if (request.request_type === "start_location") {
+      return "Where are you starting from for this plan?";
+    }
     const titles = [request.title, ...(request.related_titles || [])].filter(Boolean);
     const uniqueTitles = Array.from(new Set(titles));
     const titleText = uniqueTitles.join(", ");
@@ -523,6 +648,9 @@ export function PlanningInputPage({
   };
 
   const formatLocationCardHint = (request: LocationResolutionRequest) => {
+    if (request.request_type === "start_location") {
+      return "Choose your starting point for this day. It will not change your default unless you save it in Preferences.";
+    }
     if (request.same_location_as) {
       return `You can confirm the same place as ${request.same_location_as}, or choose a more exact place.`;
     }
@@ -534,7 +662,15 @@ export function PlanningInputPage({
     request: LocationResolutionRequest,
     candidate: GeocodeCandidate,
   ): ActivityBlock => {
-    if (!matchesLocationRequest(item, request)) return item;
+    const sameLabelMatch = Boolean(
+      candidate.source === "same_label_reuse" &&
+      request.current_guess &&
+      (
+        normalizeLocationTarget(item.location_label) === normalizeLocationTarget(request.current_guess) ||
+        normalizeLocationTarget(item.location) === normalizeLocationTarget(request.current_guess)
+      )
+    );
+    if (!matchesLocationRequest(item, request) && !sameLabelMatch) return item;
 
     const displayName = candidate.display_name || candidate.address || request.current_guess || request.title;
     const address = candidate.address || candidate.display_name || request.current_guess || request.title;
@@ -566,10 +702,35 @@ export function PlanningInputPage({
   };
 
   const applyResolvedLocationToDraft = (request: LocationResolutionRequest, candidate: GeocodeCandidate) => {
+    rememberRecentLocation(candidateToPlanningLocation(candidate, request.category));
     setPreviewSchedule(prev => {
       if (!prev) return prev;
+      if (request.request_type === "start_location") {
+        const remaining = ((prev.location_resolution_requests || []) as LocationResolutionRequest[])
+          .filter(item => item.activity_id !== request.activity_id);
+        return {
+          ...prev,
+          preferences: {
+            ...(prev.preferences || {}),
+            day_start_location_override: candidateToPlanningLocation(candidate, "start_location"),
+          },
+          location_resolution_requests: remaining,
+          schedule_status: remaining.length ? prev.schedule_status : "location_pending",
+          travel_validation_status: remaining.length ? prev.travel_validation_status : "pending_locations",
+        };
+      }
       const remaining = ((prev.location_resolution_requests || []) as LocationResolutionRequest[])
-        .filter(item => item.activity_id !== request.activity_id);
+        .filter(item => {
+          if (item.activity_id === request.activity_id) return false;
+          if ((request.related_activity_ids || []).map(String).includes(String(item.activity_id))) return false;
+          if (
+            candidate.source === "same_label_reuse" &&
+            request.current_guess &&
+            item.current_guess &&
+            normalizeLocationTarget(item.current_guess) === normalizeLocationTarget(request.current_guess)
+          ) return false;
+          return true;
+        });
       return {
         ...prev,
         activities: (prev.activities || []).map(item => attachResolvedLocation(item, request, candidate)),
@@ -585,6 +746,66 @@ export function PlanningInputPage({
       delete next[request.activity_id];
       return next;
     });
+  };
+
+  const reusableLocationOptions = (request: LocationResolutionRequest) => {
+    if (!previewSchedule || request.request_type === "start_location") return [];
+    const candidates = [
+      ...(previewSchedule.activities || []),
+      ...(previewSchedule.schedule_blocks || []),
+    ]
+      .filter(item => !matchesLocationRequest(item, request))
+      .map(item => {
+        const resolved = item.resolved_location;
+        if (!hasLocationCoordinates(resolved)) return null;
+        const candidate: GeocodeCandidate = {
+          label: resolved?.saved_location_label || resolved?.label || item.location_label || item.location,
+          display_name: resolved?.display_name || item.location_label || item.location || item.title,
+          address: resolved?.address || resolved?.display_name || item.location_label || item.location || item.title,
+          latitude: Number(resolved?.latitude),
+          longitude: Number(resolved?.longitude),
+          source: "same_as_activity",
+          confirmed_by_user: true,
+        };
+        const title = item.title || "another event";
+        const sameAsAnchor = request.same_location_as && normalizeLocationTarget(title) === normalizeLocationTarget(request.same_location_as);
+        const sameLabel = request.current_guess && (
+          normalizeLocationTarget(item.location_label) === normalizeLocationTarget(request.current_guess) ||
+          normalizeLocationTarget(item.location) === normalizeLocationTarget(request.current_guess) ||
+          normalizeLocationTarget(resolved?.label) === normalizeLocationTarget(request.current_guess)
+        );
+        if (sameAsAnchor) {
+          return {
+            key: `anchor:${title}`,
+            label: `Use same location as ${title}`,
+            source: "inferred_from_anchor",
+            candidate,
+          };
+        }
+        if (sameLabel) {
+          return {
+            key: `label:${request.current_guess}:${title}`,
+            label: `Apply this ${request.current_guess} location to all matching events`,
+            source: "same_label_reuse",
+            candidate,
+          };
+        }
+        return {
+          key: `same:${title}`,
+          label: `Same as ${title}`,
+          source: "same_as_activity",
+          candidate,
+        };
+      })
+      .filter(Boolean) as Array<{ key: string; label: string; source: string; candidate: GeocodeCandidate }>;
+
+    const seen = new Set<string>();
+    return candidates.filter(option => {
+      const coordKey = `${option.source}:${option.candidate.latitude.toFixed(6)}:${option.candidate.longitude.toFixed(6)}:${option.label}`;
+      if (seen.has(coordKey)) return false;
+      seen.add(coordKey);
+      return true;
+    }).slice(0, 4);
   };
 
   const openLocationMapPicker = (request: LocationResolutionRequest, candidate?: GeocodeCandidate) => {
@@ -671,16 +892,17 @@ export function PlanningInputPage({
     setProgressSteps(["Checking travel and buffer time...", "Preparing explanation..."]);
     setActiveProgressIndex(0);
     try {
+      const scheduleWithPrefs = withPlanningPreferences(previewSchedule);
       const validated = await completeTravelValidation({
-        ...previewSchedule,
+        ...scheduleWithPrefs,
         accurate_travel_time: true,
         preferences: {
-          ...(previewSchedule.preferences || {}),
+          ...(scheduleWithPrefs.preferences || {}),
           accurate_travel_time: true,
         },
       }, user.id, source);
       setPreviewSchedule({
-        ...validated,
+        ...withPlanningPreferences(validated),
         allow_clash: allowClash,
         accurate_travel_time: true,
       });
@@ -694,6 +916,53 @@ export function PlanningInputPage({
       setConversationHistory(prev => [...prev, {
         role: "assistant",
         message: error instanceof Error ? error.message : "I couldn't complete travel validation.",
+        status: "warning",
+      }]);
+    } finally {
+      setIsProcessing(false);
+      setProgressSteps([]);
+      setActiveProgressIndex(0);
+    }
+  };
+
+  const sendRepairConfirmation = async (message: "yes" | "no") => {
+    if (!previewSchedule || !user?.id) return;
+    const currentHistory = [...conversationHistory, { role: "user" as const, message }];
+    setConversationHistory(currentHistory);
+    setIsProcessing(true);
+    setProgressSteps(message === "yes" ? ["Applying repair suggestion...", "Rechecking accurate travel time..."] : ["Keeping current schedule..."]);
+    setActiveProgressIndex(0);
+    try {
+      const response = await fetch("http://127.0.0.1:8000/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          message,
+          history: currentHistory,
+          current_schedule: withPlanningPreferences(previewSchedule),
+          user_id: user.id,
+          allow_clash: allowClash,
+          accurate_travel_time: accurateTravelTime,
+        }),
+      });
+      if (!response.ok) throw new Error("Failed to connect to backend");
+      const data = await response.json();
+      setConversationHistory(prev => [...prev, {
+        role: "assistant",
+        message: data.reply,
+        status: data.reply_status,
+      }]);
+      if (data.schedule_data) {
+        setPreviewSchedule({
+          ...withPlanningPreferences(data.schedule_data as DailySchedule),
+          allow_clash: allowClash,
+          accurate_travel_time: accurateTravelTime,
+        });
+      }
+    } catch (error) {
+      setConversationHistory(prev => [...prev, {
+        role: "assistant",
+        message: "I couldn't apply that repair response right now. Please try again.",
         status: "warning",
       }]);
     } finally {
@@ -732,6 +1001,7 @@ export function PlanningInputPage({
   const handleConfirmManualLocation = async (candidate: GeocodeCandidate) => {
     const displayName = candidate.display_name || candidate.address || activityLocation || activityName || "Manual event location";
     const address = candidate.address || candidate.display_name || displayName;
+    rememberRecentLocation(candidateToPlanningLocation(candidate, "manual_event"));
     setActivityLocation(displayName);
     setManualResolvedLocation({
       label: candidate.label || activityName || "manual event",
@@ -795,6 +1065,77 @@ export function PlanningInputPage({
       return true;
     });
   })();
+  const activeStartLocation = (
+    (previewSchedule?.preferences || {}).day_start_location_override ||
+    planningPreferences.default_start_location
+  ) as PlanningLocation | undefined;
+  const activeStartLocationLabel = activeStartLocation
+    ? (activeStartLocation.label || activeStartLocation.display_name || activeStartLocation.address)
+    : null;
+  const activeDayStart = String((previewSchedule?.preferences || {}).day_start_time || planningPreferences.day_start_time || "08:00");
+  const activeDayEnd = String((previewSchedule?.preferences || {}).day_end_time || planningPreferences.day_end_time || "22:00");
+  const baseTimeOptions = ["06:00", "07:00", "08:00", "09:00", "10:00", "20:00", "21:00", "22:00", "23:00"];
+  const timeOptions = Array.from(new Set([
+    ...baseTimeOptions,
+    toCanonicalTime(activeDayStart) || "08:00",
+    toCanonicalTime(activeDayEnd) || "22:00",
+  ])).sort();
+  const savedStartLocationOptions = savedLocationsForPicker.filter((location) => hasLocationCoordinates(location as PlanningLocation));
+  const locationOptionKey = (location?: Partial<PlanningLocation> | null) => {
+    if (!location) return "__none__";
+    if (location.label) return `label:${location.label}`;
+    return `coord:${Number(location.latitude).toFixed(6)}:${Number(location.longitude).toFixed(6)}`;
+  };
+  const activeOverrideLocation = (previewSchedule?.preferences || {}).day_start_location_override as PlanningLocation | undefined;
+  const activeStartLocationKey = activeOverrideLocation
+    ? locationOptionKey(activeOverrideLocation)
+    : "__default__";
+  const activeOverrideIsSavedOption = activeOverrideLocation
+    ? savedStartLocationOptions.some((location) => locationOptionKey(location) === activeStartLocationKey)
+    : false;
+  const displayedDayStart = isEditingPlanSettings ? draftDayStart : (toCanonicalTime(activeDayStart) || "08:00");
+  const displayedDayEnd = isEditingPlanSettings ? draftDayEnd : (toCanonicalTime(activeDayEnd) || "22:00");
+  const displayedStartLocationKey = isEditingPlanSettings ? draftStartLocationKey : activeStartLocationKey;
+  const planSettingControlClass = `h-8 rounded-xl border border-border px-2 text-xs transition ${
+    isEditingPlanSettings
+      ? "bg-background text-foreground"
+      : "cursor-not-allowed bg-muted/50 text-muted-foreground opacity-70"
+  }`;
+  const beginPlanSettingsEdit = () => {
+    setDraftDayStart(toCanonicalTime(activeDayStart) || "08:00");
+    setDraftDayEnd(toCanonicalTime(activeDayEnd) || "22:00");
+    setDraftStartLocationKey(
+      (previewSchedule?.preferences || {}).day_start_location_override
+        ? locationOptionKey((previewSchedule?.preferences || {}).day_start_location_override as PlanningLocation)
+        : "__default__",
+    );
+    setIsEditingPlanSettings(true);
+  };
+  const applyPlanSettingsEdit = () => {
+    setPreviewSchedule((prev) => {
+      if (!prev) return prev;
+      const selectedSavedLocation = savedStartLocationOptions.find((location) => locationOptionKey(location) === draftStartLocationKey);
+      const nextPreferences: Record<string, unknown> = {
+        ...(prev.preferences || {}),
+        day_start_time: draftDayStart,
+        day_end_time: draftDayEnd,
+        day_start: draftDayStart,
+        day_end: draftDayEnd,
+      };
+      if (draftStartLocationKey === "__default__") {
+        delete (nextPreferences as Record<string, unknown>).day_start_location_override;
+      } else if (selectedSavedLocation) {
+        nextPreferences.day_start_location_override = savedLocationToPlanningLocation(selectedSavedLocation);
+      }
+      return {
+        ...prev,
+        preferences: nextPreferences,
+      };
+    });
+    setIsEditingPlanSettings(false);
+  };
+
+  const timelineActivities = previewSchedule ? [...(previewSchedule.schedule_blocks || previewSchedule.activities || [])] : [];
 
   return (
     <div className="min-h-screen bg-gradient-to-b from-background to-secondary/10">
@@ -827,9 +1168,76 @@ export function PlanningInputPage({
           {/* Left: Live Schedule Preview */}
           <div className="lg:col-span-7 flex flex-col bg-card rounded-2xl border border-border shadow-sm overflow-hidden" style={{ height: "550px" }}>
             <div className="p-5 border-b bg-secondary/10 flex justify-between items-center">
-              <div>
+              <div className="min-w-0 flex-1">
                 <h3 className="text-lg font-bold">Live Schedule</h3>
                 <p className="text-xs text-muted-foreground">{previewSchedule?.date || "No activities yet"}</p>
+                <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
+                  <span className="inline-flex items-center gap-1 text-muted-foreground">
+                    <MapPin className="h-3.5 w-3.5" />
+                    From
+                  </span>
+                  <select
+                    value={displayedStartLocationKey}
+                    onChange={(event) => setDraftStartLocationKey(event.target.value)}
+                    disabled={!isEditingPlanSettings}
+                    className={`${planSettingControlClass} max-w-[160px]`}
+                    aria-label="Plan start location for this day"
+                  >
+                    <option value="__default__">
+                      {planningPreferences.default_start_location
+                        ? `Default: ${planningPreferences.default_start_location.label || planningPreferences.default_start_location.display_name || "start"}`
+                        : "No default start"}
+                    </option>
+                    {activeOverrideLocation && !activeOverrideIsSavedOption && (
+                      <option value={activeStartLocationKey}>
+                        This plan: {activeOverrideLocation.label || activeOverrideLocation.display_name || activeOverrideLocation.address || "start"}
+                      </option>
+                    )}
+                    {savedStartLocationOptions.map((location) => (
+                      <option key={locationOptionKey(location)} value={locationOptionKey(location)}>
+                        {location.label || location.display_name || location.address}
+                      </option>
+                    ))}
+                  </select>
+                  <Clock className="h-3.5 w-3.5 text-muted-foreground" />
+                  <select
+                    value={displayedDayStart}
+                    onChange={(event) => setDraftDayStart(event.target.value)}
+                    disabled={!isEditingPlanSettings}
+                    className={planSettingControlClass}
+                    aria-label="Plan start time"
+                  >
+                    {timeOptions.map((time) => (
+                      <option key={`start-${time}`} value={time}>{toDisplayTime(time)}</option>
+                    ))}
+                  </select>
+                  <span className="text-muted-foreground">to</span>
+                  <select
+                    value={displayedDayEnd}
+                    onChange={(event) => setDraftDayEnd(event.target.value)}
+                    disabled={!isEditingPlanSettings}
+                    className={planSettingControlClass}
+                    aria-label="Plan end time"
+                  >
+                    {timeOptions.map((time) => (
+                      <option key={`end-${time}`} value={time}>{toDisplayTime(time)}</option>
+                    ))}
+                  </select>
+                  <Button
+                    type="button"
+                    variant={isEditingPlanSettings ? "default" : "ghost"}
+                    size="sm"
+                    className="h-7 rounded-full px-2 text-xs"
+                    onClick={isEditingPlanSettings ? applyPlanSettingsEdit : beginPlanSettingsEdit}
+                  >
+                    {isEditingPlanSettings ? "Apply" : "Edit"}
+                  </Button>
+                  {isEditingPlanSettings && (
+                    <Button type="button" size="sm" variant="outline" className="h-7 rounded-full px-2 text-xs" onClick={() => setIsEditingPlanSettings(false)}>
+                      Cancel
+                    </Button>
+                  )}
+                </div>
               </div>
               <Button
                 variant="outline"
@@ -844,7 +1252,7 @@ export function PlanningInputPage({
             <div className="flex-1 overflow-y-auto p-6 bg-secondary/5">
               {previewSchedule && (previewSchedule.schedule_blocks?.length || previewSchedule.activities.length > 0) ? (
                 <TimelineGrid
-                  activities={previewSchedule.schedule_blocks || previewSchedule.activities}
+                  activities={timelineActivities}
                   interactive={true}
                   onActivityClick={handleEventClick}
                   showEditIcon={true}
@@ -933,10 +1341,90 @@ export function PlanningInputPage({
                         </div>
                       </div>
                     ))}
+                    {pendingRepairSuggestions.length > 0 && (
+                      <div className="rounded-2xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-950">
+                        <div className="flex items-start gap-2">
+                          <Clock size={16} className="mt-0.5 shrink-0" />
+                          <div className="min-w-0 flex-1">
+                            <p className="font-medium">Accurate travel repair suggestion</p>
+                            {pendingRepairSuggestions.map((suggestion) => (
+                              <p key={suggestion.id || suggestion.title} className="mt-1 text-xs text-amber-800">
+                                Move {suggestion.title || "activity"} from {suggestion.from || "its current time"} to {suggestion.to || "a safer time"}.
+                                {suggestion.reason ? ` ${suggestion.reason}.` : ""}
+                              </p>
+                            ))}
+                          </div>
+                        </div>
+                        <div className="mt-3 flex gap-2">
+                          <Button
+                            size="sm"
+                            className="rounded-xl"
+                            disabled={isProcessing}
+                            onClick={() => sendRepairConfirmation("yes")}
+                          >
+                            Apply change
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="rounded-xl bg-white"
+                            disabled={isProcessing}
+                            onClick={() => sendRepairConfirmation("no")}
+                          >
+                            Keep current plan
+                          </Button>
+                        </div>
+                      </div>
+                    )}
+                    {previewSchedule && (startRouteSummaryText || routeRepairActions.length > 0 || routeUnfitActivities.length > 0 || previewSchedule.travel_validation_status === "route_conflict") && (
+                      <div className={`rounded-2xl border p-3 text-sm ${
+                        previewSchedule.travel_validation_status === "route_conflict"
+                          ? "border-red-200 bg-red-50 text-red-950"
+                          : previewSchedule.travel_validation_status === "partial_feasible_with_unfit"
+                            ? "border-amber-200 bg-amber-50 text-amber-950"
+                            : "border-emerald-200 bg-emerald-50 text-emerald-950"
+                      }`}>
+                        <div className="flex items-start gap-2">
+                          <Clock size={16} className="mt-0.5 shrink-0" />
+                          <div className="min-w-0 flex-1">
+                            <p className="font-medium">
+                              {previewSchedule.travel_validation_status === "repaired_validated"
+                                ? "Adjusted for accurate travel"
+                                : previewSchedule.travel_validation_status === "partial_feasible_with_unfit"
+                                  ? "Some items could not fit"
+                                  : previewSchedule.travel_validation_status === "route_conflict"
+                                    ? "Route timing needs attention"
+                                    : "Accurate travel start route"}
+                            </p>
+                            {startRouteSummaryText && (
+                              <p className="mt-1 text-xs opacity-90">
+                                {startRouteSummaryText}
+                              </p>
+                            )}
+                            {routeRepairActions.map((action, index) => (
+                              <p key={`${action.title || "repair"}-${index}`} className="mt-1 text-xs opacity-90">
+                                {String(action.title || "Activity")} moved from {String(action.from || "its original time")} to {String(action.to || "a route-safe time")}.
+                                {action.reason ? ` ${String(action.reason)}.` : ""}
+                              </p>
+                            ))}
+                            {routeUnfitActivities.map((item, index) => (
+                              <p key={`${item.title || "unfit"}-${index}`} className="mt-1 text-xs opacity-90">
+                                {String(item.title || "One flexible activity")} could not fit after accurate travel time.
+                              </p>
+                            ))}
+                            {previewSchedule.travel_validation_status === "route_conflict" && routeRepairActions.length === 0 && routeUnfitActivities.length === 0 && (
+                              <p className="mt-1 text-xs opacity-90">
+                                Accurate travel time still creates an unresolved route conflict.
+                              </p>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    )}
                     {pendingLocationRequests.length > 0 && (
                       <div className="space-y-3">
                         {pendingLocationRequests.map((request) => {
-                          const savedMatches = request.saved_matches || [];
+                          const primaryReuseOption = reusableLocationOptions(request)[0];
                           return (
                             <div key={request.activity_id} className="rounded-2xl border border-yellow-200 bg-yellow-50 p-3 text-sm text-yellow-950">
                               <div className="flex items-start gap-2">
@@ -944,47 +1432,38 @@ export function PlanningInputPage({
                                 <div className="min-w-0 flex-1">
                                   <p className="font-medium">{formatLocationCardTitle(request)}</p>
                                   <p className="text-xs text-yellow-800">{formatLocationCardHint(request)}</p>
-                                  {request.affected_transitions?.length ? (
-                                    <p className="mt-1 text-xs text-yellow-800">
-                                      Affects: {request.affected_transitions.map(t => `${t.from_activity || "Previous"} → ${t.to_activity || "Next"}`).join(", ")}
-                                    </p>
-                                  ) : null}
                                 </div>
                               </div>
 
-                              {savedMatches.length > 0 && (
-                                <div className="mt-3 space-y-1">
-                                  <p className="text-xs font-medium">Saved places</p>
-                                  {savedMatches.map((candidate, index) => (
-                                    <Button
-                                      key={`${candidate.display_name}-${index}`}
-                                      variant="outline"
-                                      size="sm"
-                                      className="mr-2 mt-1 rounded-xl bg-white"
-                                      disabled={resolvingLocationId === request.activity_id}
-                                      onClick={() => handleConfirmLocation(request, candidate)}
-                                    >
-                                      {candidate.label || candidate.display_name || candidate.address || "Saved location"}
-                                    </Button>
-                                  ))}
-                                </div>
-                              )}
-
-                              <div className="mt-3 flex gap-2">
-                                <Input
-                                  value={locationInputs[request.activity_id] ?? request.current_guess ?? ""}
-                                  onChange={(event) => setLocationInputs(prev => ({ ...prev, [request.activity_id]: event.target.value }))}
-                                  placeholder="Search address or place name"
-                                  className="h-9 rounded-xl bg-white"
-                                />
+                              <div className="mt-3 flex flex-wrap gap-2">
+                                {primaryReuseOption && (
+                                  <Button
+                                    variant="outline"
+                                    size="sm"
+                                    className="rounded-xl bg-white"
+                                    disabled={resolvingLocationId === request.activity_id}
+                                    onClick={() => {
+                                      const applied = [
+                                        request.title,
+                                        ...(request.related_titles || []),
+                                      ].filter(Boolean);
+                                      console.debug("[JPLAN][LOCATION_REUSE]", { source: primaryReuseOption.source, applied_to: applied });
+                                      handleConfirmLocation(request, {
+                                        ...primaryReuseOption.candidate,
+                                        source: primaryReuseOption.source,
+                                      });
+                                    }}
+                                  >
+                                    {primaryReuseOption.label}
+                                  </Button>
+                                )}
                                 <Button
                                   size="sm"
-                                  variant="outline"
-                                  className="rounded-xl bg-white"
+                                  className="rounded-xl"
                                   disabled={resolvingLocationId === request.activity_id}
-                                  onClick={() => handleSearchLocation(request)}
+                                  onClick={() => openLocationMapPicker(request)}
                                 >
-                                  Search / pick on map
+                                  {request.request_type === "start_location" ? "Choose starting point" : "Choose exact location"}
                                 </Button>
                               </div>
                             </div>
@@ -1219,12 +1698,13 @@ export function PlanningInputPage({
             {/* Save Button */}
             <Button
               onClick={() => {
+                const baseSchedule = withPlanningPreferences(previewSchedule || { date: isoDateStr, activities: [] });
                 const finalSchedule = {
-                  ...(previewSchedule || { date: isoDateStr, activities: [] }),
+                  ...baseSchedule,
                   allow_clash: allowClash,
                   accurate_travel_time: accurateTravelTime,
                   preferences: {
-                    ...((previewSchedule || {}) as DailySchedule).preferences,
+                    ...(baseSchedule.preferences || {}),
                     allow_clash: allowClash,
                     accurate_travel_time: accurateTravelTime,
                   },
@@ -1261,6 +1741,10 @@ export function PlanningInputPage({
           onDelete={handleDeleteEvent}
           allActivities={previewSchedule?.activities || []}
           savedLocations={savedLocationsForPicker}
+          recentLocations={recentLocations}
+          onLocationConfirmed={(candidate) => {
+            rememberRecentLocation(candidateToPlanningLocation(candidate, editingEvent.location_category || "event_location"));
+          }}
         />
       )}
 
@@ -1311,7 +1795,7 @@ export function PlanningInputPage({
               <button
                 onClick={() => {
                   if (previewSchedule) {
-                    onScheduleGenerated(previewSchedule);
+                    onScheduleGenerated(withPlanningPreferences(previewSchedule));
                     setShowExitConfirmation(false);
                   }
                 }}
@@ -1334,6 +1818,7 @@ export function PlanningInputPage({
         initialPin={manualLocationPoint}
         candidates={manualLocationCandidate ? [manualLocationCandidate] : []}
         savedLocations={savedLocationsForPicker}
+        recentLocations={recentLocations}
         initialSearchQuery={activityLocation || activityName || ""}
         searchCategory="manual_event"
         confirmLabel="Use this point"
@@ -1348,12 +1833,13 @@ export function PlanningInputPage({
             setMapPickerCandidate(null);
           }
         }}
-        title={mapPickerRequest ? `Pick location for ${mapPickerRequest.title}` : "Pick location on map"}
-        description={mapPickerRequest ? `Search nearby or click the exact place for ${mapPickerRequest.title}. This point stays attached to the current draft event.` : undefined}
-        label={mapPickerRequest?.title || "this event"}
+        title={mapPickerRequest?.request_type === "start_location" ? "Pick starting point" : (mapPickerRequest ? `Pick location for ${mapPickerRequest.title}` : "Pick location on map")}
+        description={mapPickerRequest?.request_type === "start_location" ? "Search, choose a recent place, or click where this plan starts today." : (mapPickerRequest ? `Search nearby or click the exact place for ${mapPickerRequest.title}. This point stays attached to the current draft event.` : undefined)}
+        label={mapPickerRequest?.request_type === "start_location" ? "starting point" : (mapPickerRequest?.title || "this event")}
         initialCenter={mapDialogInitialCenter}
         candidates={mapDialogCandidates}
         savedLocations={mapDialogSavedLocations}
+        recentLocations={recentLocations}
         initialSearchQuery={
           mapPickerRequest
             ? (locationInputs[mapPickerRequest.activity_id] || mapPickerRequest.current_guess || mapPickerRequest.title)
@@ -1438,129 +1924,6 @@ function removeDeletedActivityBlock(
   return existingBlocks.filter((block) => block.id !== deletedId);
 }
 
-function parseTime(timeStr: string): number {
-  // Handle both 24-hour and 12-hour formats
-  if (timeStr.includes('AM') || timeStr.includes('PM')) {
-    const [time, period] = timeStr.split(" ");
-    const [hours, minutes] = time.split(":").map(Number);
-    let hour24 = hours;
-    if (period === "PM" && hours !== 12) hour24 += 12;
-    if (period === "AM" && hours === 12) hour24 = 0;
-    return hour24 + (minutes || 0) / 60;
-  } else {
-    const [hours, minutes] = timeStr.split(":").map(Number);
-    return hours + (minutes || 0) / 60;
-  }
-}
-
-// Helper function to generate mock schedule
-function generateMockSchedule(input: string, additionalContext: string = ""): DailySchedule {
-  const today = new Date();
-  const dateStr = today.toLocaleDateString("en-US", {
-    weekday: "long",
-    day: "numeric",
-    month: "long",
-    year: "numeric",
-  });
-
-  const fullInput = input + " " + additionalContext;
-
-  // Parse input to create activities (simplified mock logic)
-  const activities: any[] = [];
-  let currentTime = 9; // Start at 9 AM
-
-  if (fullInput.toLowerCase().includes("gym")) {
-    activities.push({
-      id: "1",
-      type: "activity",
-      title: "Gym Session",
-      startTime: formatTime(currentTime),
-      endTime: formatTime(currentTime + 1),
-      location: "Local Gym",
-      duration: "1 hour",
-    });
-    currentTime += 1;
-
-    // Add travel buffer
-    activities.push({
-      id: "2",
-      type: "travel",
-      title: "Travel time",
-      startTime: formatTime(currentTime),
-      endTime: formatTime(currentTime + 0.5),
-      duration: "30 min",
-    });
-    currentTime += 0.5;
-  }
-
-  if (fullInput.toLowerCase().includes("meeting")) {
-    activities.push({
-      id: "3",
-      type: "activity",
-      title: "Team Meeting",
-      startTime: formatTime(14),
-      endTime: formatTime(15),
-      location: "Conference Room B",
-      duration: "1 hour",
-    });
-
-    activities.push({
-      id: "4",
-      type: "travel",
-      title: "Travel time",
-      startTime: formatTime(15),
-      endTime: formatTime(15.25),
-      duration: "15 min",
-    });
-    currentTime = 15.25;
-  }
-
-  if (fullInput.toLowerCase().includes("groceries") || fullInput.toLowerCase().includes("shopping")) {
-    activities.push({
-      id: "5",
-      type: "activity",
-      title: "Grocery Shopping",
-      startTime: formatTime(currentTime),
-      endTime: formatTime(currentTime + 0.75),
-      location: "SuperMart Downtown",
-      duration: "45 min",
-    });
-    currentTime += 0.75;
-  }
-
-  if (fullInput.toLowerCase().includes("lunch")) {
-    const lunchTime = 12.5;
-    activities.push({
-      id: "7",
-      type: "activity",
-      title: "Lunch with Sarah",
-      startTime: formatTime(lunchTime),
-      endTime: formatTime(lunchTime + 1),
-      location: "Cafe Centro",
-      duration: "1 hour",
-    });
-  }
-
-  // Sort by start time
-  activities.sort((a, b) => {
-    const timeA = parseTime(a.startTime);
-    const timeB = parseTime(b.startTime);
-    return timeA - timeB;
-  });
-
-  return {
-    date: dateStr,
-    activities,
-  };
-}
-
-function formatTime(hour: number): string {
-  const h = Math.floor(hour);
-  const m = Math.round((hour - h) * 60);
-  const period = h >= 12 ? "PM" : "AM";
-  const displayHour = h > 12 ? h - 12 : h === 0 ? 12 : h;
-  return `${displayHour}:${m.toString().padStart(2, "0")} ${period}`;
-}
 
 function formatTo12Hour(timeStr: string): string {
   if (!timeStr) return "";

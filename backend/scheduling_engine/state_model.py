@@ -27,6 +27,41 @@ class StateModelMixin:
         item_type = str(item.get("type") or "").strip().lower()
         return item_type not in {"buffer", "travel", "transition", "idle"}
 
+    def _infer_repair_protection(
+        self,
+        raw: Dict[str, Any],
+        title: str,
+        timing_mode: Optional[str],
+        fixed_start: Optional[int],
+        is_user_fixed: bool,
+        is_mandatory: bool,
+    ) -> str:
+        explicit = clean_title(raw.get("repair_protection") or raw.get("repairProtection") or "")
+        if explicit in {"fixed", "protected_social", "flexible", "optional"}:
+            return explicit
+        if is_user_fixed or timing_mode == TimingMode.FIXED or fixed_start is not None:
+            return "fixed"
+        activity_type = clean_title(raw.get("activity_type") or "")
+        if activity_type == "optional" or not is_mandatory:
+            return "optional"
+        title_clean = clean_title(title)
+        social_markers = {
+            "parent", "parents", "family", "friend", "friends", "girl", "girlfriend",
+            "boyfriend", "client", "colleague", "team", "someone",
+        }
+        social_actions = {
+            "dinner", "lunch", "brunch", "coffee", "catchup", "catch up",
+            "meet", "meeting", "hangout", "hang out",
+        }
+        words = set(title_clean.split())
+        has_social_person = bool(words & social_markers)
+        has_social_action = any(action in title_clean for action in social_actions)
+        if has_social_action and has_social_person:
+            return "protected_social"
+        if "client catch" in title_clean or "coffee catch" in title_clean:
+            return "protected_social"
+        return "flexible"
+
     def _coerce_minutes(self, *values: Any) -> Optional[int]:
         for value in values:
             if value is None or value == "":
@@ -206,18 +241,28 @@ class StateModelMixin:
             or raw.get("durationMinutes")
             or raw.get("duration")
         )
-        fixed_start = self._coerce_minutes(
-            raw.get("fixed_start"),
-            raw.get("fixedStart"),
-            raw.get("scheduled_start"),
-            raw.get("startTime"),
+        raw_timing_mode = clean_title(raw.get("timing_mode") or raw.get("timingMode") or "")
+        raw_has_fixed_fields = any(
+            raw.get(key) is not None
+            for key in ("fixed_start", "fixedStart", "fixed_end", "fixedEnd")
         )
-        fixed_end = self._coerce_minutes(
-            raw.get("fixed_end"),
-            raw.get("fixedEnd"),
-            raw.get("scheduled_end"),
-            raw.get("endTime"),
+        user_fixed_start = self._coerce_minutes(
+            raw.get("user_fixed_start"),
+            raw.get("userFixedStart"),
+            raw.get("requested_fixed_start"),
         )
+        raw_is_user_fixed = raw.get("is_user_fixed")
+        is_user_fixed = (
+            bool(raw_is_user_fixed)
+            if raw_is_user_fixed is not None
+            else bool(raw_has_fixed_fields or user_fixed_start is not None or raw_timing_mode == TimingMode.FIXED)
+        )
+        fixed_start = self._coerce_minutes(raw.get("fixed_start"), raw.get("fixedStart"), user_fixed_start)
+        fixed_end = self._coerce_minutes(raw.get("fixed_end"), raw.get("fixedEnd"))
+        if is_user_fixed and fixed_start is None:
+            fixed_start = self._coerce_minutes(raw.get("scheduled_start"), raw.get("startTime"))
+        if is_user_fixed and fixed_end is None:
+            fixed_end = self._coerce_minutes(raw.get("scheduled_end"), raw.get("endTime"))
         if fixed_start is not None and fixed_end is None:
             fixed_end = fixed_start + duration_minutes
         if fixed_end is not None and fixed_start is None:
@@ -264,6 +309,24 @@ class StateModelMixin:
             scheduled_end = fixed_end
         if scheduled_start is not None and scheduled_end is None:
             scheduled_end = scheduled_start + duration_minutes
+        original_timing_mode = (
+            clean_title(raw.get("original_timing_mode") or raw.get("originalTimingMode") or "")
+            or raw_timing_mode
+            or timing_mode
+            or TimingMode.UNSPECIFIED
+        )
+        raw_system_scheduled = raw.get("is_system_scheduled")
+        is_system_scheduled = (
+            bool(raw_system_scheduled)
+            if raw_system_scheduled is not None
+            else bool(scheduled_start is not None and scheduled_end is not None and not is_user_fixed)
+        )
+        raw_can_move = raw.get("can_move_for_repair")
+        can_move_for_repair = (
+            bool(raw_can_move)
+            if raw_can_move is not None
+            else not bool(is_user_fixed or timing_mode == TimingMode.FIXED or fixed_start is not None)
+        )
 
         location = clean_optional_text(raw.get("location"))
         location_normalized = raw.get("location_normalized") or _normalize_location(location)
@@ -299,6 +362,23 @@ class StateModelMixin:
             if raw.get("is_mandatory") is not None
             else raw.get("isMandatory", True)
         )
+        repair_protection = self._infer_repair_protection(
+            raw,
+            title,
+            timing_mode,
+            fixed_start,
+            bool(is_user_fixed),
+            is_mandatory,
+        )
+        if repair_protection == "fixed":
+            can_move_for_repair = False
+
+        preferred_time_window = raw.get("preferred_time_window") or raw.get("preferredTimeWindow")
+        title_clean_for_window = clean_title(title)
+        if not preferred_time_window and "dinner" in title_clean_for_window:
+            preferred_time_window = "evening"
+            preferred_window_start = preferred_window_start if preferred_window_start is not None else 1080
+            preferred_window_end = preferred_window_end if preferred_window_end is not None else 1260
 
         trace = list(raw.get("trace") or [])
         if raw.get("notes") and raw.get("notes") not in trace:
@@ -316,12 +396,18 @@ class StateModelMixin:
             "normalized_title": normalized_title,
             "aliases": list(raw.get("aliases") or self._generate_aliases(title)),
             "timing_mode": timing_mode,
+            "original_timing_mode": original_timing_mode,
+            "is_user_fixed": bool(is_user_fixed),
+            "is_system_scheduled": bool(is_system_scheduled),
+            "user_fixed_start": user_fixed_start if user_fixed_start is not None else (fixed_start if is_user_fixed else None),
+            "can_move_for_repair": bool(can_move_for_repair),
+            "repair_protection": repair_protection,
             "fixed_start": fixed_start,
             "fixed_end": fixed_end,
             "earliest_start": earliest_start,
             "latest_end": latest_end,
             "preferred_start": preferred_start,
-            "preferred_time_window": raw.get("preferred_time_window") or raw.get("preferredTimeWindow"),
+            "preferred_time_window": preferred_time_window,
             "preferred_window_start": preferred_window_start,
             "preferred_window_end": preferred_window_end,
             "preferred_order": deepcopy(raw.get("preferred_order")) if isinstance(raw.get("preferred_order"), dict) else None,

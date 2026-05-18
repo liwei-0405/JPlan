@@ -30,6 +30,7 @@ type LocationPickerDialogProps = {
   initialPin?: MapPoint | null;
   candidates?: GeocodeCandidate[];
   savedLocations?: Array<Partial<SavedLocation>>;
+  recentLocations?: Array<Partial<SavedLocation>>;
   initialSearchQuery?: string;
   searchCategory?: string;
   confirmLabel?: string;
@@ -137,6 +138,7 @@ export function LocationPickerDialog({
   initialPin,
   candidates,
   savedLocations,
+  recentLocations,
   initialSearchQuery = "",
   searchCategory,
   confirmLabel = "Save this map point",
@@ -145,9 +147,14 @@ export function LocationPickerDialog({
 }: LocationPickerDialogProps) {
   const safeCandidates = candidates || EMPTY_CANDIDATES;
   const safeSavedLocations = savedLocations || EMPTY_SAVED_LOCATIONS;
+  const safeRecentLocations = recentLocations || EMPTY_SAVED_LOCATIONS;
   const savedCandidates = useMemo(
     () => safeSavedLocations.map(savedLocationToCandidate).filter(Boolean) as GeocodeCandidate[],
     [safeSavedLocations],
+  );
+  const recentCandidates = useMemo(
+    () => safeRecentLocations.map(savedLocationToCandidate).filter(Boolean) as GeocodeCandidate[],
+    [safeRecentLocations],
   );
   const [center, setCenter] = useState<MapPoint>(getDefaultMapCenter());
   const [pin, setPin] = useState<MapPoint | null>(null);
@@ -158,12 +165,14 @@ export function LocationPickerDialog({
   const [notice, setNotice] = useState<string | null>(null);
   const [isSearching, setIsSearching] = useState(false);
   const [showSavedLocations, setShowSavedLocations] = useState(false);
+  const [showRecentLocations, setShowRecentLocations] = useState(false);
 
   useEffect(() => {
     if (!open) return;
     const candidatePoint = firstCandidatePoint(safeCandidates);
     const savedPoint = firstCandidatePoint(savedCandidates);
-    const nextCenter = initialPin || initialCenter || candidatePoint || savedPoint || getDefaultMapCenter();
+    const recentPoint = firstCandidatePoint(recentCandidates);
+    const nextCenter = initialPin || initialCenter || candidatePoint || savedPoint || recentPoint || getDefaultMapCenter();
     const initialCandidate = safeCandidates.find(candidateToMapPoint) || null;
 
     setCenter(nextCenter);
@@ -174,7 +183,8 @@ export function LocationPickerDialog({
     setSearchQuery(initialSearchQuery);
     setNotice(null);
     setShowSavedLocations(false);
-  }, [safeCandidates, initialCenter, initialPin, initialSearchQuery, open, savedCandidates]);
+    setShowRecentLocations(false);
+  }, [safeCandidates, initialCenter, initialPin, initialSearchQuery, open, savedCandidates, recentCandidates]);
 
   const handlePickPoint = (point: MapPoint) => {
     setPin(point);
@@ -296,46 +306,6 @@ export function LocationPickerDialog({
           </DialogDescription>
         </DialogHeader>
 
-        <div className="flex flex-col gap-2 sm:flex-row">
-          <Input
-            value={searchQuery}
-            onChange={(event) => setSearchQuery(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter") {
-                event.preventDefault();
-                handleSearch();
-              }
-            }}
-            placeholder="Search a nearby landmark or address"
-            className="rounded-xl"
-          />
-          <Button
-            type="button"
-            variant="outline"
-            className="rounded-xl"
-            disabled={!searchQuery.trim() || isSearching}
-            onClick={handleSearch}
-          >
-            {isSearching ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Search className="mr-2 h-4 w-4" />}
-            Search nearby
-          </Button>
-          <Button
-            type="button"
-            variant="outline"
-            className="rounded-xl"
-            onClick={handleUseDeviceLocation}
-          >
-            <Crosshair className="mr-2 h-4 w-4" />
-            Use my current location
-          </Button>
-        </div>
-
-        {notice && (
-          <div className="rounded-xl border border-primary/15 bg-primary/5 px-3 py-2 text-xs text-muted-foreground">
-            {notice}
-          </div>
-        )}
-
         {savedCandidates.length > 0 && (
           <div className="rounded-2xl border border-border bg-secondary/10">
             <button
@@ -368,6 +338,84 @@ export function LocationPickerDialog({
                 ))}
               </div>
             )}
+          </div>
+        )}
+
+        {recentCandidates.length > 0 && (
+          <div className="rounded-2xl border border-border bg-secondary/10">
+            <button
+              type="button"
+              className="flex w-full items-center justify-between gap-2 px-3 py-2 text-left text-xs font-medium"
+              onClick={() => setShowRecentLocations(value => !value)}
+            >
+              <span>Recent locations ({recentCandidates.length})</span>
+              <ChevronDown className={`h-4 w-4 transition-transform ${showRecentLocations ? "rotate-180" : ""}`} />
+            </button>
+            {showRecentLocations && (
+              <div className="max-h-32 space-y-1 overflow-y-auto border-t border-border/70 p-2">
+                {recentCandidates.map((candidate, index) => (
+                  <button
+                    type="button"
+                    key={`${candidate.label || candidate.display_name}-${candidate.latitude}-${candidate.longitude}-${index}`}
+                    className="flex w-full items-start gap-2 rounded-xl px-2 py-1.5 text-left text-xs hover:bg-background"
+                    onClick={() => handleSelectCandidate({ ...candidate, source: candidate.source || "recent" })}
+                  >
+                    <MapPin className="mt-0.5 h-3.5 w-3.5 shrink-0 text-primary" />
+                    <span className="min-w-0">
+                      <span className="block truncate font-medium text-foreground">
+                        {candidate.label || candidate.display_name || "Recent location"}
+                      </span>
+                      <span className="block truncate text-muted-foreground">
+                        {candidate.address || candidate.display_name || "Recently used place"}
+                      </span>
+                    </span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        <div className="rounded-2xl border border-border bg-secondary/10 p-3">
+          <p className="mb-2 text-xs font-medium">Search new location</p>
+          <div className="flex flex-col gap-2 sm:flex-row">
+            <Input
+              value={searchQuery}
+              onChange={(event) => setSearchQuery(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  handleSearch();
+                }
+              }}
+              placeholder="Search a nearby landmark or address"
+              className="rounded-xl bg-background"
+            />
+            <Button
+              type="button"
+              variant="outline"
+              className="rounded-xl bg-background"
+              disabled={!searchQuery.trim() || isSearching}
+              onClick={handleSearch}
+            >
+              {isSearching ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Search className="mr-2 h-4 w-4" />}
+              Search nearby
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              className="rounded-xl bg-background"
+              onClick={handleUseDeviceLocation}
+            >
+              <Crosshair className="mr-2 h-4 w-4" />
+              Use my current location
+            </Button>
+          </div>
+        </div>
+
+        {notice && (
+          <div className="rounded-xl border border-primary/15 bg-primary/5 px-3 py-2 text-xs text-muted-foreground">
+            {notice}
           </div>
         )}
 

@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from jplan_logging import jjson, jlog, jsection
+from jplan_logging import jjson, jjson_verbose, jlog, jlog_verbose, jsection
 from travel_service import MissingORSApiKey, TravelService, TravelServiceError, coordinate_from_saved_location
 from .types_utils import *
 from .types_utils import _normalize_location
@@ -41,10 +41,19 @@ class ModuleAParserMixin:
         history: List[Dict[str, Any]],
         current_schedule: Optional[Dict[str, Any]],
         audio_part: Any,
-        saved_locations: List[Dict[str, Any]] = []
+        saved_locations: List[Dict[str, Any]] = [],
+        disable_deterministic_fallback: bool = False,
+        fallback_reason: Optional[str] = None,
     ) -> Dict[str, Any]:
         jsection("MODULE_A", "LLM parsing", "PARSE")
-        jlog("MODULE_A", f"Request={latest_request!r}", "PARSE")
+        jlog_verbose("MODULE_A", f"Request={latest_request!r}", "PARSE")
+        if fallback_reason:
+            active_titles = [
+                str(item.get("title"))
+                for item in (current_schedule or {}).get("activities", [])
+                if isinstance(item, dict) and item.get("title")
+            ]
+            jlog("MODULE_A", f"active_titles={active_titles}", "EDIT_CONTEXT")
         
         prompt = self._build_parser_prompt(latest_request, history, current_schedule, saved_locations)
 
@@ -76,7 +85,7 @@ class ModuleAParserMixin:
                 raw_llm_reply = str(parsed.get("reply") or "").strip() or None
         except json.JSONDecodeError as exc:
             self._debug(f"LLM parse exception | type={type(exc).__name__} | message={str(exc)}")
-            fallback = self._deterministic_fallback_parse(latest_request, current_schedule, history)
+            fallback = None if disable_deterministic_fallback else self._deterministic_fallback_parse(latest_request, current_schedule, history)
             if fallback:
                 self._debug_json("Deterministic fallback parse result", fallback)
                 return fallback
@@ -92,7 +101,7 @@ class ModuleAParserMixin:
             return invalid
         except Exception as exc:
             self._debug(f"LLM call exception | type={type(exc).__name__} | message={str(exc)}")
-            fallback = self._deterministic_fallback_parse(latest_request, current_schedule, history)
+            fallback = None if disable_deterministic_fallback else self._deterministic_fallback_parse(latest_request, current_schedule, history)
             if fallback:
                 self._debug_json("Deterministic fallback parse result", fallback)
                 return fallback
@@ -109,7 +118,7 @@ class ModuleAParserMixin:
             return invalid
 
         if not isinstance(parsed, dict):
-            fallback = self._deterministic_fallback_parse(latest_request, current_schedule, history)
+            fallback = None if disable_deterministic_fallback else self._deterministic_fallback_parse(latest_request, current_schedule, history)
             if fallback:
                 self._debug_json("Deterministic fallback parse result", fallback)
                 return fallback
@@ -136,13 +145,14 @@ class ModuleAParserMixin:
             parsed["_token_usage"] = token_usage
         parsed = self._normalize_plan_level_operations(parsed, latest_request, current_schedule)
         parsed = self._normalize_parsed_locations(parsed, latest_request, saved_locations)
+        parsed = self._normalize_module_a_duplicate_relative_adds(parsed, current_schedule)
         if self._is_schedule_change_intent(parsed) and not parsed.get("operations") and not parsed.get("activities"):
             jlog(
                 "MODULE_A",
                 "Empty operations for edit intent. Attempting deterministic fallback parse.",
                 "SAFETY",
             )
-            fallback = self._deterministic_fallback_parse(latest_request, current_schedule, history)
+            fallback = None if disable_deterministic_fallback else self._deterministic_fallback_parse(latest_request, current_schedule, history)
             if fallback:
                 self._debug_json("Deterministic fallback parse result", fallback)
                 return fallback
@@ -154,11 +164,32 @@ class ModuleAParserMixin:
             f"parser_rejected_request=false operations_count={len(parsed.get('operations') or [])}",
             "SAFETY",
         )
-        self._debug_json("LLM parsed request", parsed)
+        self._log_module_a_summary(parsed)
+        jjson_verbose("MODULE_A", "LLM parsed request", parsed, "PARSE")
         self._debug(
             f"Parsed request | intent={parsed.get('intent')} | parsed_date={parsed.get('date')} | activities={len(parsed.get('activities', []))} | operations={len(parsed.get('operations', []))}"
         )
         return parsed
+
+    def _log_module_a_summary(self, parsed: Dict[str, Any]) -> None:
+        operations = parsed.get("operations") or parsed.get("activities") or []
+        jlog(
+            "MODULE_A",
+            f"intent={parsed.get('intent')} date={parsed.get('date')} operations={len(operations)}",
+            "PARSE_SUMMARY",
+        )
+        if not operations:
+            return
+        lines = []
+        for op in operations:
+            title = op.get("title") or op.get("target_title") or "activity"
+            timing = op.get("fixed_start") or op.get("preferred_time_window") or op.get("timing_mode") or "flexible"
+            duration = op.get("duration_minutes") or op.get("duration") or "?"
+            location = op.get("location_label") or op.get("location") or "no location"
+            status = op.get("location_status") or ""
+            needs = "needs coordinates" if clean_title(status) in {"needs_resolution", "unresolved", "fallback_used"} else status or "ok"
+            lines.append(f"- {title} | {timing} | {duration} min | {location} ({needs})")
+        jlog("SUMMARY", "Module A output:\n" + "\n".join(lines), "MODULE_A_OUTPUT")
 
     def _generate_parser_content_with_retry(self, contents: Any) -> Any:
         total_started = time.perf_counter()
@@ -251,7 +282,7 @@ class ModuleAParserMixin:
             jlog("MODULE_A", "reason=timeout_total_budget_exceeded", "FAIL")
             raise ModuleALLMTotalBudgetExceededError("timeout_total_budget_exceeded")
 
-        jlog("MODULE_A", f"start timeout={int(timeout_seconds * 1000)}ms", "LLM")
+        jlog_verbose("MODULE_A", f"start timeout={int(timeout_seconds * 1000)}ms", "LLM")
         acquired = MODULE_A_LLM_SEMAPHORE.acquire(blocking=False)
         if not acquired:
             raise ModuleALLMExecutorSaturatedError("executor_saturated")
@@ -348,8 +379,17 @@ class ModuleAParserMixin:
             location = item.get("location_label") or item.get("location") or "?"
             timing_mode = item.get("timing_mode") or "?"
             priority = item.get("priority") or "medium"
+            duration = item.get("duration_minutes") or item.get("duration") or "?"
             stable_id = item.get("stable_activity_id") or item.get("id") or "?"
-            lines.append(f"- {stable_id} | {title} | {start}-{end} | {location} | {timing_mode} | {priority}")
+            fixed_status = "user_fixed" if item.get("is_user_fixed") or item.get("fixed_start") is not None else "movable"
+            resolved_location = item.get("resolved_location") if isinstance(item.get("resolved_location"), dict) else {}
+            latitude = resolved_location.get("latitude") or resolved_location.get("lat") or item.get("latitude") or item.get("lat")
+            longitude = resolved_location.get("longitude") or resolved_location.get("lng") or item.get("longitude") or item.get("lng")
+            coordinates = f"{latitude},{longitude}" if latitude is not None and longitude is not None else "no_coordinates"
+            lines.append(
+                f"- activity_id={stable_id} | title={title} | time={start}-{end} | duration={duration} min | "
+                f"priority={priority} | location={location} | coordinates={coordinates} | timing={timing_mode} | {fixed_status}"
+            )
         return "\n".join(lines) if lines else "(none)"
 
     def _build_saved_location_index(self, saved_locations: List[Dict[str, Any]]) -> str:
@@ -569,6 +609,13 @@ class ModuleAParserMixin:
         saved_locations: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[Dict[str, Any]]:
         started = time.perf_counter()
+        self._last_fast_path_fallback_reason = None
+        pre_skip_reason = self._fast_path_natural_edit_skip_reason(latest_request)
+        if pre_skip_reason:
+            self._last_fast_path_fallback_reason = pre_skip_reason
+            jlog("FAST_PATH", f"reason={pre_skip_reason}", "SKIP_TO_MODULE_A")
+            jlog("TIMER", f"module_a_fast_path_seconds={time.perf_counter() - started:.2f}", None)
+            return None
         parsed = self._deterministic_fallback_parse(
             latest_request=latest_request,
             current_schedule=current_schedule,
@@ -577,6 +624,12 @@ class ModuleAParserMixin:
             reply_source="deterministic_fast_path",
             failure_type="deterministic_fast_path",
         )
+        fallback_reason = self._fast_path_relative_safety_fallback_reason(latest_request, parsed, current_schedule)
+        if fallback_reason:
+            self._last_fast_path_fallback_reason = fallback_reason
+            jlog("FAST_PATH", f"reason={fallback_reason}", "SKIP_TO_MODULE_A")
+            jlog("TIMER", f"module_a_fast_path_seconds={time.perf_counter() - started:.2f}", None)
+            return None
         jlog("TIMER", f"module_a_fast_path_seconds={time.perf_counter() - started:.2f}", None)
         if parsed:
             jlog("MODULE_A", "deterministic_fast_path matched simple pattern", "FAST_PATH")
@@ -608,6 +661,63 @@ class ModuleAParserMixin:
         request = clean_title(parsed.get("transcription") or "")
         return bool(re.search(r"\b(move|shift|change|update|add|remove|delete|reschedule)\b", request))
 
+    def _normalize_module_a_duplicate_relative_adds(
+        self,
+        parsed: Dict[str, Any],
+        current_schedule: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        if parsed.get("_reply_source") != "llm":
+            return parsed
+        pool = self._active_resolution_pool(current_schedule)
+        if not pool:
+            return parsed
+
+        normalized = deepcopy(parsed)
+        request_text = clean_title(normalized.get("transcription") or "")
+        if re.search(r"\b(?:another|new|second|additional)\b", request_text):
+            return normalized
+
+        for operation in normalized.get("operations") or []:
+            if clean_title(operation.get("op") or "add") != "add":
+                continue
+            has_relation_intent = bool(operation.get("anchor_relation")) or clean_title(operation.get("timing_mode") or "") == TimingMode.RELATIVE
+            if not has_relation_intent:
+                continue
+            title = operation.get("title") or operation.get("target_title")
+            resolution = self._resolve_activity_reference(title, pool)
+            if resolution.get("status") != "resolved" or resolution.get("target_resolution_confidence") != "high":
+                continue
+
+            target = resolution.get("activity") or {}
+            target_id = target.get("stable_activity_id") or target.get("id")
+            operation["op"] = "update"
+            operation["title"] = target.get("title") or title
+            operation["target_title"] = target.get("title") or title
+            operation["target_id"] = target_id
+            operation["activity_id"] = target_id
+            operation["preserve_existing_fields"] = True
+            operation["_preserve_resolved_title"] = True
+            operation["_duplicate_safety_converted_add_to_update"] = True
+            if operation.get("raw_llm_location") is None and not operation.get("explicit_user_location"):
+                for field in (
+                    "location",
+                    "location_label",
+                    "location_category",
+                    "location_status",
+                    "location_source",
+                    "location_confidence",
+                    "location_normalized",
+                    "location_warning",
+                    "travel_required",
+                ):
+                    operation.pop(field, None)
+            jlog(
+                "MODULE_A",
+                f"converted add->update title={operation.get('title')} reason=existing_relative_target",
+                "DUPLICATE_SAFETY",
+            )
+        return normalized
+
     def _active_resolution_pool(self, current_schedule: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
         activities = [
             item for item in (current_schedule or {}).get("activities", [])
@@ -636,6 +746,87 @@ class ModuleAParserMixin:
         if resolution.get("status") == "resolved" and resolution.get("target_resolution_confidence") == "high":
             return resolution["activity"].get("title") or title, True
         return title, False
+
+    def _fast_path_has_rationale_clause(self, text: str) -> bool:
+        return bool(re.search(
+            r"\b(?:because|cause|cuz|since|so\s+that|so\s+i\s+(?:do\s+not|don'?t|dont)|to\s+avoid)\b",
+            text or "",
+            flags=re.IGNORECASE,
+        ))
+
+    def _fast_path_has_wrapper_title(self, text: str) -> bool:
+        return bool(re.match(
+            r"^(?:i want|i need|i would like|can you|please)\b",
+            clean_title(text or ""),
+        ))
+
+    def _fast_path_natural_edit_skip_reason(self, latest_request: str) -> Optional[str]:
+        text = latest_request or ""
+        clean = clean_title(text)
+        if not clean:
+            return None
+
+        has_relation = bool(re.search(r"\b(?:after|before|right\s+after|right\s+before|earlier|later)\b", clean))
+        has_activity = bool(re.search(r"\b(?:lunch|dinner|breakfast|coffee|meeting|seminar|class|gym|workout|shopping|grocery|groceries|fyp|study|project)\b", clean))
+        if not (has_relation and has_activity):
+            return None
+
+        explicit_clean_command = bool(re.match(
+            r"^(?:(?:arrange|rearrange|put|place|make|set)\b|(?:add|schedule)\b|(?:move|shift|change|update)\b|(?:remove|delete|cancel)\b)",
+            clean,
+        ))
+        if self._fast_path_has_rationale_clause(text):
+            return "natural_edit_wording"
+        if re.match(
+            r"^(?:how\s+about|what\s+about|maybe|what\s+if|i\s+was\s+thinking|i\s+think\s+maybe|"
+            r"would\s+it\s+be\s+better|would\s+it\s+help|i\s+want|i\s+need|i\s+would\s+like|can\s+we|could\s+we)\b",
+            clean,
+        ):
+            return "natural_edit_wording"
+        if len(clean.split()) > 14 and not explicit_clean_command:
+            return "natural_edit_wording"
+        return None
+
+    def _fast_path_relative_safety_fallback_reason(
+        self,
+        latest_request: str,
+        parsed: Optional[Dict[str, Any]],
+        current_schedule: Optional[Dict[str, Any]],
+    ) -> Optional[str]:
+        if not parsed:
+            return None
+        relative_ops = [
+            operation for operation in (parsed.get("operations") or [])
+            if isinstance(operation, dict) and operation.get("anchor_relation")
+        ]
+        if not relative_ops:
+            return None
+
+        if self._fast_path_has_rationale_clause(latest_request):
+            return "natural_edit_wording"
+
+        pool = self._active_resolution_pool(current_schedule)
+        for operation in relative_ops:
+            title = str(operation.get("title") or operation.get("target_title") or "")
+            anchor = operation.get("anchor_relation") or {}
+            anchor_title = str(anchor.get("target_title") or "")
+            if self._fast_path_has_wrapper_title(title) or self._fast_path_has_rationale_clause(anchor_title):
+                return "unclean_target_or_anchor"
+
+            if clean_title(operation.get("op") or "") in {"update", "move"} and pool:
+                target_resolution = self._resolve_activity_reference(title, pool)
+                anchor_resolution = self._resolve_activity_reference(anchor_title, pool)
+                target_clean = (
+                    target_resolution.get("status") == "resolved"
+                    and target_resolution.get("target_resolution_confidence") == "high"
+                )
+                anchor_clean = (
+                    anchor_resolution.get("status") == "resolved"
+                    and anchor_resolution.get("target_resolution_confidence") == "high"
+                )
+                if not (target_clean and anchor_clean):
+                    return "unclean_target_or_anchor"
+        return None
 
     def _extract_fast_path_duration(self, value: str) -> Tuple[Optional[int], Optional[str]]:
         text = value or ""

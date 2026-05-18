@@ -1,34 +1,75 @@
 import { useState, useEffect } from "react";
 import { Button } from "./ui/button";
 import { Label } from "./ui/label";
-import { AlertCircle, ArrowLeft, Bell, Calendar, Check, Loader2, MapPin, Search, Trash2 } from "lucide-react";
+import { AlertCircle, ArrowLeft, Bell, Calendar, Check, Home, Info, Loader2, MapPin, Search, Trash2 } from "lucide-react";
 import { Switch } from "./ui/switch";
+import { Checkbox } from "./ui/checkbox";
+import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
 import { useAuth } from "../context/AuthContext";
 import { LocationPickerDialog } from "./LocationPickerDialog";
 import {
   deleteSavedLocation,
+  getPlanningPreferences,
+  getRecentLocations,
   geocodeLocation,
   getSavedLocations,
+  addRecentLocationRemote,
   resolveLocation,
+  savePlanningPreferencesRemote,
   type GeocodeCandidate,
   type SavedLocation,
 } from "../services/planService";
+import {
+  addRecentLocation,
+  candidateToPlanningLocation,
+  loadPlanningPreferences,
+  normalizePlanningPreferences,
+  savePlanningPreferences,
+  saveRecentLocations,
+  savedLocationToPlanningLocation,
+  toCanonicalTime,
+  toDisplayTime,
+  type PlanningLocation,
+} from "../utils/planningPreferences";
 
 type PreferencesPageProps = {
   onBack: () => void;
 };
 
+function preferenceSnapshot(
+  dayStart: string,
+  dayEnd: string,
+  useDayBoundaries: boolean,
+  defaultStartLocation: PlanningLocation | null,
+) {
+  return JSON.stringify({
+    day_start_time: toCanonicalTime(dayStart) || "08:00",
+    day_end_time: toCanonicalTime(dayEnd) || "22:00",
+    use_day_boundary_preferences: useDayBoundaries,
+    default_start_location: defaultStartLocation
+      ? {
+          label: defaultStartLocation.label,
+          display_name: defaultStartLocation.display_name,
+          address: defaultStartLocation.address,
+          latitude: defaultStartLocation.latitude,
+          longitude: defaultStartLocation.longitude,
+          source: defaultStartLocation.source,
+        }
+      : null,
+  });
+}
+
 export function PreferencesPage({ onBack }: PreferencesPageProps) {
   const { user } = useAuth();
   const [dayStart, setDayStart] = useState("8:00 AM");
   const [dayEnd, setDayEnd] = useState("10:00 PM");
-  const [preferredHomeReturn, setPreferredHomeReturn] = useState("6:00 PM");
-  const [useHomeReturn, setUseHomeReturn] = useState(false);
+  const [useDayBoundaries, setUseDayBoundaries] = useState(true);
   const [allowWeekends, setAllowWeekends] = useState(true);
   const [minimizeTravel, setMinimizeTravel] = useState(true);
   const [notificationsEnabled, setNotificationsEnabled] = useState(true);
   const [reminderBefore, setReminderBefore] = useState(true);
   const [calendarConnected, setCalendarConnected] = useState(true);
+  const [defaultStartLocation, setDefaultStartLocation] = useState<PlanningLocation | null>(null);
 
   // --- Location Management State ---
   const [savedLocations, setSavedLocations] = useState<SavedLocation[]>([]);
@@ -41,10 +82,48 @@ export function PreferencesPage({ onBack }: PreferencesPageProps) {
   const [savingCandidateKey, setSavingCandidateKey] = useState<string | null>(null);
   const [isMapPickerOpen, setIsMapPickerOpen] = useState(false);
   const [isSavingMapPin, setIsSavingMapPin] = useState(false);
+  const [isChoosingDefaultStart, setIsChoosingDefaultStart] = useState(false);
+  const [pendingDefaultStartLocation, setPendingDefaultStartLocation] = useState<PlanningLocation | null>(null);
+  const [originalPreferencesJson, setOriginalPreferencesJson] = useState("");
+  const [showExitConfirmation, setShowExitConfirmation] = useState(false);
+  const [isSavingPreferences, setIsSavingPreferences] = useState(false);
 
   useEffect(() => {
     if (user) {
+      const prefs = loadPlanningPreferences(user.id);
+      setDayStart(toDisplayTime(prefs.day_start_time) || "8:00 AM");
+      setDayEnd(toDisplayTime(prefs.day_end_time) || "10:00 PM");
+      setUseDayBoundaries(prefs.use_day_boundary_preferences ?? true);
+      setDefaultStartLocation(prefs.default_start_location || null);
+      setOriginalPreferencesJson(preferenceSnapshot(
+        toDisplayTime(prefs.day_start_time) || "8:00 AM",
+        toDisplayTime(prefs.day_end_time) || "10:00 PM",
+        prefs.use_day_boundary_preferences ?? true,
+        prefs.default_start_location || null,
+      ));
       fetchLocations();
+      getPlanningPreferences(user.id)
+        .then((remotePrefs) => {
+          if (!remotePrefs) return;
+          const normalized = normalizePlanningPreferences(remotePrefs);
+          savePlanningPreferences(user.id, normalized);
+          setDayStart(toDisplayTime(normalized.day_start_time) || "8:00 AM");
+          setDayEnd(toDisplayTime(normalized.day_end_time) || "10:00 PM");
+          setUseDayBoundaries(normalized.use_day_boundary_preferences ?? true);
+          setDefaultStartLocation(normalized.default_start_location || null);
+          setOriginalPreferencesJson(preferenceSnapshot(
+            toDisplayTime(normalized.day_start_time) || "8:00 AM",
+            toDisplayTime(normalized.day_end_time) || "10:00 PM",
+            normalized.use_day_boundary_preferences ?? true,
+            normalized.default_start_location || null,
+          ));
+        })
+        .catch((error) => console.error("Failed to fetch planning preferences:", error));
+      getRecentLocations(user.id)
+        .then((locations) => {
+          if (locations.length) saveRecentLocations(user.id, locations);
+        })
+        .catch((error) => console.error("Failed to fetch recent locations:", error));
     }
   }, [user]);
 
@@ -104,6 +183,9 @@ export function PreferencesPage({ onBack }: PreferencesPageProps) {
         source: candidate.source || "ors_geocoded",
         confirmed_by_user: true,
       });
+      const recent = candidateToPlanningLocation(candidate, "saved_location");
+      addRecentLocation(user.id, recent);
+      addRecentLocationRemote(user.id, recent).catch((error) => console.error("Failed to save recent location:", error));
       setNewLocLabel("");
       setNewLocAddress("");
       setLocationCandidates([]);
@@ -140,6 +222,9 @@ export function PreferencesPage({ onBack }: PreferencesPageProps) {
         source: candidate.source || "manual_map_pin",
         confirmed_by_user: true,
       });
+      const recent = candidateToPlanningLocation(candidate, "saved_location");
+      addRecentLocation(user.id, recent);
+      addRecentLocationRemote(user.id, recent).catch((error) => console.error("Failed to save recent location:", error));
       setNewLocLabel("");
       setNewLocAddress("");
       setLocationCandidates([]);
@@ -164,8 +249,62 @@ export function PreferencesPage({ onBack }: PreferencesPageProps) {
     }
   };
 
-  const handleSave = () => {
-    // In a real app, this would save to backend/local storage
+  const beginDefaultStartSelection = () => {
+    setPendingDefaultStartLocation(defaultStartLocation);
+    setIsChoosingDefaultStart(true);
+  };
+
+  const confirmDefaultStartSelection = () => {
+    setDefaultStartLocation(pendingDefaultStartLocation);
+    setIsChoosingDefaultStart(false);
+  };
+
+  const cancelDefaultStartSelection = () => {
+    setPendingDefaultStartLocation(null);
+    setIsChoosingDefaultStart(false);
+  };
+
+  const handleSave = async () => {
+    const nextPreferences = {
+      day_start_time: toCanonicalTime(dayStart) || "08:00",
+      day_end_time: toCanonicalTime(dayEnd) || "22:00",
+      use_day_boundary_preferences: useDayBoundaries,
+      default_start_location: defaultStartLocation,
+    };
+    setIsSavingPreferences(true);
+    savePlanningPreferences(user?.id, nextPreferences);
+    if (user?.id) {
+      try {
+        const saved = await savePlanningPreferencesRemote(user.id, nextPreferences);
+        const normalized = normalizePlanningPreferences(saved);
+        savePlanningPreferences(user.id, normalized);
+        setOriginalPreferencesJson(preferenceSnapshot(
+          toDisplayTime(normalized.day_start_time) || "8:00 AM",
+          toDisplayTime(normalized.day_end_time) || "10:00 PM",
+          normalized.use_day_boundary_preferences ?? true,
+          normalized.default_start_location || null,
+        ));
+      } catch (error) {
+        console.error("Failed to save planning preferences:", error);
+        setLocationError(error instanceof Error ? error.message : "Failed to save planning preferences.");
+        setIsSavingPreferences(false);
+        return;
+      }
+    }
+    setIsSavingPreferences(false);
+    onBack();
+  };
+
+  const hasUnsavedPreferenceChanges = () => {
+    const current = preferenceSnapshot(dayStart, dayEnd, useDayBoundaries, defaultStartLocation);
+    return Boolean(originalPreferencesJson && current !== originalPreferencesJson);
+  };
+
+  const handleRequestBack = () => {
+    if (hasUnsavedPreferenceChanges()) {
+      setShowExitConfirmation(true);
+      return;
+    }
     onBack();
   };
 
@@ -175,6 +314,24 @@ export function PreferencesPage({ onBack }: PreferencesPageProps) {
     loc.longitude !== null &&
     loc.longitude !== undefined
   );
+
+  const isDefaultStartLocation = (loc: SavedLocation) => {
+    if (!defaultStartLocation) return false;
+    if (defaultStartLocation.label && loc.label && defaultStartLocation.label === loc.label) return true;
+    return (
+      Number(defaultStartLocation.latitude).toFixed(6) === Number(loc.latitude).toFixed(6) &&
+      Number(defaultStartLocation.longitude).toFixed(6) === Number(loc.longitude).toFixed(6)
+    );
+  };
+
+  const isPendingDefaultStartLocation = (loc: SavedLocation) => {
+    if (!pendingDefaultStartLocation) return false;
+    if (pendingDefaultStartLocation.label && loc.label && pendingDefaultStartLocation.label === loc.label) return true;
+    return (
+      Number(pendingDefaultStartLocation.latitude).toFixed(6) === Number(loc.latitude).toFixed(6) &&
+      Number(pendingDefaultStartLocation.longitude).toFixed(6) === Number(loc.longitude).toFixed(6)
+    );
+  };
 
   const mapEmbedUrl = (lat: number, lng: number) => {
     const delta = 0.006;
@@ -192,7 +349,7 @@ export function PreferencesPage({ onBack }: PreferencesPageProps) {
       <div className="max-w-2xl mx-auto px-6 py-8">
         <Button 
           variant="ghost" 
-          onClick={onBack}
+          onClick={handleRequestBack}
           className="mb-8 rounded-xl"
         >
           <ArrowLeft className="mr-2 h-4 w-4" />
@@ -255,18 +412,51 @@ export function PreferencesPage({ onBack }: PreferencesPageProps) {
 
           {/* Day Time Preferences */}
           <div className="bg-card rounded-2xl border border-border p-5 shadow-sm">
-            <h3 className="mb-4">Daily Schedule Preferences</h3>
-            
-            <div className="space-y-4">
+            <div className="mb-4 flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2">
+                <h3>Daily Schedule Preferences</h3>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <button
+                      type="button"
+                      className="inline-flex h-6 w-6 items-center justify-center rounded-full border border-border text-muted-foreground hover:bg-secondary"
+                      aria-label="Daily schedule preferences info"
+                    >
+                      <Info className="h-3.5 w-3.5" />
+                    </button>
+                  </TooltipTrigger>
+                  <TooltipContent className="max-w-xs text-xs">
+                    These times set your normal planning window. JPlan uses them as the day boundary unless your request gives a more specific time.
+                  </TooltipContent>
+                </Tooltip>
+              </div>
+              <Switch
+                id="daily-schedule-toggle"
+                checked={useDayBoundaries}
+                onCheckedChange={setUseDayBoundaries}
+              />
+            </div>
+
+            <div
+              className={`grid grid-cols-2 gap-3 rounded-2xl border p-3 transition-all ${
+                useDayBoundaries
+                  ? "border-transparent bg-transparent"
+                  : "pointer-events-none border-border/60 bg-secondary/30 opacity-45 grayscale"
+              }`}
+              aria-disabled={!useDayBoundaries}
+            >
               <div>
-                <Label htmlFor="day-start" className="mb-2 block text-sm">
-                  Preferred Day Start Time
+                <Label htmlFor="day-start" className="mb-2 block text-xs">
+                  Start time
                 </Label>
                 <select
                   id="day-start"
                   value={dayStart}
                   onChange={(e) => setDayStart(e.target.value)}
-                  className="w-full px-4 py-2 border border-border rounded-xl bg-background"
+                  disabled={!useDayBoundaries}
+                  className={`w-full px-3 py-2 border border-border rounded-xl text-sm ${
+                    useDayBoundaries ? "bg-background" : "cursor-not-allowed bg-muted text-muted-foreground"
+                  }`}
                 >
                   <option>6:00 AM</option>
                   <option>7:00 AM</option>
@@ -277,56 +467,25 @@ export function PreferencesPage({ onBack }: PreferencesPageProps) {
               </div>
 
               <div>
-                <Label htmlFor="day-end" className="mb-2 block text-sm">
-                  Preferred Day End Time
+                <Label htmlFor="day-end" className="mb-2 block text-xs">
+                  End time
                 </Label>
                 <select
                   id="day-end"
                   value={dayEnd}
                   onChange={(e) => setDayEnd(e.target.value)}
-                  className="w-full px-4 py-2 border border-border rounded-xl bg-background"
+                  disabled={!useDayBoundaries}
+                  className={`w-full px-3 py-2 border border-border rounded-xl text-sm ${
+                    useDayBoundaries ? "bg-background" : "cursor-not-allowed bg-muted text-muted-foreground"
+                  }`}
                 >
                   <option>8:00 PM</option>
                   <option>9:00 PM</option>
                   <option>10:00 PM</option>
                   <option>11:00 PM</option>
-                  <option>12:00 AM</option>
                 </select>
               </div>
             </div>
-          </div>
-
-          {/* Home Return Time */}
-          <div className="bg-card rounded-2xl border border-border p-5 shadow-sm">
-            <div className="flex items-center justify-between mb-3">
-              <div>
-                <Label htmlFor="home-return-toggle" className="text-sm">
-                  Preferred Return Home Time
-                </Label>
-                <p className="text-xs text-muted-foreground mt-1">
-                  Schedule activities to end by this time
-                </p>
-              </div>
-              <Switch
-                id="home-return-toggle"
-                checked={useHomeReturn}
-                onCheckedChange={setUseHomeReturn}
-              />
-            </div>
-            
-            {useHomeReturn && (
-              <select
-                value={preferredHomeReturn}
-                onChange={(e) => setPreferredHomeReturn(e.target.value)}
-                className="w-full px-4 py-2 border border-border rounded-xl bg-background mt-3"
-              >
-                <option>5:00 PM</option>
-                <option>6:00 PM</option>
-                <option>7:00 PM</option>
-                <option>8:00 PM</option>
-                <option>9:00 PM</option>
-              </select>
-            )}
           </div>
 
           {/* Notifications */}
@@ -375,22 +534,73 @@ export function PreferencesPage({ onBack }: PreferencesPageProps) {
 
           {/* Saved Locations Section */}
           <div className="bg-card rounded-2xl border border-border p-5 shadow-sm">
-            <div className="flex items-center gap-3 mb-4">
-              <MapPin className="h-5 w-5 text-primary" />
-              <h3>Saved Locations</h3>
+            <div className="flex items-center justify-between gap-3 mb-4">
+              <div className="flex items-center gap-3">
+                <MapPin className="h-5 w-5 text-primary" />
+                <h3>Saved Locations</h3>
+              </div>
+              {isChoosingDefaultStart ? (
+                <div className="flex gap-2">
+                  <Button
+                    size="sm"
+                    className="rounded-xl"
+                    onClick={confirmDefaultStartSelection}
+                    disabled={!pendingDefaultStartLocation}
+                  >
+                    Confirm
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="rounded-xl"
+                    onClick={cancelDefaultStartSelection}
+                  >
+                    Cancel
+                  </Button>
+                </div>
+              ) : (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="rounded-xl"
+                  onClick={beginDefaultStartSelection}
+                >
+                  Choose start
+                </Button>
+              )}
             </div>
             
             <p className="text-xs text-muted-foreground mb-4">
               Search and confirm exact places so Accurate Travel Time can reuse the right map point later.
+            </p>
+            <p className="text-xs text-muted-foreground mb-4 rounded-xl border border-primary/10 bg-primary/5 px-3 py-2">
+              Default start: {defaultStartLocation?.label || defaultStartLocation?.display_name || "Not set"}. This is used only when Accurate Travel Time is on.
             </p>
 
             {/* Location List */}
             <div className="space-y-2 mb-5">
               {savedLocations.map((loc) => (
                 <div key={loc.label} className="flex items-start justify-between gap-3 p-3 bg-secondary/20 rounded-xl border border-border/50 group">
-                  <div className="min-w-0">
+                  <div className="flex min-w-0 flex-1 items-start gap-3">
+                    {isChoosingDefaultStart && hasCoordinates(loc) && (
+                      <Checkbox
+                        checked={isPendingDefaultStartLocation(loc)}
+                        onCheckedChange={(checked) => {
+                          setPendingDefaultStartLocation(checked ? savedLocationToPlanningLocation(loc) : null);
+                        }}
+                        className="mt-1"
+                        aria-label={`Choose ${loc.label} as default start location`}
+                      />
+                    )}
+                    <div className="min-w-0">
                     <div className="flex flex-wrap items-center gap-2 mb-1">
                       <p className="text-sm font-medium">{loc.label}</p>
+                      {isDefaultStartLocation(loc) && (
+                        <span className="inline-flex items-center gap-1 rounded-full border border-primary/20 bg-primary/10 px-2 py-0.5 text-[10px] font-medium text-primary">
+                          <Home className="h-3 w-3" />
+                          Start
+                        </span>
+                      )}
                       <span className={`text-[10px] px-2 py-0.5 rounded-full border ${
                         hasCoordinates(loc)
                           ? "bg-emerald-500/10 text-emerald-700 border-emerald-500/20"
@@ -407,6 +617,12 @@ export function PreferencesPage({ onBack }: PreferencesPageProps) {
                       {loc.source ? ` | ${loc.source}` : ""}
                       {loc.confirmed_by_user ? " | confirmed" : ""}
                     </p>
+                    {!hasCoordinates(loc) && isChoosingDefaultStart && (
+                      <p className="mt-1 text-[11px] text-amber-700">
+                        Add a map point before using this as your start.
+                      </p>
+                    )}
+                    </div>
                   </div>
                   <Button 
                     variant="ghost" 
@@ -600,10 +816,11 @@ export function PreferencesPage({ onBack }: PreferencesPageProps) {
 
         {/* Save Button */}
         <div className="mt-8 flex gap-3">
-          <Button onClick={handleSave} className="flex-1 rounded-xl shadow-sm">
+          <Button onClick={handleSave} className="flex-1 rounded-xl shadow-sm" disabled={isSavingPreferences}>
+            {isSavingPreferences ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
             Save Preferences
           </Button>
-          <Button onClick={onBack} variant="outline" className="flex-1 rounded-xl">
+          <Button onClick={handleRequestBack} variant="outline" className="flex-1 rounded-xl" disabled={isSavingPreferences}>
             Cancel
           </Button>
         </div>
@@ -614,6 +831,50 @@ export function PreferencesPage({ onBack }: PreferencesPageProps) {
           </p>
         </div>
       </div>
+
+      {showExitConfirmation && (
+        <div
+          className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/50 px-4"
+          role="dialog"
+          aria-modal="true"
+        >
+          <div className="w-full max-w-md rounded-2xl border border-border bg-card p-6 shadow-xl">
+            <h2 className="mb-2 text-xl font-semibold">Save preferences?</h2>
+            <p className="mb-6 text-sm text-muted-foreground">
+              You have unsaved preference changes. Save them before going back to the dashboard?
+            </p>
+            <div className="flex justify-end gap-2">
+              <Button
+                variant="outline"
+                className="rounded-xl"
+                onClick={() => setShowExitConfirmation(false)}
+                disabled={isSavingPreferences}
+              >
+                Cancel
+              </Button>
+              <Button
+                variant="outline"
+                className="rounded-xl"
+                onClick={() => {
+                  setShowExitConfirmation(false);
+                  onBack();
+                }}
+                disabled={isSavingPreferences}
+              >
+                Don&apos;t save
+              </Button>
+              <Button
+                className="rounded-xl"
+                onClick={handleSave}
+                disabled={isSavingPreferences}
+              >
+                {isSavingPreferences ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+                Save
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
 
       <LocationPickerDialog
         open={isMapPickerOpen}

@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 import json
+import os
 from typing import Any, Optional
+
+
+def jplan_verbose_enabled() -> bool:
+    return os.getenv("JPLAN_VERBOSE_LOGS", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def jlog(module: str, message: str, stage: Optional[str] = None) -> None:
@@ -14,6 +19,11 @@ def jlog(module: str, message: str, stage: Optional[str] = None) -> None:
     print(f"{prefix} {message}")
 
 
+def jlog_verbose(module: str, message: str, stage: Optional[str] = None) -> None:
+    if jplan_verbose_enabled():
+        jlog(module, message, stage)
+
+
 def jjson(module: str, label: str, payload: Any, stage: Optional[str] = None) -> None:
     """Print JSON payloads under the same module/stage convention."""
     try:
@@ -21,6 +31,11 @@ def jjson(module: str, label: str, payload: Any, stage: Optional[str] = None) ->
     except Exception:
         serialized = repr(payload)
     jlog(module, f"{label}:\n{serialized}", stage)
+
+
+def jjson_verbose(module: str, label: str, payload: Any, stage: Optional[str] = None) -> None:
+    if jplan_verbose_enabled():
+        jjson(module, label, payload, stage)
 
 
 def jsection(module: str, title: str, stage: Optional[str] = None) -> None:

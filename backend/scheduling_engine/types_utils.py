@@ -235,13 +235,16 @@ Schema:
   "date": "YYYY-MM-DD or null",
   "operations": [{
     "op": "add|update|remove|replace|shift_plan_date",
+    "activity_id": "existing stable activity id when updating an existing item",
     "title": "Activity title",
     "timing_mode": "fixed|relative|flexible|preferred",
     "fixed_start": "HH:MM",
     "duration_minutes": 60,
     "priority": "low|medium|high",
     "location": "label or null",
-    "anchor_relation": {"kind":"after|before","target_title":"..."},
+    "anchor_relation": {"kind":"after|before","target_title":"...","target_activity_id":"existing anchor id when known"},
+    "edit_reason": "short rationale clause when user explains why",
+    "preserve_existing_fields": true,
     "sequence_index": 1
   }],
   "preferences": {},
@@ -262,6 +265,9 @@ Critical rules:
 11. Do not invent store/supermarket locations except for grocery/shopping activities.
 12. Soft phrases like preferably, if possible, maybe, sometime after, not too late, later in the day, at night, or around are preferences, not hard anchor_relation.
 13. Use anchor_relation only for hard wording like right after, immediately after, must be after, only after, before X starts, or cannot happen before.
+14. For edits that refer to an existing activity in CURRENT_ACTIVITY_INDEX, output op="update" with activity_id when available; do not output op="add".
+15. Preserve existing duration, priority, location label/source, coordinates, travel_required, and title unless the user explicitly changes them. You may set preserve_existing_fields=true for update edits.
+16. If the user gives a rationale ("because", "cause", "so that", "to avoid"), put it in edit_reason. Never include rationale text in title or anchor_relation.target_title.
 """
 
 

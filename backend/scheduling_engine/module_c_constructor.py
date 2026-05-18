@@ -7,12 +7,144 @@ from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from jplan_logging import jjson, jlog, jsection
+from jplan_logging import jjson, jlog, jlog_verbose, jsection
 from travel_service import MissingORSApiKey, TravelService, TravelServiceError, coordinate_from_saved_location
 from .types_utils import *
 from .types_utils import _normalize_location
 
 class ModuleCConstructorMixin:
+    def _active_route_context(self) -> Optional[Dict[str, Any]]:
+        context = getattr(self, "_current_route_context", None)
+        if isinstance(context, dict) and context.get("enabled"):
+            return context
+        return None
+
+    def _route_context_activity_key(self, item: Optional[Dict[str, Any]]) -> str:
+        if not item:
+            return ""
+        activity_id = str(item.get("stable_activity_id") or item.get("id") or "").strip()
+        if activity_id:
+            return f"id:{activity_id}"
+        title = clean_title(item.get("title") or "")
+        return f"title:{title}" if title else ""
+
+    def _route_context_pair_key(self, left: Optional[Dict[str, Any]], right: Optional[Dict[str, Any]]) -> str:
+        left_key = self._route_context_activity_key(left)
+        right_key = self._route_context_activity_key(right)
+        if not left_key or not right_key:
+            return ""
+        return f"{left_key}->{right_key}"
+
+    def _route_context_entry(
+        self,
+        left: Optional[Dict[str, Any]],
+        right: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        context = self._active_route_context()
+        if not context:
+            return None
+        pair_key = self._route_context_pair_key(left, right)
+        if not pair_key:
+            return None
+        return (context.get("pairs") or {}).get(pair_key)
+
+    def _route_context_start_entry(self, item: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        context = self._active_route_context()
+        if not context or not item:
+            return None
+        key = self._route_context_activity_key(item)
+        if not key:
+            return None
+        return (context.get("start_routes") or {}).get(key)
+
+    def _route_aware_timeline_violations(
+        self,
+        timeline: List[Dict[str, Any]],
+        day_start: int,
+        day_end: int,
+        min_travel: Optional[int],
+    ) -> List[Dict[str, Any]]:
+        if not self._active_route_context():
+            return []
+        ordered = sorted(timeline or [], key=lambda item: item.get("scheduled_start") or 0)
+        violations: List[Dict[str, Any]] = []
+
+        for index, item in enumerate(ordered):
+            start = item.get("scheduled_start")
+            end = item.get("scheduled_end")
+            if start is None or end is None:
+                violations.append({"reason": "missing_schedule_time", "title": item.get("title")})
+                continue
+            if start < day_start or end > day_end or end <= start:
+                violations.append({"reason": "day_boundary", "title": item.get("title")})
+            if index > 0:
+                previous = ordered[index - 1]
+                previous_end = previous.get("scheduled_end") or 0
+                if start < previous_end:
+                    violations.append({
+                        "reason": "overlap",
+                        "from": previous.get("title"),
+                        "to": item.get("title"),
+                    })
+
+        physical_indices = [
+            index for index, item in enumerate(ordered)
+            if self._activity_requires_travel(item)
+        ]
+        if physical_indices:
+            first_index = physical_indices[0]
+            first = ordered[first_index]
+            start_entry = self._route_context_start_entry(first)
+            first_start = first.get("scheduled_start")
+            if start_entry and first_start is not None:
+                route_minutes = int(start_entry.get("duration_minutes") or 0)
+                leave_by = first_start - route_minutes
+                if leave_by < day_start:
+                    violations.append({
+                        "reason": "start_route_before_day_start",
+                        "to": first.get("title"),
+                        "leave_by": leave_by,
+                    })
+                for blocker in ordered[:first_index]:
+                    blocker_end = blocker.get("scheduled_end")
+                    if blocker_end is not None and blocker_end > leave_by:
+                        violations.append({
+                            "reason": "start_route_blocker",
+                            "from": blocker.get("title"),
+                            "to": first.get("title"),
+                            "blocker_end": blocker_end,
+                            "leave_by": leave_by,
+                        })
+
+        for left_pos, right_pos in zip(physical_indices, physical_indices[1:]):
+            left = ordered[left_pos]
+            right = ordered[right_pos]
+            entry = self._route_context_entry(left, right)
+            if not entry:
+                continue
+            route_minutes = int(entry.get("duration_minutes") or 0)
+            prep = max(
+                int(left.get("prep_buffer", DEFAULT_PREP_BUFFER) or 0),
+                int(right.get("prep_buffer", DEFAULT_PREP_BUFFER) or 0),
+            )
+            intermediate_ends = [
+                item.get("scheduled_end") or 0
+                for item in ordered[left_pos + 1:right_pos]
+            ]
+            route_gap_start = max([left.get("scheduled_end") or 0] + intermediate_ends)
+            right_start = right.get("scheduled_start")
+            required_start = route_gap_start + prep + route_minutes
+            if right_start is not None and right_start < required_start:
+                violations.append({
+                    "reason": "route_transition",
+                    "from": left.get("title"),
+                    "to": right.get("title"),
+                    "required_travel": route_minutes,
+                    "required_start": required_start,
+                    "actual_start": right_start,
+                })
+        return violations
+
     def _activity_requires_travel(self, activity: Optional[Dict[str, Any]]) -> bool:
         if not activity:
             return False
@@ -41,6 +173,7 @@ class ModuleCConstructorMixin:
         
         last_end = day_start
         last_loc = None
+        last_activity = None
 
         for act in ordered:
             start_min = act.get("scheduled_start") or 0
@@ -54,10 +187,24 @@ class ModuleCConstructorMixin:
                 gap_dur = start_min - last_end
                 
                 # Calculate required overhead
+                route_entry = self._route_context_entry(last_activity, act) if last_activity and current_loc else None
                 buffer_dur = DEFAULT_PREP_BUFFER if last_loc is not None and current_loc is not None else 0
                 travel_time = 0
+                travel_source = "heuristic"
+                route_status = "not_requested"
+                route_duration = None
+                from_coordinate = None
+                to_coordinate = None
                 if last_loc and current_loc and last_loc != current_loc:
-                    travel_time = estimate_travel_minutes(last_loc, current_loc)
+                    if route_entry:
+                        travel_time = int(route_entry.get("duration_minutes") or 0)
+                        route_duration = travel_time
+                        travel_source = route_entry.get("source") or "routing_service"
+                        route_status = "fallback_used" if travel_source == "fallback" else "validated"
+                        from_coordinate = route_entry.get("from_coordinate")
+                        to_coordinate = route_entry.get("to_coordinate")
+                    else:
+                        travel_time = estimate_travel_minutes(last_loc, current_loc)
                 
                 required_total = buffer_dur + travel_time
                 
@@ -92,14 +239,18 @@ class ModuleCConstructorMixin:
                         t_start = last_end + idle_at_current + buffer_dur
                         blocks.append({
                             "block_type": "transition",
+                            "type": "travel",
                             "title": f"Travel to {current_loc}",
                             "start": format_clock(t_start),
                             "end": format_clock(start_min),
                             "duration_minutes": travel_time,
                             "from_location": last_loc,
                             "to_location": current_loc,
-                            "travel_estimate_source": "heuristic",
-                            "travel_validation_status": "not_requested",
+                            "travel_estimate_source": travel_source,
+                            "travel_validation_status": route_status,
+                            "route_duration_minutes": route_duration,
+                            "from_coordinate": deepcopy(from_coordinate) if isinstance(from_coordinate, dict) else from_coordinate,
+                            "to_coordinate": deepcopy(to_coordinate) if isinstance(to_coordinate, dict) else to_coordinate,
                             "reason": f"Travel timed to arrive exactly for {act['title']}"
                         })
                 else:
@@ -107,14 +258,18 @@ class ModuleCConstructorMixin:
                     # Force move immediately and mark as potentially tight
                     blocks.append({
                         "block_type": "transition",
+                        "type": "travel",
                         "title": f"Travel to {current_loc} (Tight)",
                         "start": format_clock(last_end),
                         "end": format_clock(start_min),
                         "duration_minutes": gap_dur,
                         "from_location": last_loc,
                         "to_location": current_loc,
-                        "travel_estimate_source": "heuristic",
-                        "travel_validation_status": "not_requested",
+                        "travel_estimate_source": travel_source,
+                        "travel_validation_status": route_status,
+                        "route_duration_minutes": route_duration,
+                        "from_coordinate": deepcopy(from_coordinate) if isinstance(from_coordinate, dict) else from_coordinate,
+                        "to_coordinate": deepcopy(to_coordinate) if isinstance(to_coordinate, dict) else to_coordinate,
                         "is_tight": True,
                         "warning_code": WARNING_TIGHT_TRANSITION,
                         "reason": "Immediate departure required due to tight schedule"
@@ -140,6 +295,17 @@ class ModuleCConstructorMixin:
                 "location_warning": act.get("location_warning"),
                 "area_preference": act.get("area_preference"),
                 "travel_required": travel_required,
+                "timing_mode": act.get("timing_mode"),
+                "original_timing_mode": act.get("original_timing_mode"),
+                "fixed_start": act.get("fixed_start"),
+                "fixed_end": act.get("fixed_end"),
+                "is_user_fixed": bool(act.get("is_user_fixed", False)),
+                "is_system_scheduled": bool(act.get("is_system_scheduled", False)),
+                "user_fixed_start": act.get("user_fixed_start"),
+                "can_move_for_repair": bool(act.get("can_move_for_repair", False)),
+                "repair_protection": act.get("repair_protection"),
+                "priority": act.get("priority"),
+                "is_mandatory": bool(act.get("is_mandatory", True)),
                 "saved_location_label": act.get("saved_location_label"),
                 "resolved_location": deepcopy(act.get("resolved_location")) if isinstance(act.get("resolved_location"), dict) else None,
                 "notes": act.get("notes"),
@@ -159,6 +325,7 @@ class ModuleCConstructorMixin:
             last_end = end_min
             if travel_required:
                 last_loc = current_loc
+                last_activity = act
 
         return blocks
 
@@ -281,9 +448,23 @@ class ModuleCConstructorMixin:
         activities: List[Dict[str, Any]],
         preferences: Dict[str, Any],
     ) -> Dict[str, Any]:
+        self._normalize_day_boundary_preferences(preferences)
         day_start = parse_clock(preferences.get("day_start")) or DEFAULT_DAY_START
         day_end = parse_clock(preferences.get("day_end")) or DEFAULT_DAY_END
         min_travel = preferences.get("min_travel_buffer_minutes") or 0
+        route_context = preferences.get("_route_context") if preferences.get("route_aware_repair") else None
+        self._current_route_context = route_context if isinstance(route_context, dict) else None
+        if self._active_route_context():
+            jlog("MODULE_C", "enabled=true", "ROUTE_AWARE")
+            for pair in (self._active_route_context().get("pairs") or {}).values():
+                jlog_verbose(
+                    "MODULE_C",
+                    (
+                        f"from={pair.get('from_title')} to={pair.get('to_title')} "
+                        f"required_travel={pair.get('duration_minutes')}"
+                    ),
+                    "ROUTE_CONSTRAINT",
+                )
 
         # Pass 1: Categorize
         fixed: List[Dict[str, Any]] = []
@@ -449,6 +630,15 @@ class ModuleCConstructorMixin:
             "day_end": format_clock(day_end),
             **refinement_metadata,
         }
+
+    def _normalize_day_boundary_preferences(self, preferences: Dict[str, Any]) -> None:
+        """Map UI preference names into the fields Module C already consumes."""
+        if not isinstance(preferences, dict):
+            return
+        if not preferences.get("day_start") and preferences.get("day_start_time"):
+            preferences["day_start"] = preferences.get("day_start_time")
+        if not preferences.get("day_end") and preferences.get("day_end_time"):
+            preferences["day_end"] = preferences.get("day_end_time")
 
     def _should_unschedule_initial_generation_item(
         self,
@@ -1027,6 +1217,36 @@ class ModuleCConstructorMixin:
             if candidate_end > (item.get("latest_end") or day_end):
                 continue 
 
+            candidate = deepcopy(item)
+            candidate["scheduled_start"] = candidate_start
+            candidate["scheduled_end"] = candidate_end
+            candidate_timeline = sorted(timeline + [candidate], key=lambda x: x["scheduled_start"])
+            route_violations = self._route_aware_timeline_violations(
+                candidate_timeline,
+                day_start,
+                day_end,
+                min_travel,
+            )
+            if route_violations:
+                first_violation = route_violations[0]
+                reason = first_violation.get("reason") or "route_infeasible"
+                if reason == "start_route_blocker":
+                    jlog(
+                        "MODULE_C",
+                        f"first_event={first_violation.get('to')} leave_by={format_clock(int(first_violation.get('leave_by') or 0))}",
+                        "START_ROUTE_CONSTRAINT",
+                    )
+                elif reason == "route_transition":
+                    jlog(
+                        "MODULE_C",
+                        (
+                            f"from={first_violation.get('from')} to={first_violation.get('to')} "
+                            f"required_travel={first_violation.get('required_travel')}"
+                        ),
+                        "ROUTE_CONSTRAINT",
+                    )
+                continue
+
             # Scoring
             base_score = self._calculate_activity_base_score(item)
             delay_penalty = 0
@@ -1059,9 +1279,6 @@ class ModuleCConstructorMixin:
             
             if total_score > best_score:
                 best_score = total_score
-                candidate = deepcopy(item)
-                candidate["scheduled_start"] = candidate_start
-                candidate["scheduled_end"] = candidate_end
                 
                 if prefer_earliest and delay_minutes > 0:
                     candidate.setdefault("trace", []).append(f"Placed with {delay_minutes}m delay from earliest possible start.")
@@ -1088,7 +1305,7 @@ class ModuleCConstructorMixin:
                         })
                         candidate.setdefault("trace", []).append(explanation)
                 
-                best_timeline = sorted(timeline + [candidate], key=lambda x: x["scheduled_start"])
+                best_timeline = candidate_timeline
 
         if best_timeline:
             return best_timeline, ""
@@ -1126,8 +1343,12 @@ class ModuleCConstructorMixin:
             return 0
         if not left.get("location") or not right.get("location"):
             return 0
-        travel = estimate_travel_minutes(left.get("location"), right.get("location"))
-        travel = max(travel, min_travel or 0)
+        route_entry = self._route_context_entry(left, right)
+        if route_entry:
+            travel = int(route_entry.get("duration_minutes") or 0)
+        else:
+            travel = estimate_travel_minutes(left.get("location"), right.get("location"))
+            travel = max(travel, min_travel or 0)
         prep = max(
             left.get("prep_buffer", DEFAULT_PREP_BUFFER),
             right.get("prep_buffer", DEFAULT_PREP_BUFFER),

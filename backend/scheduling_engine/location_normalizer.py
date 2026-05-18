@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from jplan_logging import jjson, jlog, jsection
+from jplan_logging import jjson, jlog, jlog_verbose, jsection
 from travel_service import MissingORSApiKey, TravelService, TravelServiceError, coordinate_from_saved_location
 from .types_utils import *
 from .types_utils import _normalize_location
@@ -34,7 +34,83 @@ class LocationNormalizerMixin:
             transcription,
             saved_locations or [],
         )
+        self._log_location_and_timing_summary(
+            list(normalized.get("operations") or []) + list(normalized.get("activities") or [])
+        )
         return normalized
+
+    def _log_location_and_timing_summary(
+        self,
+        operations: List[Dict[str, Any]],
+        *,
+        include_locations: bool = True,
+    ) -> None:
+        location_lines: List[str] = []
+        timing_lines: List[str] = []
+        for operation in operations or []:
+            if not isinstance(operation, dict):
+                continue
+            title = str(operation.get("title") or operation.get("target_title") or operation.get("op") or "Activity")
+            if clean_title(operation.get("op") or "add") in {"remove", "shift_plan_date"}:
+                continue
+            if include_locations:
+                location_lines.append(self._location_summary_line(title, operation))
+            timing_line = self._timing_summary_line(title, operation)
+            if timing_line:
+                timing_lines.append(timing_line)
+        if location_lines:
+            jlog("LOCATION", "\n".join(location_lines), "SUMMARY")
+        if timing_lines:
+            jlog("SOFT_PREF", "\n".join(timing_lines), "SUMMARY")
+
+    def _location_summary_line(self, title: str, operation: Dict[str, Any]) -> str:
+        if (
+            operation.get("travel_required") is False
+            or clean_title(operation.get("location_status") or "") == "not_required"
+            or clean_title(operation.get("location_category") or "") == "home_or_online"
+        ):
+            return f"{title} -> no location required"
+        label = (
+            operation.get("location_label")
+            or operation.get("location")
+            or operation.get("location_normalized")
+            or operation.get("location_category")
+            or "exact location"
+        )
+        if self._operation_has_coordinates(operation):
+            return f"{title} -> {label} (coordinates confirmed)"
+        if clean_title(operation.get("location_status") or "") in {"needs_resolution", "unresolved", "resolved_default"}:
+            return f"{title} -> {label} (needs coordinates)"
+        return f"{title} -> {label} (needs coordinates)"
+
+    def _operation_has_coordinates(self, operation: Dict[str, Any]) -> bool:
+        resolved = operation.get("resolved_location")
+        if isinstance(resolved, dict):
+            if resolved.get("latitude") is not None and resolved.get("longitude") is not None:
+                return True
+            if resolved.get("lat") is not None and resolved.get("lng") is not None:
+                return True
+        return (
+            operation.get("latitude") is not None
+            and operation.get("longitude") is not None
+        ) or (
+            operation.get("lat") is not None
+            and operation.get("lng") is not None
+        )
+
+    def _timing_summary_line(self, title: str, operation: Dict[str, Any]) -> str:
+        parts: List[str] = []
+        if operation.get("preferred_time_window"):
+            parts.append(f"preferred_window={operation.get('preferred_time_window')}")
+        preferred_order = operation.get("preferred_order")
+        if isinstance(preferred_order, dict):
+            kind = preferred_order.get("kind")
+            target = preferred_order.get("target_title")
+            if kind and target:
+                parts.append(f"preferred_order={kind} {target}")
+        if not parts:
+            return ""
+        return f"{title} -> {'; '.join(parts)}"
 
     def _normalize_operation_locations(
         self,
@@ -115,11 +191,12 @@ class LocationNormalizerMixin:
         ops = [deepcopy(op) for op in operations or [] if isinstance(op, dict)]
         lunch_match = self._lunch_reference_match(source_text)
         found_lunch_reference = lunch_match is not None
-        jlog(
-            "IMPLICIT_LUNCH",
-            f"found={str(found_lunch_reference).lower()} phrase=\"{lunch_match.group(0) if lunch_match else ''}\"",
-            "DETECT",
-        )
+        if found_lunch_reference:
+            jlog(
+                "IMPLICIT_LUNCH",
+                f"found=true phrase=\"{lunch_match.group(0) if lunch_match else ''}\"",
+                "DETECT",
+            )
         if not self._should_infer_implicit_lunch(ops, source_text, existing_activities or [], preferences or {}):
             return ops
 
@@ -510,8 +587,8 @@ class LocationNormalizerMixin:
             updated["preferred_time_window"] = label
             updated["preferred_window_start"] = start
             updated["preferred_window_end"] = end
-            jlog("MODULE_C", f"{updated.get('title')} preferred_window={label}", "SOFT_PREF")
-            jlog("SOFT_PREF", f"{updated.get('title')} preferred_window={label}", None)
+            jlog_verbose("MODULE_C", f"{updated.get('title')} preferred_window={label}", "SOFT_PREF")
+            jlog_verbose("SOFT_PREF", f"{updated.get('title')} preferred_window={label}", None)
         elif updated.get("preferred_time_window") and (
             updated.get("preferred_window_start") is None or updated.get("preferred_window_end") is None
         ):
@@ -528,7 +605,7 @@ class LocationNormalizerMixin:
             updated.pop("anchor_relation", None)
             if clean_title(updated.get("timing_mode") or "") == TimingMode.RELATIVE:
                 updated["timing_mode"] = TimingMode.PREFERRED if window else TimingMode.UNSPECIFIED
-            jlog(
+            jlog_verbose(
                 "MODULE_C",
                 f"{updated.get('title')} soft_order={anchor.get('kind')} {anchor.get('target_title')}",
                 "SOFT_PREF",
@@ -914,7 +991,7 @@ class LocationNormalizerMixin:
         raw_location: Optional[str],
         payload: Dict[str, Any],
     ) -> None:
-        jlog(
+        jlog_verbose(
             "LOCATION",
             f"{title or 'Untitled'} | raw_llm_location={raw_location} | "
             f"explicit_user_location={str(payload.get('explicit_user_location')).lower()} | "

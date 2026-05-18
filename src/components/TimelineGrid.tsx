@@ -446,9 +446,9 @@ function SupportTimelineBlock({ activity, kind }: { activity: ActivityBlock; kin
   const et = activity.endTime || activity.end;
   const duration = activity.duration_minutes || getDurationMinutes(activity);
   const destination = activity.title.replace(/^travel to\s+/i, "").trim();
-  const label = kind === "travel"
+  const label = activity.display_label || (kind === "travel"
     ? `${duration} min travel${destination ? ` to ${destination}` : ""}`
-    : `${duration} min buffer`;
+    : `${duration} min buffer`);
 
   const colorClass = kind === "travel"
     ? "border-indigo-200 bg-indigo-50/70 text-indigo-800"

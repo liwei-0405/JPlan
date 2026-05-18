@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from jplan_logging import jjson, jlog, jsection
+from jplan_logging import jjson, jlog, jlog_verbose, jsection
 from travel_service import MissingORSApiKey, TravelService, TravelServiceError, coordinate_from_saved_location
 from .types_utils import *
 from .types_utils import _normalize_location
@@ -52,6 +52,30 @@ class Module0RouterMixin:
         r"\b(?:recalculate|recompute|validate|check|update)\s+(?:the\s+)?(?:travel|route|commute)\s+time\b|"
         r"\b(?:regenerate|rebuild|refresh)\b.*\b(?:accurate|actual|real)\s+(?:travel|route|commute)\s+time\b"
     )
+
+    def _natural_edit_wording_skip_reason(self, clean: str, text: str) -> Optional[str]:
+        has_relation = bool(re.search(r"\b(?:after|before|right\s+after|right\s+before|earlier|later)\b", clean))
+        has_activity = bool(re.search(self._ROUTER_ACTIVITY_PATTERN, clean))
+        if not (has_relation and has_activity):
+            return None
+        activity_mentions = len(re.findall(self._ROUTER_ACTIVITY_PATTERN, clean))
+        if activity_mentions >= 3 and len(clean.split()) > 14:
+            return None
+        if re.search(r"\b(?:because|cause|cuz|since|so\s+that|so\s+i\s+(?:do\s+not|don'?t|dont)|to\s+avoid)\b", clean):
+            return "natural_edit_wording"
+        if re.match(
+            r"^(?:how\s+about|what\s+about|maybe|what\s+if|i\s+was\s+thinking|i\s+think\s+maybe|"
+            r"would\s+it\s+be\s+better|would\s+it\s+help|i\s+want|i\s+need|i\s+would\s+like|can\s+we|could\s+we)\b",
+            clean,
+        ):
+            return "natural_edit_wording"
+        explicit_clean_command = bool(re.match(
+            r"^(?:(?:arrange|rearrange|put|place|make|set)\b|(?:add|schedule)\b|(?:move|shift|change|update)\b|(?:remove|delete|cancel)\b)",
+            clean,
+        ))
+        if len(clean.split()) > 14 and not explicit_clean_command:
+            return "natural_edit_wording"
+        return None
 
     def route_chat_request(
         self,
@@ -125,6 +149,19 @@ class Module0RouterMixin:
             and re.search(r"\b(?:can|could)\s+(?:it|this|that|you)\s+(?:be|make|move|shift)\b|\bcan you\b", clean)
         )
         complaint_only = bool(has_activity_entity and has_adjustment_word and not complaint_action and not has_action_word)
+
+        natural_skip_reason = self._natural_edit_wording_skip_reason(clean, text)
+        if natural_skip_reason:
+            jlog("FAST_PATH", f"reason={natural_skip_reason}", "SKIP_TO_MODULE_A")
+            route.update({
+                "route": "simple_schedule_command",
+                "confidence": 0.84,
+                "should_mutate_schedule": True,
+                "use_deterministic_parser": False,
+                "use_module_a_llm": True,
+                "reason": natural_skip_reason,
+            })
+            return self._log_route_decision(route)
 
         advice_patterns = (
             r"\bshould i\b",
@@ -399,7 +436,7 @@ SCHEDULE_SUMMARY:
         if not ADVISORY_LLM_SEMAPHORE.acquire(blocking=False):
             raise AdvisoryLLMExecutorSaturatedError("advisory executor saturated")
         timeout_seconds = max(0.1, float(ADVISORY_LLM_TIMEOUT_SECONDS))
-        jlog("ADVICE", f"start timeout={int(timeout_seconds * 1000)}ms", "LLM")
+        jlog_verbose("ADVICE", f"start timeout={int(timeout_seconds * 1000)}ms", "LLM")
         future = ADVISORY_LLM_EXECUTOR.submit(self._call_advisory_llm, prompt)
         future.add_done_callback(lambda _future: ADVISORY_LLM_SEMAPHORE.release())
         try:

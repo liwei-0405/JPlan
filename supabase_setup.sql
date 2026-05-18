@@ -84,6 +84,42 @@ CREATE TABLE IF NOT EXISTS public.user_locations (
 CREATE INDEX IF NOT EXISTS idx_user_locations_user_id
   ON public.user_locations(user_id);
 
+-- User-level planning preferences. Per-day overrides still live inside
+-- daily_plans.activities JSON so editing one day does not change defaults.
+CREATE TABLE IF NOT EXISTS public.user_preferences (
+  user_id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+  day_start_time TIME NOT NULL DEFAULT TIME '08:00',
+  day_end_time TIME NOT NULL DEFAULT TIME '22:00',
+  use_day_boundary_preferences BOOLEAN NOT NULL DEFAULT true,
+  default_start_location_label TEXT,
+  default_start_location JSONB,
+  created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT timezone('utc'::text, now()),
+  updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT timezone('utc'::text, now()),
+  CONSTRAINT user_preferences_day_boundary_check CHECK (day_start_time < day_end_time)
+);
+
+-- Cross-device recent confirmed locations. This is user history, not the
+-- provider result cache below. The app keeps only the newest five per user.
+CREATE TABLE IF NOT EXISTS public.user_recent_locations (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  location_key TEXT NOT NULL,
+  label TEXT,
+  display_name TEXT,
+  address TEXT,
+  category TEXT,
+  latitude DOUBLE PRECISION NOT NULL,
+  longitude DOUBLE PRECISION NOT NULL,
+  source TEXT NOT NULL DEFAULT 'recent',
+  last_used_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT timezone('utc'::text, now()),
+  created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT timezone('utc'::text, now()),
+  updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT timezone('utc'::text, now()),
+  CONSTRAINT user_recent_locations_user_key UNIQUE (user_id, location_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_recent_locations_user_last_used
+  ON public.user_recent_locations(user_id, last_used_at DESC);
+
 -- Shared geocode cache for ORS/Nominatim candidate results.
 -- Nullable hints are handled by the unique expression index below.
 CREATE TABLE IF NOT EXISTS public.geocode_cache (
@@ -132,6 +168,18 @@ CREATE TRIGGER update_user_locations_updated_at
   FOR EACH ROW
   EXECUTE FUNCTION public.update_updated_at_column();
 
+DROP TRIGGER IF EXISTS update_user_preferences_updated_at ON public.user_preferences;
+CREATE TRIGGER update_user_preferences_updated_at
+  BEFORE UPDATE ON public.user_preferences
+  FOR EACH ROW
+  EXECUTE FUNCTION public.update_updated_at_column();
+
+DROP TRIGGER IF EXISTS update_user_recent_locations_updated_at ON public.user_recent_locations;
+CREATE TRIGGER update_user_recent_locations_updated_at
+  BEFORE UPDATE ON public.user_recent_locations
+  FOR EACH ROW
+  EXECUTE FUNCTION public.update_updated_at_column();
+
 DROP TRIGGER IF EXISTS update_geocode_cache_updated_at ON public.geocode_cache;
 CREATE TRIGGER update_geocode_cache_updated_at
   BEFORE UPDATE ON public.geocode_cache
@@ -174,6 +222,8 @@ CREATE TRIGGER on_auth_user_created
 ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.daily_plans ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.user_locations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.user_preferences ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.user_recent_locations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.geocode_cache ENABLE ROW LEVEL SECURITY;
 
 -- Profiles policies
@@ -214,6 +264,22 @@ CREATE POLICY "Admins can read all plans"
 DROP POLICY IF EXISTS "Users can manage their own locations" ON public.user_locations;
 CREATE POLICY "Users can manage their own locations"
   ON public.user_locations
+  FOR ALL
+  USING (auth.uid() = user_id)
+  WITH CHECK (auth.uid() = user_id);
+
+-- Preference policies
+DROP POLICY IF EXISTS "Users can manage their own preferences" ON public.user_preferences;
+CREATE POLICY "Users can manage their own preferences"
+  ON public.user_preferences
+  FOR ALL
+  USING (auth.uid() = user_id)
+  WITH CHECK (auth.uid() = user_id);
+
+-- Recent location policies
+DROP POLICY IF EXISTS "Users can manage their own recent locations" ON public.user_recent_locations;
+CREATE POLICY "Users can manage their own recent locations"
+  ON public.user_recent_locations
   FOR ALL
   USING (auth.uid() = user_id)
   WITH CHECK (auth.uid() = user_id);

@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from jplan_logging import jjson, jlog, jsection
+from jplan_logging import jjson, jlog, jlog_verbose, jsection
 from travel_service import MissingORSApiKey, TravelService, TravelServiceError, coordinate_from_saved_location
 from .types_utils import *
 from .types_utils import _normalize_location
@@ -666,18 +666,20 @@ class Module8ReplyMixin:
     ) -> None:
         reply = reply_meta.get("reply") or ""
         reply_status = reply_meta.get("reply_status") or "success"
-        referenced = [
-            {
-                "title": block.get("title"),
-                "start": block.get("start"),
-                "end": block.get("end"),
-            }
-            for block in summary.get("referenced_blocks") or []
-        ]
-        jlog("MODULE_8", f"Reply class={self._module_8_reply_class(reply_status)}", "REPLY")
-        jlog("MODULE_8", f"Referenced blocks={json.dumps(referenced, ensure_ascii=True)}", "REPLY")
-        jlog("MODULE_8", f"Final reply={json.dumps(reply, ensure_ascii=True)}", "REPLY")
-        jlog("MODULE_8", f"Reply source={source}", "REPLY")
+        referenced_rows = []
+        for block in summary.get("referenced_blocks") or []:
+            title = block.get("title") or "Activity"
+            start = block.get("start") or "?"
+            end = block.get("end") or "?"
+            referenced_rows.append(f"- {title}: {start}-{end}")
+        if referenced_rows:
+            jlog("MODULE_8", "referenced_blocks:\n" + "\n".join(referenced_rows), "REPLY")
+        reply_class = self._module_8_reply_class(reply_status)
+        jlog(
+            "MODULE_8",
+            f"source={source} status={reply_class} text={json.dumps(reply, ensure_ascii=True)}",
+            "REPLY",
+        )
 
     def _module_8_fallback(
         self,
@@ -774,7 +776,7 @@ RESULT_SUMMARY:
         try:
             llm_start = time.perf_counter()
             timeout_seconds = min(MODULE8_LLM_TIMEOUT_SECONDS, MODULE8_LLM_TOTAL_TIMEOUT_SECONDS)
-            jlog("MODULE_8", f"start timeout={int(timeout_seconds * 1000)}ms", "LLM")
+            jlog_verbose("MODULE_8", f"start timeout={int(timeout_seconds * 1000)}ms", "LLM")
             future = MODULE8_LLM_EXECUTOR.submit(self._call_module_8_llm, prompt)
             try:
                 response = future.result(timeout=timeout_seconds)

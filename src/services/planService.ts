@@ -130,11 +130,24 @@ export async function savePlan(schedule: DailySchedule, userId: string): Promise
                 planning_mode: schedule.planning_mode || "feasibility_first",
                 allow_clash: Boolean(schedule.allow_clash),
                 accurate_travel_time: Boolean(schedule.accurate_travel_time),
+                preferences: schedule.preferences || {},
                 schedule_status: schedule.schedule_status || schedule.status || "ok",
                 travel_validation_status: schedule.travel_validation_status || "not_requested",
                 warnings: schedule.warnings || [],
                 location_resolution_requests: schedule.location_resolution_requests || [],
                 route_conflicts: schedule.route_conflicts || [],
+                pending_repair_suggestions: schedule.pending_repair_suggestions || [],
+                unfit_activities: schedule.unfit_activities || [],
+                route_repair_actions: schedule.route_repair_actions || [],
+                route_efficiency: schedule.route_efficiency || {},
+                route_total_before: schedule.route_total_before ?? null,
+                route_total_after: schedule.route_total_after ?? null,
+                route_minutes_saved: schedule.route_minutes_saved ?? null,
+                location_revisits_count: schedule.location_revisits_count ?? null,
+                same_location_split_penalty_before: schedule.same_location_split_penalty_before ?? null,
+                same_location_split_penalty_after: schedule.same_location_split_penalty_after ?? null,
+                revisit_penalty_before: schedule.revisit_penalty_before ?? null,
+                revisit_penalty_after: schedule.revisit_penalty_after ?? null,
                 conflicts: schedule.conflicts || [],
                 conflict: schedule.conflict || null,
                 unmet_items: schedule.unmet_items || [],
@@ -177,6 +190,71 @@ export type SavedLocation = {
     confirmed_by_user?: boolean;
     updated_at?: string;
 };
+
+export type PlanningLocationPayload = {
+    label?: string;
+    display_name?: string;
+    address?: string;
+    latitude?: number | null;
+    longitude?: number | null;
+    category?: string;
+    source?: string;
+    confirmed_by_user?: boolean;
+};
+
+export type PlanningPreferencesPayload = {
+    day_start_time: string;
+    day_end_time: string;
+    use_day_boundary_preferences?: boolean;
+    default_start_location?: PlanningLocationPayload | null;
+};
+
+export type RecentLocationPayload = PlanningLocationPayload & {
+    id?: string;
+    location_key?: string;
+    last_used_at?: string;
+};
+
+export async function getPlanningPreferences(userId: string): Promise<PlanningPreferencesPayload | null> {
+    const response = await fetch(`${API_BASE_URL}/api/preferences?user_id=${encodeURIComponent(userId)}`);
+    if (!response.ok) return null;
+    return await response.json();
+}
+
+export async function savePlanningPreferencesRemote(
+    userId: string,
+    preferences: PlanningPreferencesPayload,
+): Promise<PlanningPreferencesPayload> {
+    const response = await fetch(`${API_BASE_URL}/api/preferences`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ user_id: userId, ...preferences }),
+    });
+    if (!response.ok) {
+        const error = await response.json().catch(() => ({ detail: 'Failed to save preferences' }));
+        throw new Error(error.detail || 'Failed to save preferences');
+    }
+    return await response.json();
+}
+
+export async function getRecentLocations(userId: string): Promise<RecentLocationPayload[]> {
+    const response = await fetch(`${API_BASE_URL}/api/recent-locations?user_id=${encodeURIComponent(userId)}`);
+    if (!response.ok) return [];
+    return await response.json();
+}
+
+export async function addRecentLocationRemote(
+    userId: string,
+    location: PlanningLocationPayload,
+): Promise<RecentLocationPayload[]> {
+    const response = await fetch(`${API_BASE_URL}/api/recent-locations`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ user_id: userId, location }),
+    });
+    if (!response.ok) return [];
+    return await response.json();
+}
 
 export async function getSavedLocations(userId: string): Promise<SavedLocation[]> {
     const response = await fetch(`${API_BASE_URL}/api/locations?user_id=${encodeURIComponent(userId)}`);
