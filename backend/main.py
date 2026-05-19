@@ -57,8 +57,15 @@ class ScheduleItem(BaseModel):
     location_source: Optional[str] = None
     location_confidence: Optional[float] = None
     location_normalized: Optional[str] = None
+    raw_location_text: Optional[str] = None
+    location_kind: Optional[str] = None
+    location_resolution_status: Optional[str] = None
+    no_location_reason: Optional[str] = None
+    semantic_confidence: Optional[float] = None
     raw_llm_location: Optional[str] = None
     explicit_user_location: Optional[bool] = False
+    needs_clarification: Optional[bool] = False
+    parse_notes: Optional[str] = None
     location_warning: Optional[str] = None
     saved_location_label: Optional[str] = None
     resolved_location: Optional[Dict[str, Any]] = None
@@ -603,6 +610,13 @@ async def chat_with_llm(request: ChatRequest):
             if fast_path_fallback_reason:
                 parse_kwargs["disable_deterministic_fallback"] = True
                 parse_kwargs["fallback_reason"] = fast_path_fallback_reason
+            elif (
+                route.get("route") == "complex_schedule_command"
+                or route.get("travel_intent")
+                or route.get("reason") in {"multi_activity_generation", "multi_activity_redesign", "natural_edit_wording"}
+            ):
+                parse_kwargs["disable_deterministic_fallback"] = True
+                parse_kwargs["fallback_reason"] = "complex_or_travel_intent"
             parsed = scheduling_engine.parse_text_request(**parse_kwargs)
         jlog("TIMER", f"module_a_total_seconds={elapsed_seconds(module_a_started)}")
         parsed.setdefault("preferences", {})
@@ -616,10 +630,21 @@ async def chat_with_llm(request: ChatRequest):
             if not parsed["preferences"].get("day_end") and parsed["preferences"].get("day_end_time"):
                 parsed["preferences"]["day_end"] = parsed["preferences"]["day_end_time"]
         parsed["preferences"]["allow_clash"] = bool(request.allow_clash)
-        parsed["preferences"]["accurate_travel_time"] = bool(request.accurate_travel_time)
+        travel_intent = bool(
+            parsed["preferences"].get("travel_intent")
+            or route.get("travel_intent")
+        )
+        parsed["preferences"]["travel_intent"] = travel_intent
+        parsed["preferences"]["accurate_travel_time"] = bool(request.accurate_travel_time or travel_intent)
         parsed["preferences"]["module_0_route"] = route.get("route")
         parsed["preferences"]["module_0_reason"] = route.get("reason")
         parsed["preferences"]["latest_request"] = request.message
+        if current_envelope is not None:
+            current_envelope.setdefault("preferences", {})
+            current_envelope["preferences"]["travel_intent"] = bool(
+                current_envelope["preferences"].get("travel_intent")
+                or parsed["preferences"].get("travel_intent")
+            )
         
         intent = parsed.get("intent", "chat")
         reply = parsed.get("reply", "I've processed your request.")

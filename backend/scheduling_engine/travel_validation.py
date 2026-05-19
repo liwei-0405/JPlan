@@ -23,12 +23,41 @@ class TravelValidationMixin:
         preferences = updated.setdefault("preferences", {})
         if hasattr(self, "_normalize_day_boundary_preferences"):
             self._normalize_day_boundary_preferences(preferences)
+        travel_intent = bool(preferences.get("travel_intent") or updated.get("travel_intent"))
         accurate = self._resolve_accurate_travel_time(preferences, updated)
+        if travel_intent:
+            accurate = True
         updated["accurate_travel_time"] = accurate
         preferences["accurate_travel_time"] = accurate
+        updated["travel_intent"] = travel_intent
+        preferences["travel_intent"] = travel_intent
         updated.setdefault("schedule_status", updated.get("status") or "ok")
 
         if not accurate:
+            if travel_intent:
+                location_requests = self._location_resolution_requests(
+                    updated,
+                    saved_locations,
+                    include_start_location=False,
+                )
+                if location_requests:
+                    updated["schedule_status"] = "location_pending"
+                    updated["status"] = "location_pending"
+                    updated["travel_validation_status"] = "pending_locations"
+                    updated["location_resolution_requests"] = location_requests
+                    updated.setdefault("validation_issues", [])
+                    pending_titles = ", ".join(req.get("title", "activity") for req in location_requests[:5])
+                    updated["validation_issues"] = list(dict.fromkeys(updated["validation_issues"] + [
+                        f"Travel-aware planning needs exact location confirmation for {pending_titles}."
+                    ]))
+                    updated.setdefault("explanations", [])
+                    updated["explanations"] = self._merge_explanations(
+                        updated.get("explanations", []),
+                        ["I drafted the plan, but exact travel validation is pending location confirmation."],
+                    )
+                    self._mark_transition_estimate_source(updated, "heuristic_pending_locations")
+                    jlog("TIMER", f"accurate_travel_validation_seconds={time.perf_counter() - validation_started:.2f}", None)
+                    return updated
             updated["travel_validation_status"] = "not_requested"
             updated["location_resolution_requests"] = []
             self._mark_transition_estimate_source(updated, "heuristic")
@@ -76,9 +105,18 @@ class TravelValidationMixin:
             repair_meta = self._attempt_route_repair(updated, saved_locations, validation["route_conflicts"])
             if repair_meta:
                 validation["route_repair_attempted"] = bool(repair_meta.get("route_repair_attempted", True))
-                validation["pending_repair_suggestions"] = repair_meta.get("pending_repair_suggestions", [])
+                pending_suggestions = repair_meta.get("pending_repair_suggestions", [])
+                repaired_validation = repair_meta.get("repaired_validation")
+                repaired_envelope = repair_meta.get("repaired_envelope")
+                apply_repaired = bool(
+                    repaired_validation
+                    and repaired_envelope
+                    and not pending_suggestions
+                    and not repaired_validation.get("route_conflicts")
+                )
+                validation["pending_repair_suggestions"] = pending_suggestions
                 validation["unfit_activities"] = repair_meta.get("unfit_activities", [])
-                validation["route_repair_actions"] = repair_meta.get("route_repair_actions", [])
+                validation["route_repair_actions"] = repair_meta.get("route_repair_actions", []) if apply_repaired else []
                 validation["route_efficiency"] = repair_meta.get("route_efficiency", {})
                 for key in (
                     "route_total_before",
@@ -92,15 +130,11 @@ class TravelValidationMixin:
                 ):
                     if key in repair_meta.get("route_efficiency", {}):
                         validation[key] = repair_meta["route_efficiency"][key]
-                validation["travel_validation_status"] = repair_meta.get(
-                    "travel_validation_status",
-                    validation.get("travel_validation_status"),
-                )
-                if repair_meta.get("start_route_summary"):
-                    validation["start_route_summary"] = repair_meta.get("start_route_summary")
-                repaired_validation = repair_meta.get("repaired_validation")
-                repaired_envelope = repair_meta.get("repaired_envelope")
-                if repaired_validation and repaired_envelope and not validation["pending_repair_suggestions"]:
+                if apply_repaired:
+                    validation["travel_validation_status"] = repair_meta.get(
+                        "travel_validation_status",
+                        validation.get("travel_validation_status"),
+                    )
                     validation["schedule_blocks"] = repaired_validation.get(
                         "schedule_blocks",
                         repaired_envelope.get("schedule_blocks", validation.get("schedule_blocks", [])),
@@ -118,6 +152,10 @@ class TravelValidationMixin:
                     )
                     if repaired_validation.get("start_route_summary"):
                         validation["start_route_summary"] = repaired_validation.get("start_route_summary")
+                elif pending_suggestions:
+                    validation["travel_validation_status"] = "repair_suggestion_pending"
+                elif repair_meta.get("travel_validation_status") == "partial_feasible_with_unfit":
+                    validation["travel_validation_status"] = "partial_feasible_with_unfit"
         updated["location_resolution_requests"] = []
         updated["travel_validation_status"] = validation["travel_validation_status"]
         updated["route_conflicts"] = validation.get("route_conflicts", [])
@@ -523,7 +561,10 @@ class TravelValidationMixin:
             validation.setdefault("route_conflicts", [])
             validation["route_conflicts"].extend(semantic_violations)
             validation["travel_validation_status"] = "route_conflict"
-        suggestions = self._protected_repair_suggestions_from_conflicts(envelope, route_conflicts)
+        suggestions = self._protected_repair_suggestions_from_conflicts(
+            envelope,
+            validation.get("route_conflicts", []),
+        )
         unfit = self._repair_unfit_activities(
             active,
             list(planned.get("unscheduled_activities", [])) + conflict_unfit,
@@ -796,6 +837,16 @@ class TravelValidationMixin:
             if from_end is not None and required > 0:
                 suggested_start = max(target["_repair_start"], from_end + required)
             suggested_end = suggested_start + duration
+            if not self._repair_suggestion_would_change(target, suggested_start, suggested_end):
+                jlog(
+                    "PENDING_REPAIR",
+                    (
+                        f"title={target.get('title') or target_title} "
+                        f"from={format_clock(target['_repair_start'])} to={format_clock(suggested_start)}"
+                    ),
+                    "SKIP_NOOP",
+                )
+                continue
             suggestion = {
                 "id": f"suggestion_{len(suggestions) + 1}",
                 "type": "move_activity",
@@ -811,6 +862,7 @@ class TravelValidationMixin:
                 "reason": f"Travel from {conflict.get('from_activity') or conflict.get('from')} takes about {required} minutes",
                 "impact": "minimal_shift",
                 "requires_user_confirmation": True,
+                "would_change": True,
                 "schedule_version": int(envelope.get("version") or 1),
                 "route_conflict_index": index - 1,
             }
@@ -849,6 +901,13 @@ class TravelValidationMixin:
             suggested_start = max(target["_repair_start"], from_end + required)
             suggested_end = suggested_start + duration
             title = target.get("title") or target_title or "activity"
+            if not self._repair_suggestion_would_change(target, suggested_start, suggested_end):
+                jlog(
+                    "PENDING_REPAIR",
+                    f"title={title} from={format_clock(target['_repair_start'])} to={format_clock(suggested_start)}",
+                    "SKIP_NOOP",
+                )
+                continue
             protection = self._activity_repair_protection(target)
             if protection == "protected_social":
                 reason = f"Travel from {conflict.get('from_activity') or conflict.get('from')} takes about {required} minutes"
@@ -869,6 +928,7 @@ class TravelValidationMixin:
                 "reason": reason,
                 "impact": "minimal_shift",
                 "requires_user_confirmation": True,
+                "would_change": True,
                 "schedule_version": int(envelope.get("version") or 1),
                 "route_conflict_index": index - 1,
                 "repair_protection": protection,
@@ -878,6 +938,34 @@ class TravelValidationMixin:
                 seen_ids.add(activity_id)
             jlog("PENDING_REPAIR", f"id={suggestion['id']} action=created title={title}", None)
         return suggestions
+
+    def _repair_suggestion_would_change(
+        self,
+        target: Dict[str, Any],
+        suggested_start: Optional[int],
+        suggested_end: Optional[int],
+    ) -> bool:
+        if suggested_start is None or suggested_end is None:
+            return False
+        return not (
+            int(target.get("_repair_start") or 0) == int(suggested_start)
+            and int(target.get("_repair_end") or 0) == int(suggested_end)
+        )
+
+    def _pending_suggestion_would_change(self, suggestion: Dict[str, Any]) -> bool:
+        if suggestion.get("would_change") is False:
+            return False
+        old_start = parse_clock(suggestion.get("from") or "")
+        old_end = parse_clock(suggestion.get("from_end") or "")
+        new_start = parse_clock(suggestion.get("to") or "")
+        new_end = parse_clock(suggestion.get("to_end") or "")
+        if old_start is None or new_start is None:
+            return bool(suggestion.get("would_change"))
+        if old_end is None:
+            old_end = int(suggestion.get("from_end_minutes") or -1)
+        if new_end is None:
+            new_end = int(suggestion.get("to_end_minutes") or -2)
+        return not (old_start == new_start and old_end == new_end)
 
     def _protected_semantic_violations(
         self,
@@ -1069,6 +1157,12 @@ class TravelValidationMixin:
                 start_route_summary = {
                     "start_location": start_entry.get("start_location") or "Starting point",
                     "first_physical_event": first.get("title"),
+                    "first_physical_event_location": (
+                        start_entry.get("to_location")
+                        or first.get("location_label")
+                        or first.get("location")
+                        or first.get("title")
+                    ),
                     "first_physical_event_start": format_clock(first_start),
                     "travel_duration_minutes": route_minutes,
                     "leave_by": format_clock(leave_by),
@@ -1321,6 +1415,26 @@ class TravelValidationMixin:
                 "envelope": updated,
             }
 
+        if not self._pending_suggestion_would_change(suggestion):
+            updated = deepcopy(envelope)
+            updated["pending_repair_suggestions"] = []
+            jlog(
+                "PENDING_REPAIR",
+                (
+                    f"title={suggestion.get('title') or 'activity'} "
+                    f"from={suggestion.get('from')} to={suggestion.get('to')}"
+                ),
+                "SKIP_NOOP",
+            )
+            jlog("PENDING_REPAIR", f"id={suggestion_id} action=cleared", None)
+            return {
+                "handled": True,
+                "reply": "That repair suggestion no longer changes the schedule, so I cleared it and kept the current plan unchanged.",
+                "reply_status": "warning",
+                "reply_reason": "pending_repair_noop_cleared",
+                "envelope": updated,
+            }
+
         jlog("PENDING_REPAIR", f"id={suggestion_id} action=accepted", None)
         operation = {
             "op": "update",
@@ -1340,6 +1454,7 @@ class TravelValidationMixin:
         updated_envelope = result.get("envelope") or envelope
         if updated_envelope.get("travel_validation_status") != "route_conflict" and not updated_envelope.get("route_conflicts"):
             updated_envelope["pending_repair_suggestions"] = []
+            jlog("PENDING_REPAIR", f"id={suggestion_id} action=cleared", None)
             reply = f"I applied the repair suggestion and moved {suggestion.get('title')} to {suggestion.get('to')}."
             reply_status = "success"
             reply_reason = "pending_repair_accepted"
@@ -1373,17 +1488,24 @@ class TravelValidationMixin:
         self,
         envelope: Dict[str, Any],
         saved_locations: List[Dict[str, Any]],
+        include_start_location: bool = True,
     ) -> List[Dict[str, Any]]:
         requests: List[Dict[str, Any]] = []
         seen_ids: set[str] = set()
         grouped_by_location: Dict[str, Dict[str, Any]] = {}
+        skipped_not_required: List[str] = []
         blocks = list(envelope.get("schedule_blocks") or envelope.get("activities") or [])
         first_physical = self._first_physical_activity_index(blocks)
-        if first_physical is not None and not self._start_location_coordinate_resolution(envelope.get("preferences") or {}, saved_locations)[0]:
+        if include_start_location and first_physical is not None and not self._start_location_coordinate_resolution(envelope.get("preferences") or {}, saved_locations)[0]:
             requests.append(self._start_location_resolution_request(envelope.get("preferences") or {}))
         for index, block in enumerate(blocks):
             block_type = block.get("block_type") or block.get("type")
             if block_type and block_type != "activity":
+                continue
+            if not self._block_requires_travel_coordinate(block):
+                title = block.get("title")
+                if title:
+                    skipped_not_required.append(str(title))
                 continue
             if not self._activity_needs_coordinate_resolution(block, saved_locations):
                 continue
@@ -1428,6 +1550,16 @@ class TravelValidationMixin:
             requests.append(request)
             if location_key:
                 grouped_by_location[location_key] = request
+        requested_titles = [
+            str(request.get("title") or request.get("current_guess") or "activity")
+            for request in requests
+            if request.get("request_type") != "start_location"
+        ]
+        jlog(
+            "LOCATION_REQUESTS",
+            f"requested={requested_titles} skipped_not_required={skipped_not_required}",
+            "SUMMARY",
+        )
         return requests
 
     def _start_location_resolution_request(self, preferences: Dict[str, Any]) -> Dict[str, Any]:
@@ -1541,33 +1673,33 @@ class TravelValidationMixin:
         if saved:
             return False
         status = clean_title(block.get("location_status") or "")
+        semantic_status = clean_title(block.get("location_resolution_status") or "").replace(" ", "_").replace("-", "_")
         category = clean_title(block.get("location_category") or "")
+        if semantic_status in {"not_required", "no_location_required"}:
+            return False
+        if semantic_status in {"needs_coordinates", "ambiguous", "missing_coordinates"}:
+            return True
         if not block.get("location"):
-            return status in {"needs_resolution", "fallback_used", "unresolved"} and category in {
-                "meal_place",
-                "supermarket",
-                "fitness_center",
-                "workplace",
-                "institution",
-                "campus_area",
-                "office",
-                "library",
-            }
+            return status in {"needs_resolution", "fallback_used", "unresolved", "resolved_default"} or bool(block.get("travel_required") is True)
         if status in {"needs_resolution", "fallback_used", "unresolved"}:
             return True
         return True
 
     def _block_requires_travel_coordinate(self, block: Dict[str, Any]) -> bool:
         status = clean_title(block.get("location_status") or "")
+        semantic_status = clean_title(block.get("location_resolution_status") or "").replace(" ", "_").replace("-", "_")
+        location_kind = clean_title(block.get("location_kind") or "").replace(" ", "_").replace("-", "_")
         category = clean_title(block.get("location_category") or "")
         raw_travel_required = block.get("travel_required")
         if raw_travel_required is False:
             return False
         if isinstance(raw_travel_required, str) and raw_travel_required.strip().lower() in {"0", "false", "no", "off"}:
             return False
-        if status in {"not_required", "no_location_required"}:
+        if status in {"not_required", "no_location_required"} or semantic_status in {"not_required", "no_location_required"}:
             return False
-        if category in {"home_or_online", "none"}:
+        if location_kind in {"no_location_required", "online"}:
+            return False
+        if category in {"home_or_online", "none", "no_location"}:
             return False
         return True
 
@@ -1796,6 +1928,11 @@ class TravelValidationMixin:
                     start_route_summary = {
                         "start_location": start_label,
                         "first_physical_event": right.get("title"),
+                        "first_physical_event_location": (
+                            right.get("location_label")
+                            or right.get("location")
+                            or right.get("title")
+                        ),
                         "first_physical_event_start": format_clock(right_start),
                         "travel_duration_minutes": route_minutes,
                         "leave_by": format_clock(leave_by),
@@ -2115,9 +2252,12 @@ class TravelValidationMixin:
             )
 
         transition = deepcopy(transition_template) if transition_template else {}
+        source_activity_id = left.get("stable_activity_id") or left.get("id")
+        destination_activity_id = right.get("stable_activity_id") or right.get("id")
         transition.update({
             "block_type": "transition",
             "type": "travel",
+            "id": transition.get("id") or (f"travel-{source_activity_id}-{destination_activity_id}" if source_activity_id and destination_activity_id else None),
             "title": transition.get("title") or f"Travel to {right.get('location') or right.get('title')}",
             "start": format_clock(route_start),
             "end": format_clock(right_start),
@@ -2132,6 +2272,13 @@ class TravelValidationMixin:
             "route_duration_minutes": route_minutes,
             "from_coordinate": {"latitude": left_coord[0], "longitude": left_coord[1]},
             "to_coordinate": {"latitude": right_coord[0], "longitude": right_coord[1]},
+            "source_activity_id": source_activity_id,
+            "destination_activity_id": destination_activity_id,
+            "related_activity_ids": [
+                activity_id
+                for activity_id in (source_activity_id, destination_activity_id)
+                if activity_id
+            ],
             "reason": "Route-based travel duration validated after draft construction",
         })
         transition.pop("is_tight", None)

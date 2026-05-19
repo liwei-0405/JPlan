@@ -37,23 +37,46 @@ export function TimelineGrid({
     [activities],
   );
 
-  const groups = useMemo(() => buildCollisionGroups(visibleActivities), [visibleActivities]);
-  const collidingIds = useMemo(() => getCollidingIds(visibleActivities), [visibleActivities]);
+  const startRouteRows = useMemo(
+    () => visibleActivities.filter(isDisplayOnlyStartRouteBlock),
+    [visibleActivities],
+  );
+  const collisionActivities = useMemo(
+    () => visibleActivities.filter((activity) => !isDisplayOnlyStartRouteBlock(activity)),
+    [visibleActivities],
+  );
+  const groups = useMemo(() => buildCollisionGroups(collisionActivities), [collisionActivities]);
+  const collidingIds = useMemo(() => getCollidingIds(collisionActivities), [collisionActivities]);
+  const timelineRows = useMemo(
+    () => [
+      ...groups.map((group) => ({ kind: "group" as const, start: group.groupStart, group })),
+      ...startRouteRows.map((activity) => ({
+        kind: "start_route" as const,
+        start: timeToMinutes(activity.startTime || activity.start || "00:00"),
+        activity,
+      })),
+    ].sort((a, b) => a.start - b.start),
+    [groups, startRouteRows],
+  );
 
   if (visibleActivities.length === 0) return null;
 
   return (
     <div className="space-y-2">
-      {groups.map((group, gi) => (
-        <CollisionGroupRow
-          key={gi}
-          group={group}
-          collidingIds={collidingIds}
-          interactive={interactive}
-          onActivityClick={onActivityClick}
-          showEditIcon={showEditIcon}
-          compact={compact}
-        />
+      {timelineRows.map((row, index) => (
+        row.kind === "start_route" ? (
+          <SupportTimelineBlock key={row.activity.id || `start-route-${index}`} activity={row.activity} kind="start_route" />
+        ) : (
+          <CollisionGroupRow
+            key={index}
+            group={row.group}
+            collidingIds={collidingIds}
+            interactive={interactive}
+            onActivityClick={onActivityClick}
+            showEditIcon={showEditIcon}
+            compact={compact}
+          />
+        )
       ))}
     </div>
   );
@@ -327,13 +350,17 @@ function ActivityCard({
   );
 }
 
-type TimelineBlockKind = "activity" | "travel" | "buffer" | "free_time";
+type TimelineBlockKind = "activity" | "travel" | "buffer" | "free_time" | "start_route";
 
 function normalizedBlockText(value: unknown): string {
   return String(value || "").trim().toLowerCase();
 }
 
 function getTimelineBlockKind(activity: ActivityBlock): TimelineBlockKind {
+  if (isDisplayOnlyStartRouteBlock(activity)) {
+    return "start_route";
+  }
+
   const title = normalizedBlockText(activity.title);
   const blockType = normalizedBlockText(activity.block_type || activity.type);
   const category = normalizedBlockText((activity as ActivityBlock & { category?: string; block_category?: string }).category || (activity as ActivityBlock & { category?: string; block_category?: string }).block_category);
@@ -400,6 +427,9 @@ function dedupeSupportBlocks(activities: ActivityBlock[]): ActivityBlock[] {
 }
 
 function getSupportDedupeKey(activity: ActivityBlock, kind: TimelineBlockKind): string | null {
+  if (kind === "start_route") {
+    return `start_route:${activity.id || activity.title || activity.startTime || activity.start}`;
+  }
   if (kind === "travel") {
     const destination = normalizedTravelDestination(activity);
     const end = normalizedBlockText(activity.endTime || activity.end);
@@ -413,6 +443,10 @@ function getSupportDedupeKey(activity: ActivityBlock, kind: TimelineBlockKind): 
     return `buffer:${start}:${end}`;
   }
   return null;
+}
+
+function isDisplayOnlyStartRouteBlock(activity: ActivityBlock): boolean {
+  return Boolean(activity.is_start_route || activity.display_only || activity.type === "start_route" || activity.block_type === "start_route");
 }
 
 function normalizedTravelDestination(activity: ActivityBlock): string {
@@ -446,20 +480,24 @@ function SupportTimelineBlock({ activity, kind }: { activity: ActivityBlock; kin
   const et = activity.endTime || activity.end;
   const duration = activity.duration_minutes || getDurationMinutes(activity);
   const destination = activity.title.replace(/^travel to\s+/i, "").trim();
-  const label = activity.display_label || (kind === "travel"
+  const label = activity.display_label || (kind === "start_route"
+    ? activity.title
+    : kind === "travel"
     ? `${duration} min travel${destination ? ` to ${destination}` : ""}`
     : `${duration} min buffer`);
 
-  const colorClass = kind === "travel"
+  const colorClass = kind === "start_route"
+    ? "border-amber-200 bg-amber-50/70 text-amber-900"
+    : kind === "travel"
     ? "border-indigo-200 bg-indigo-50/70 text-indigo-800"
     : "border-emerald-200 bg-emerald-50/60 text-emerald-800";
-  const iconClass = kind === "travel" ? "text-indigo-500" : "text-emerald-500";
+  const iconClass = kind === "start_route" ? "text-amber-500" : kind === "travel" ? "text-indigo-500" : "text-emerald-500";
 
   return (
     <div className={`rounded-xl border px-3 py-2 shadow-sm ${colorClass}`}>
       <div className="flex items-center justify-between gap-3">
         <span className="flex items-center gap-2 text-xs font-semibold">
-          {kind === "travel" ? <MapPin className={`h-3.5 w-3.5 ${iconClass}`} /> : <Clock className={`h-3.5 w-3.5 ${iconClass}`} />}
+          {kind === "buffer" ? <Clock className={`h-3.5 w-3.5 ${iconClass}`} /> : <MapPin className={`h-3.5 w-3.5 ${iconClass}`} />}
           {label}
         </span>
         <span className="text-xs font-medium opacity-75 whitespace-nowrap">

@@ -1,4 +1,5 @@
 import os
+import json
 import sys
 import time
 from copy import deepcopy
@@ -186,7 +187,12 @@ class SlowThenSuccessParserModels:
               "intent": "add",
               "transcription": "Generate a busy workday.",
               "date": "2026-05-02",
-              "operations": [{"op": "add", "title": "Retry Meeting", "timing_mode": "fixed", "fixed_start": "09:00", "duration_minutes": 60}],
+              "operations": [
+                {"op": "add", "title": "Retry Meeting", "timing_mode": "fixed", "fixed_start": "09:00", "duration_minutes": 60},
+                {"op": "add", "title": "Lunch", "timing_mode": "fixed", "fixed_start": "12:30", "duration_minutes": 60},
+                {"op": "add", "title": "Gym", "timing_mode": "flexible", "duration_minutes": 45},
+                {"op": "add", "title": "Grocery", "timing_mode": "flexible", "duration_minutes": 45}
+              ],
               "activities": [],
               "preferences": {}
             }
@@ -215,7 +221,12 @@ class FallbackModelParserModels:
                   "intent": "add",
                   "transcription": "Generate a busy workday.",
                   "date": "2026-05-02",
-                  "operations": [{"op": "add", "title": "Fallback Meeting", "timing_mode": "fixed", "fixed_start": "09:00", "duration_minutes": 60}],
+                  "operations": [
+                    {"op": "add", "title": "Fallback Meeting", "timing_mode": "fixed", "fixed_start": "09:00", "duration_minutes": 60},
+                    {"op": "add", "title": "Lunch", "timing_mode": "fixed", "fixed_start": "12:30", "duration_minutes": 60},
+                    {"op": "add", "title": "Gym", "timing_mode": "flexible", "duration_minutes": 45},
+                    {"op": "add", "title": "Grocery", "timing_mode": "flexible", "duration_minutes": 45}
+                  ],
                   "activities": [],
                   "preferences": {}
                 }
@@ -2308,6 +2319,42 @@ def test_location_normalizer_keeps_explicit_grocery_at_home():
     assert grocery["explicit_user_location"] is True
 
 
+def test_semantic_contradiction_preserves_explicit_non_home_location():
+    engine = SchedulingEngine(DummyClient())
+    parsed = {
+        "intent": "add",
+        "reply": "Draft created.",
+        "transcription": "doctor appointment at Sunway Medical",
+        "date": "2026-05-02",
+        "preferences": {"accurate_travel_time": False},
+        "operations": [
+            {
+                "op": "add",
+                "title": "Doctor appointment",
+                "duration_minutes": 60,
+                "raw_location_text": "Sunway Medical",
+                "location_kind": "home",
+                "location_category": "home",
+                "explicit_user_location": True,
+                "travel_required": False,
+                "location_resolution_status": "resolved_coordinates",
+            }
+        ],
+    }
+
+    envelope = engine.build_schedule_response(
+        parsed=parsed,
+        current_schedule=None,
+        latest_request=parsed["transcription"],
+    )["schedule_data"]
+    doctor = _activity_by_title(envelope, "Doctor appointment")
+
+    assert doctor["location"] == "Sunway Medical"
+    assert doctor["location_kind"] == "exact_named_place"
+    assert doctor["location_status"] == "needs_resolution"
+    assert doctor["travel_required"] is True
+
+
 def test_location_normalizer_lunch_near_campus_is_explicit_campus_area():
     engine = SchedulingEngine(DummyClient())
 
@@ -2844,9 +2891,205 @@ def test_accurate_travel_off_keeps_heuristic_without_location_pending():
     envelope = engine.build_schedule_response(parsed, None, "Fit in a grocery shopping trip.")["schedule_data"]
 
     assert envelope["accurate_travel_time"] is False
+    assert envelope["preferences"]["accurate_travel_time"] is False
     assert envelope["travel_validation_status"] == "not_requested"
     assert envelope["location_resolution_requests"] == []
     assert envelope["status"] != "location_pending"
+
+
+def test_travel_intent_with_accurate_off_returns_physical_location_requests():
+    engine = SchedulingEngine(DummyClient(), travel_service=FakeTravelService())
+    parsed = {
+        "intent": "add",
+        "reply": "Draft created.",
+        "transcription": (
+            "Plan my day for next Tuesday. I have a doctor appointment from 9:00 AM to 10:00 AM "
+            "at Sunway Medical, a lunch meeting at 12:30 PM in SS15, and a dinner with family "
+            "at 7:30 PM at home. I still need focused work, grocery shopping, a pharmacy stop, "
+            "gym, and prepare documents. Please make it realistic with travel time."
+        ),
+        "date": "2026-05-26",
+        "preferences": {
+            "accurate_travel_time": False,
+            "travel_intent": True,
+            "default_start_location": {
+                "label": "home",
+                "display_name": "Home",
+                "category": "home",
+                "latitude": 2.9,
+                "longitude": 101.6,
+            },
+        },
+        "operations": [
+            {
+                "op": "add",
+                "title": "Doctor appointment",
+                "timing_mode": TimingMode.FIXED,
+                "fixed_start": "09:00",
+                "duration_minutes": 60,
+                "raw_location_text": "Sunway Medical",
+                "location_kind": "exact_named_place",
+                "location_category": "medical",
+                "explicit_user_location": True,
+                "travel_required": True,
+                "location_resolution_status": "needs_coordinates",
+            },
+            {
+                "op": "add",
+                "title": "Lunch meeting",
+                "timing_mode": TimingMode.FIXED,
+                "fixed_start": "12:30",
+                "duration_minutes": 60,
+                "raw_location_text": "SS15",
+                "location_kind": "area_only",
+                "location_category": "meal_place",
+                "explicit_user_location": True,
+                "travel_required": True,
+                "location_resolution_status": "needs_coordinates",
+            },
+            {
+                "op": "add",
+                "title": "Dinner with family",
+                "timing_mode": TimingMode.FIXED,
+                "fixed_start": "19:30",
+                "duration_minutes": 60,
+                "raw_location_text": "home",
+                "location_kind": "home",
+                "location_category": "home",
+                "explicit_user_location": True,
+                "travel_required": True,
+                "location_resolution_status": "resolved_coordinates",
+            },
+            {
+                "op": "add",
+                "title": "Prepare documents",
+                "timing_mode": TimingMode.RELATIVE,
+                "anchor_relation": {"kind": "before", "target_title": "Doctor appointment"},
+                "duration_minutes": 30,
+                "location_kind": "no_location_required",
+                "location_category": "no_location",
+                "travel_required": False,
+                "location_resolution_status": "not_required",
+                "no_location_reason": "document_preparation",
+            },
+            {
+                "op": "add",
+                "title": "Focused work",
+                "duration_minutes": 120,
+                "location_kind": "no_location_required",
+                "location_category": "no_location",
+                "travel_required": False,
+                "location_resolution_status": "not_required",
+                "no_location_reason": "focused_work",
+            },
+            {
+                "op": "add",
+                "title": "Grocery shopping",
+                "duration_minutes": 45,
+                "location_kind": "category_only",
+                "location_category": "supermarket",
+                "travel_required": True,
+                "location_resolution_status": "needs_coordinates",
+            },
+            {
+                "op": "add",
+                "title": "Pharmacy stop",
+                "duration_minutes": 15,
+                "location_kind": "category_only",
+                "location_category": "pharmacy",
+                "travel_required": True,
+                "location_resolution_status": "needs_coordinates",
+            },
+            {
+                "op": "add",
+                "title": "Gym",
+                "duration_minutes": 45,
+                "location_kind": "category_only",
+                "location_category": "fitness_center",
+                "travel_required": True,
+                "location_resolution_status": "needs_coordinates",
+            },
+        ],
+    }
+    saved_locations = [
+        {
+            "label": "home",
+            "display_name": "Home",
+            "category": "home",
+            "latitude": 2.9,
+            "longitude": 101.6,
+        }
+    ]
+
+    envelope = engine.build_schedule_response(
+        parsed,
+        None,
+        parsed["transcription"],
+        saved_locations=saved_locations,
+    )["schedule_data"]
+
+    requested = {request["title"] for request in envelope["location_resolution_requests"]}
+    assert envelope["accurate_travel_time"] is True
+    assert envelope["preferences"]["accurate_travel_time"] is True
+    assert envelope["travel_validation_status"] == "pending_locations"
+    assert requested == {
+        "Doctor appointment",
+        "Lunch meeting",
+        "Grocery shopping",
+        "Pharmacy stop",
+        "Gym",
+    }
+    assert _activity_by_title(envelope, "Doctor appointment")["location"] == "Sunway Medical"
+    assert _activity_by_title(envelope, "Prepare documents")["travel_required"] is False
+    assert _activity_by_title(envelope, "Pharmacy stop")["location_category"] == "pharmacy"
+
+
+def test_module_8_location_pending_reply_lists_all_short_requests():
+    engine = SchedulingEngine(DummyClient())
+    requested_titles = [
+        "Grocery shopping",
+        "Pharmacy stop",
+        "Doctor appointment",
+        "Lunch meeting",
+        "Gym",
+    ]
+
+    reply = engine.compose_result_reply(
+        latest_request="Plan my day with travel time.",
+        parsed={"operations": []},
+        result={
+            "envelope": {
+                "date": "2026-05-26",
+                "status": "location_pending",
+                "schedule_status": "location_pending",
+                "location_resolution_requests": [{"title": title} for title in requested_titles],
+                "schedule_blocks": [],
+                "activities": [],
+            }
+        },
+        allow_clash=False,
+    )
+
+    assert reply["reply_status"] == "location_pending"
+    for title in requested_titles:
+        assert title in reply["reply"]
+
+
+def test_location_summary_marks_resolved_home_as_resolved(capsys):
+    engine = SchedulingEngine(DummyClient())
+
+    engine._log_location_and_timing_summary([
+        {
+            "op": "add",
+            "title": "Dinner with family",
+            "location_category": "home",
+            "location_kind": "home",
+            "travel_required": True,
+            "location_resolution_status": "resolved_coordinates",
+        }
+    ])
+
+    assert "Dinner with family -> home (resolved)" in capsys.readouterr().out
 
 
 def test_day_boundary_preferences_are_used_by_module_c():
@@ -2962,6 +3205,7 @@ def test_default_start_location_calculates_route_to_first_physical_event():
     assert not any(block.get("block_type") == "transition" for block in updated["schedule_blocks"])
     assert updated["start_route_summary"]["start_location"] == "Home"
     assert updated["start_route_summary"]["first_physical_event"] == "Client Meeting"
+    assert updated["start_route_summary"]["first_physical_event_location"] == "office"
     assert updated["start_route_summary"]["leave_by"] == "08:43 AM"
     assert fake_travel.route_calls == 1
 
@@ -3356,6 +3600,7 @@ def test_accurate_travel_validation_recognizes_type_only_activity_blocks():
     updated = engine._apply_accurate_travel_if_requested(envelope, saved_locations)
 
     assert updated["start_route_summary"]["first_physical_event"] == "Client Meeting"
+    assert updated["start_route_summary"]["first_physical_event_location"] == "Mid Valley"
     assert updated["travel_validation_status"] in {"validated", "fallback_used"}
     travel_blocks = [
         block for block in updated["schedule_blocks"]
@@ -4238,6 +4483,146 @@ def test_pending_repair_yes_confirmation_applies_suggestion_and_reruns_validatio
     assert updated["route_conflicts"] == []
 
 
+def test_noop_pending_repair_suggestion_is_skipped(capsys):
+    engine = SchedulingEngine(DummyClient(), travel_service=FakeTravelService(route_minutes=30))
+    envelope = _custom_envelope([
+        {
+            "op": "add",
+            "title": "Lunch meeting",
+            "timing_mode": TimingMode.FIXED,
+            "fixed_start": "12:30",
+            "duration_minutes": 60,
+            "location": "SS15",
+        }
+    ])
+    conflict = {
+        "from_activity": "Previous stop",
+        "to_activity": "Lunch meeting",
+        "to_start": "12:30 PM",
+        "from_end": "12:00 PM",
+        "required_route_minutes": 30,
+        "required_travel_minutes": 30,
+    }
+
+    suggestions = engine._protected_repair_suggestions_from_conflicts(envelope, [conflict])
+
+    assert suggestions == []
+    assert "[JPLAN][PENDING_REPAIR][SKIP_NOOP]" in capsys.readouterr().out
+
+
+def test_pending_repair_keeps_current_chronology(monkeypatch):
+    engine = SchedulingEngine(DummyClient(), travel_service=FakeTravelService(route_minutes=30))
+    current_blocks = [
+        {"id": "current", "block_type": "activity", "title": "Grocery shopping", "start": "07:30 AM", "end": "08:15 AM"}
+    ]
+    repaired_blocks = [
+        {"id": "repaired", "block_type": "activity", "title": "Doctor appointment", "start": "09:00 AM", "end": "10:00 AM"}
+    ]
+    envelope = {
+        "date": "2026-05-26",
+        "status": "ok",
+        "schedule_status": "ok",
+        "accurate_travel_time": True,
+        "preferences": {"accurate_travel_time": True},
+        "activities": current_blocks,
+        "schedule_blocks": current_blocks,
+        "unscheduled_activities": [],
+        "explanations": [],
+    }
+    current_start_route = {"first_physical_event": "Grocery shopping", "leave_by": "07:25 AM"}
+    repaired_start_route = {"first_physical_event": "Doctor appointment", "leave_by": "08:25 AM"}
+
+    monkeypatch.setattr(engine, "_location_resolution_requests", lambda *args, **kwargs: [])
+    monkeypatch.setattr(engine, "_validate_routes_with_service", lambda *args, **kwargs: {
+        "travel_validation_status": "route_conflict",
+        "schedule_blocks": current_blocks,
+        "route_conflicts": [{"reason_code": "not_enough_travel_time", "reason": "Needs travel"}],
+        "updated_transition_count": 0,
+        "start_route_summary": current_start_route,
+    })
+    monkeypatch.setattr(engine, "_attempt_route_repair", lambda *args, **kwargs: {
+        "route_repair_attempted": True,
+        "pending_repair_suggestions": [{"id": "suggestion_1", "title": "Doctor appointment", "would_change": True}],
+        "unfit_activities": [],
+        "travel_validation_status": "repair_suggestion_pending",
+        "route_repair_actions": [{"title": "Gym", "from": "01:30 PM", "to": "04:05 PM"}],
+        "route_efficiency": {},
+        "repaired_envelope": {"activities": repaired_blocks, "schedule_blocks": repaired_blocks},
+        "repaired_validation": {
+            "schedule_blocks": repaired_blocks,
+            "route_conflicts": [],
+            "updated_transition_count": 1,
+            "start_route_summary": repaired_start_route,
+        },
+        "start_route_summary": repaired_start_route,
+    })
+
+    updated = engine._apply_accurate_travel_if_requested(envelope, [])
+
+    assert updated["travel_validation_status"] == "repair_suggestion_pending"
+    assert updated["schedule_blocks"] == current_blocks
+    assert updated["start_route_summary"] == current_start_route
+    assert updated["route_repair_actions"] == []
+
+
+def test_applied_route_repair_returns_repaired_chronology(monkeypatch):
+    engine = SchedulingEngine(DummyClient(), travel_service=FakeTravelService(route_minutes=30))
+    current_blocks = [
+        {"id": "current", "block_type": "activity", "title": "Grocery shopping", "start": "07:30 AM", "end": "08:15 AM"}
+    ]
+    repaired_blocks = [
+        {"id": "doctor", "block_type": "activity", "title": "Doctor appointment", "start": "09:00 AM", "end": "10:00 AM"},
+        {"id": "travel", "block_type": "transition", "title": "Travel to Grocery shopping", "start": "10:05 AM", "end": "10:42 AM"},
+        {"id": "grocery", "block_type": "activity", "title": "Grocery shopping", "start": "10:42 AM", "end": "11:27 AM"},
+    ]
+    envelope = {
+        "date": "2026-05-26",
+        "status": "ok",
+        "schedule_status": "ok",
+        "accurate_travel_time": True,
+        "preferences": {"accurate_travel_time": True},
+        "activities": current_blocks,
+        "schedule_blocks": current_blocks,
+        "unscheduled_activities": [],
+        "explanations": [],
+    }
+    repaired_start_route = {"first_physical_event": "Doctor appointment", "leave_by": "08:25 AM"}
+    action = {"title": "Grocery shopping", "from": "07:30 AM", "to": "10:42 AM"}
+
+    monkeypatch.setattr(engine, "_location_resolution_requests", lambda *args, **kwargs: [])
+    monkeypatch.setattr(engine, "_validate_routes_with_service", lambda *args, **kwargs: {
+        "travel_validation_status": "route_conflict",
+        "schedule_blocks": current_blocks,
+        "route_conflicts": [{"reason_code": "not_enough_travel_time", "reason": "Needs travel"}],
+        "updated_transition_count": 0,
+        "start_route_summary": {"first_physical_event": "Grocery shopping", "leave_by": "07:25 AM"},
+    })
+    monkeypatch.setattr(engine, "_attempt_route_repair", lambda *args, **kwargs: {
+        "route_repair_attempted": True,
+        "pending_repair_suggestions": [],
+        "unfit_activities": [],
+        "travel_validation_status": "repaired_validated",
+        "route_repair_actions": [action],
+        "route_efficiency": {},
+        "repaired_envelope": {"activities": repaired_blocks, "schedule_blocks": repaired_blocks},
+        "repaired_validation": {
+            "schedule_blocks": repaired_blocks,
+            "activities": repaired_blocks,
+            "unscheduled_activities": [],
+            "route_conflicts": [],
+            "updated_transition_count": 1,
+            "start_route_summary": repaired_start_route,
+        },
+    })
+
+    updated = engine._apply_accurate_travel_if_requested(envelope, [])
+
+    assert updated["travel_validation_status"] == "repaired_validated"
+    assert updated["schedule_blocks"] == repaired_blocks
+    assert updated["start_route_summary"] == repaired_start_route
+    assert updated["route_repair_actions"] == [action]
+
+
 def test_pending_repair_no_confirmation_keeps_schedule_and_conflict_visible():
     fake_travel = FakeTravelService(route_minutes=35)
     engine = SchedulingEngine(DummyClient(), travel_service=fake_travel)
@@ -4747,7 +5132,7 @@ def test_chat_api_smoke_returns_schedule_blocks(monkeypatch):
                 "use_advisory_llm": False,
             }
 
-        def parse_text_request(self, message, history=None, current_schedule=None, saved_locations=None):
+        def parse_text_request(self, message, history=None, current_schedule=None, saved_locations=None, **kwargs):
             return {
                 "intent": "add",
                 "reply": "Draft created.",
@@ -5014,7 +5399,420 @@ def test_module_0_router_classifies_latency_paths():
     assert engine.route_chat_request("should I move lunch to 12pm", envelope)["route"] == "planning_advice"
     assert engine.route_chat_request("do you think my schedule is too packed", envelope)["route"] == "planning_advice"
     assert engine.route_chat_request("Generate a busy workday for me with meeting, lunch, gym and grocery", envelope)["route"] == "complex_schedule_command"
+    empty_accurate_envelope = {"activities": [], "schedule_blocks": [], "accurate_travel_time": True, "preferences": {"accurate_travel_time": True}}
+    generation_with_travel = engine.route_chat_request(
+        "Plan my day for next Tuesday. I have a doctor appointment from 9:00 AM to 10:00 AM at Sunway Medical, a lunch meeting at 12:30 PM in SS15, and a dinner with family at 7:30 PM at home. Please make it realistic with travel time.",
+        empty_accurate_envelope,
+    )
+    assert generation_with_travel["route"] == "complex_schedule_command"
+    assert generation_with_travel["use_module_a_llm"] is True
+    assert generation_with_travel["travel_intent"] is True
+    new_timed_commitment = engine.route_chat_request(
+        "owh i just realise i booked a cinema shows at 5pm and it takes like 2 hours",
+        envelope,
+    )
+    assert new_timed_commitment["route"] == "simple_schedule_command"
+    assert new_timed_commitment["use_module_a_llm"] is True
+    assert new_timed_commitment["use_deterministic_parser"] is False
+    assert new_timed_commitment["reason"] == "temporal_schedule_context_use_llm"
     assert engine.route_chat_request("hello", envelope)["route"] == "general_chat"
+
+
+def _tuesday_travel_prompt():
+    return (
+        "Plan my day for next Tuesday. I have a doctor appointment from 9:00 AM to 10:00 AM "
+        "at Sunway Medical, a lunch meeting at 12:30 PM in SS15, and a dinner with family "
+        "at 7:30 PM at home. I still need to fit in 2 hours of focused work, grocery shopping, "
+        "a pharmacy stop, 45 minutes of gym, and 30 minutes to prepare some documents before "
+        "the doctor appointment. Please make it realistic with travel time."
+    )
+
+
+def _compact_tuesday_operations(include_pharmacy=True):
+    operations = [
+        {
+            "op": "add",
+            "title": "Prepare documents",
+            "timing_mode": "relative",
+            "duration_minutes": 30,
+            "anchor_relation": {"kind": "before", "target_title": "Doctor appointment"},
+            "travel_required": False,
+            "location_resolution_status": "not_required",
+            "no_location_reason": "document_preparation",
+        },
+        {
+            "op": "add",
+            "title": "Doctor appointment",
+            "timing_mode": "fixed",
+            "fixed_start": "09:00",
+            "duration_minutes": 60,
+            "priority": "high",
+            "raw_location_text": "Sunway Medical",
+            "location_kind": "exact_named_place",
+            "location_category": "medical",
+            "travel_required": True,
+            "location_resolution_status": "needs_coordinates",
+        },
+        {
+            "op": "add",
+            "title": "Lunch meeting",
+            "timing_mode": "fixed",
+            "fixed_start": "12:30",
+            "duration_minutes": 60,
+            "raw_location_text": "SS15",
+            "location_kind": "area_only",
+            "location_category": "meal_place",
+            "travel_required": True,
+            "location_resolution_status": "needs_coordinates",
+        },
+        {
+            "op": "add",
+            "title": "Focused work",
+            "timing_mode": "flexible",
+            "duration_minutes": 120,
+            "travel_required": False,
+            "location_resolution_status": "not_required",
+            "no_location_reason": "focused_work",
+        },
+        {
+            "op": "add",
+            "title": "Grocery shopping",
+            "timing_mode": "flexible",
+            "duration_minutes": 45,
+            "location_kind": "category_only",
+            "location_category": "supermarket",
+            "travel_required": True,
+            "location_resolution_status": "needs_coordinates",
+        },
+        {
+            "op": "add",
+            "title": "Gym",
+            "timing_mode": "flexible",
+            "duration_minutes": 45,
+            "location_kind": "category_only",
+            "location_category": "fitness_center",
+            "travel_required": True,
+            "location_resolution_status": "needs_coordinates",
+        },
+        {
+            "op": "add",
+            "title": "Dinner with family",
+            "timing_mode": "fixed",
+            "fixed_start": "19:30",
+            "duration_minutes": 60,
+            "raw_location_text": "home",
+            "location_kind": "home",
+            "location_category": "home",
+            "travel_required": True,
+            "location_resolution_status": "resolved_coordinates",
+        },
+    ]
+    if include_pharmacy:
+        operations.insert(5, {
+            "op": "add",
+            "title": "Pharmacy stop",
+            "timing_mode": "flexible",
+            "duration_minutes": 15,
+            "location_kind": "category_only",
+            "location_category": "pharmacy",
+            "travel_required": True,
+            "location_resolution_status": "needs_coordinates",
+        })
+    return operations
+
+
+def test_module_a_complex_travel_failure_does_not_use_deterministic_fallback(capsys):
+    engine = SchedulingEngine(UnavailableReplyClient())
+
+    parsed = engine.parse_text_request(
+        _tuesday_travel_prompt(),
+        current_schedule=None,
+        history=[],
+        saved_locations=[],
+    )
+    logs = capsys.readouterr().out
+
+    assert parsed["intent"] == "chat"
+    assert parsed["operations"] == []
+    assert parsed["_failure_type"] == "module_a_unavailable"
+    assert "[JPLAN][MODULE_A][FALLBACK_DISABLED] reason=complex_or_travel_intent" in logs
+    assert "[JPLAN][MODULE_A][LLM_FALLBACK_PARSE]" not in logs
+
+
+def test_module_a_rejects_complex_giant_title_output(capsys):
+    class GiantTitleClient:
+        class models:
+            @staticmethod
+            def generate_content(*args, **kwargs):
+                prompt = _tuesday_travel_prompt()
+                return ParserJsonResponse(
+                    json.dumps({
+                        "intent": "add",
+                        "reply": "I translated your request into a draft.",
+                        "transcription": prompt,
+                        "date": "2026-05-26",
+                        "operations": [{
+                            "op": "add",
+                            "title": prompt,
+                            "timing_mode": "flexible",
+                            "duration_minutes": 60,
+                        }],
+                        "activities": [],
+                        "preferences": {},
+                    })
+                )
+
+    engine = SchedulingEngine(GiantTitleClient())
+
+    parsed = engine.parse_text_request(
+        _tuesday_travel_prompt(),
+        current_schedule=None,
+        history=[],
+        saved_locations=[],
+    )
+    logs = capsys.readouterr().out
+
+    assert parsed["intent"] == "chat"
+    assert parsed["operations"] == []
+    assert parsed["_failure_type"] in {"expected_multi_activity_got_one", "giant_title_or_complex_fallback"}
+    assert (
+        "[JPLAN][MODULE_A][SCHEMA_INVALID] reason=expected_multi_activity_got_one" in logs
+        or "[JPLAN][MODULE_A][PARSE_REJECTED] reason=giant_title_or_complex_fallback" in logs
+    )
+
+
+def test_module_a_complex_travel_success_keeps_semantic_fields():
+    class TuesdaySemanticClient:
+        class models:
+            @staticmethod
+            def generate_content(*args, **kwargs):
+                prompt = _tuesday_travel_prompt()
+                return ParserJsonResponse(
+                    json.dumps({
+                        "intent": "add",
+                        "reply": "I translated your request into a plan draft.",
+                        "transcription": prompt,
+                        "date": "2026-05-26",
+                        "operations": [
+                            {
+                                "op": "add",
+                                "title": "Prepare documents",
+                                "timing_mode": "relative",
+                                "anchor_relation": {"kind": "before", "target_title": "Doctor appointment"},
+                                "duration_minutes": 30,
+                                "location_kind": "no_location_required",
+                                "location_category": "no_location",
+                                "travel_required": False,
+                                "location_resolution_status": "not_required",
+                                "no_location_reason": "document_preparation",
+                            },
+                            {
+                                "op": "add",
+                                "title": "Doctor appointment",
+                                "timing_mode": "fixed",
+                                "fixed_start": "09:00",
+                                "duration_minutes": 60,
+                                "raw_location_text": "Sunway Medical",
+                                "location_kind": "exact_named_place",
+                                "location_category": "medical",
+                                "explicit_user_location": True,
+                                "travel_required": True,
+                                "location_resolution_status": "needs_coordinates",
+                            },
+                            {
+                                "op": "add",
+                                "title": "Lunch meeting",
+                                "timing_mode": "fixed",
+                                "fixed_start": "12:30",
+                                "duration_minutes": 60,
+                                "raw_location_text": "SS15",
+                                "location_kind": "area_only",
+                                "location_category": "meal_place",
+                                "explicit_user_location": True,
+                                "travel_required": True,
+                                "location_resolution_status": "needs_coordinates",
+                            },
+                            {
+                                "op": "add",
+                                "title": "Focused work",
+                                "duration_minutes": 120,
+                                "location_kind": "no_location_required",
+                                "location_category": "no_location",
+                                "travel_required": False,
+                                "location_resolution_status": "not_required",
+                            },
+                            {
+                                "op": "add",
+                                "title": "Grocery shopping",
+                                "duration_minutes": 45,
+                                "location_kind": "category_only",
+                                "location_category": "supermarket",
+                                "travel_required": True,
+                                "location_resolution_status": "needs_coordinates",
+                            },
+                            {
+                                "op": "add",
+                                "title": "Pharmacy stop",
+                                "duration_minutes": 15,
+                                "location_kind": "category_only",
+                                "location_category": "pharmacy",
+                                "travel_required": True,
+                                "location_resolution_status": "needs_coordinates",
+                            },
+                            {
+                                "op": "add",
+                                "title": "Gym",
+                                "duration_minutes": 45,
+                                "location_kind": "category_only",
+                                "location_category": "fitness_center",
+                                "travel_required": True,
+                                "location_resolution_status": "needs_coordinates",
+                            },
+                            {
+                                "op": "add",
+                                "title": "Dinner with family",
+                                "timing_mode": "fixed",
+                                "fixed_start": "19:30",
+                                "duration_minutes": 60,
+                                "raw_location_text": "home",
+                                "location_kind": "home",
+                                "location_category": "home",
+                                "explicit_user_location": True,
+                                "travel_required": True,
+                                "location_resolution_status": "resolved_coordinates",
+                            },
+                        ],
+                        "activities": [],
+                        "preferences": {},
+                    })
+                )
+
+    engine = SchedulingEngine(TuesdaySemanticClient(), travel_service=FakeTravelService())
+    parsed = engine.parse_text_request(
+        _tuesday_travel_prompt(),
+        current_schedule=None,
+        history=[],
+        saved_locations=[],
+    )
+
+    assert parsed["_reply_source"] == "llm"
+    assert len(parsed["operations"]) == 8
+    doctor = next(op for op in parsed["operations"] if op["title"] == "Doctor appointment")
+    prepare = next(op for op in parsed["operations"] if op["title"] == "Prepare documents")
+    pharmacy = next(op for op in parsed["operations"] if op["title"] == "Pharmacy stop")
+    assert doctor["raw_location_text"] == "Sunway Medical"
+    assert doctor["location"] == "Sunway Medical"
+    assert prepare["travel_required"] is False
+    assert pharmacy["travel_required"] is True
+    assert pharmacy["location_category"] == "pharmacy"
+
+
+def test_module_a_complex_travel_compact_output_is_accepted(capsys):
+    class CompactTuesdayModels:
+        def __init__(self):
+            self.kwargs = None
+            self.payload = {
+                "intent": "add",
+                "date": "2026-05-26",
+                "operations": _compact_tuesday_operations(),
+            }
+
+        def generate_content(self, *args, **kwargs):
+            self.kwargs = kwargs
+            return ParserJsonResponse(json.dumps(self.payload))
+
+    class CompactTuesdayClient:
+        def __init__(self):
+            self.models = CompactTuesdayModels()
+
+    client = CompactTuesdayClient()
+    engine = SchedulingEngine(client, travel_service=FakeTravelService())
+
+    parsed = engine.parse_text_request(
+        _tuesday_travel_prompt(),
+        current_schedule=None,
+        history=[],
+        saved_locations=[],
+    )
+    logs = capsys.readouterr().out
+
+    assert client.models.kwargs["config"]["max_output_tokens"] == 1200
+    assert "COMPACT_OUTPUT_MODE" in client.models.kwargs["contents"]
+    assert "[JPLAN][MODULE_A][OUTPUT_MODE] compact=true max_output_tokens=1200" in logs
+    assert "reply" not in client.models.payload
+    assert "transcription" not in client.models.payload
+    assert "conflict_analysis" not in client.models.payload
+    assert len(parsed["operations"]) == 8
+    assert parsed["transcription"] == _tuesday_travel_prompt()
+    assert parsed["_reply_source"] == "llm"
+    doctor = next(op for op in parsed["operations"] if op["title"] == "Doctor appointment")
+    lunch = next(op for op in parsed["operations"] if op["title"] == "Lunch meeting")
+    pharmacy = next(op for op in parsed["operations"] if op["title"] == "Pharmacy stop")
+    prepare = next(op for op in parsed["operations"] if op["title"] == "Prepare documents")
+    focused = next(op for op in parsed["operations"] if op["title"] == "Focused work")
+    assert doctor["raw_location_text"] == "Sunway Medical"
+    assert doctor["location"] == "Sunway Medical"
+    assert lunch["raw_location_text"] == "SS15"
+    assert prepare["travel_required"] is False
+    assert focused["travel_required"] is False
+    assert pharmacy["travel_required"] is True
+    assert pharmacy["location_category"] == "pharmacy"
+    assert all("location_warning" not in op for op in client.models.payload["operations"])
+    assert all("parse_notes" not in op for op in client.models.payload["operations"])
+
+
+def test_module_a_complex_travel_rejects_compact_output_missing_expected_operation(capsys):
+    class MissingPharmacyClient:
+        class models:
+            @staticmethod
+            def generate_content(*args, **kwargs):
+                return ParserJsonResponse(json.dumps({
+                    "intent": "add",
+                    "date": "2026-05-26",
+                    "operations": _compact_tuesday_operations(include_pharmacy=False),
+                }))
+
+    engine = SchedulingEngine(MissingPharmacyClient(), travel_service=FakeTravelService())
+
+    parsed = engine.parse_text_request(
+        _tuesday_travel_prompt(),
+        current_schedule=None,
+        history=[],
+        saved_locations=[],
+    )
+    logs = capsys.readouterr().out
+
+    assert parsed["intent"] == "chat"
+    assert parsed["operations"] == []
+    assert parsed["_failure_type"] == "missing_expected_operations"
+    assert "[JPLAN][MODULE_A][SCHEMA_INVALID] reason=missing_expected_operations" in logs
+    assert "[JPLAN][MODULE_A][LLM_FALLBACK_PARSE]" not in logs
+
+
+def test_module_a_complex_travel_truncated_compact_json_fails_safely(capsys):
+    class TruncatedCompactClient:
+        class models:
+            @staticmethod
+            def generate_content(*args, **kwargs):
+                response = FakeResponse()
+                response.text = '{"intent":"add","date":"2026-05-26","operations":[{"op":"add","title":"Pharmacy stop"'
+                return response
+
+    engine = SchedulingEngine(TruncatedCompactClient(), travel_service=FakeTravelService())
+
+    parsed = engine.parse_text_request(
+        _tuesday_travel_prompt(),
+        current_schedule=None,
+        history=[],
+        saved_locations=[],
+    )
+    logs = capsys.readouterr().out
+
+    assert parsed["intent"] == "chat"
+    assert parsed["operations"] == []
+    assert "couldn't safely parse the full-day plan" in parsed["reply"]
+    assert parsed["_failure_type"] == "llm_parse_error"
+    assert "[JPLAN][MODULE_A][LLM_FALLBACK_PARSE]" not in logs
 
 
 def test_module_0_router_detects_accurate_travel_validation_before_optimize():
@@ -5392,6 +6190,186 @@ def test_duplicate_guard_converts_add_with_wrapper_title_to_existing_update():
     assert updated_grocery["priority"] == "low"
     assert updated_grocery["location"] == "KB01 Mid Valley"
     assert updated_grocery["resolved_location"]["latitude"] == 3.1184
+
+
+def test_update_preserve_existing_fields_keeps_confirmed_location_over_parser_default(capsys):
+    engine = SchedulingEngine(DummyClient())
+    envelope = _custom_envelope([
+        {
+            "op": "add",
+            "title": "Client Meeting",
+            "timing_mode": TimingMode.FIXED,
+            "fixed_start": "09:00",
+            "duration_minutes": 60,
+            "location": "KB01 Mid Valley",
+        },
+        {
+            "op": "add",
+            "title": "Grocery Run",
+            "timing_mode": TimingMode.FIXED,
+            "fixed_start": "07:00",
+            "duration_minutes": 45,
+            "priority": "low",
+            "location": "KB01 Mid Valley",
+        },
+    ])
+    grocery = _activity_by_title(envelope, "Grocery Run")
+    grocery["location"] = "KB01 Mid Valley"
+    grocery["location_label"] = "KB01 Mid Valley"
+    grocery["location_normalized"] = "KB01 Mid Valley"
+    grocery["location_category"] = "supermarket"
+    grocery["location_source"] = "event_confirmed"
+    grocery["location_status"] = "resolved"
+    grocery["travel_required"] = True
+    grocery["scheduled_start"] = 420
+    grocery["scheduled_end"] = 465
+    grocery["startTime"] = "07:00 AM"
+    grocery["endTime"] = "07:45 AM"
+    grocery["fixed_start"] = 420
+    grocery["fixed_end"] = 465
+    grocery["resolved_location"] = {
+        "display_name": "KB01 Mid Valley",
+        "latitude": 3.1184,
+        "longitude": 101.6778,
+        "source": "event_confirmed",
+    }
+
+    result = engine.apply_operations(
+        envelope=envelope,
+        operations=[{
+            "op": "update",
+            "title": "Grocery Run",
+            "target_title": "Grocery Run",
+            "timing_mode": TimingMode.RELATIVE,
+            "anchor_relation": {"kind": "after", "target_title": "Client Meeting"},
+            "preserve_existing_fields": True,
+            "location": "store",
+            "location_label": "store",
+            "location_category": "supermarket",
+            "location_status": "needs_resolution",
+            "location_source": "deterministic_default",
+            "travel_required": True,
+            "_user_message": "how about move grocery run to after client meeting?",
+        }],
+        base_version=envelope["version"],
+    )
+
+    updated = result["envelope"]
+    updated_grocery = _activity_by_title(updated, "Grocery Run")
+    assert result["status"] in {"success", "warning"}
+    assert updated_grocery["duration_minutes"] == 45
+    assert updated_grocery["location"] == "KB01 Mid Valley"
+    assert updated_grocery["location_label"] == "KB01 Mid Valley"
+    assert updated_grocery["location_status"] == "resolved"
+    assert updated_grocery["resolved_location"]["latitude"] == 3.1184
+    assert "PRESERVE_LOCATION" in capsys.readouterr().out
+
+
+def test_update_preserve_existing_fields_allows_explicit_location_change():
+    engine = SchedulingEngine(DummyClient())
+    envelope = _custom_envelope([
+        {
+            "op": "add",
+            "title": "Grocery Run",
+            "timing_mode": "flexible",
+            "duration_minutes": 45,
+            "location": "KB01 Mid Valley",
+        },
+    ])
+    grocery = _activity_by_title(envelope, "Grocery Run")
+    grocery["location"] = "KB01 Mid Valley"
+    grocery["location_label"] = "KB01 Mid Valley"
+    grocery["location_status"] = "resolved"
+    grocery["location_source"] = "event_confirmed"
+    grocery["resolved_location"] = {
+        "display_name": "KB01 Mid Valley",
+        "latitude": 3.1184,
+        "longitude": 101.6778,
+        "source": "event_confirmed",
+    }
+
+    result = engine.apply_operations(
+        envelope=envelope,
+        operations=[{
+            "op": "update",
+            "title": "Grocery Run",
+            "target_title": "Grocery Run",
+            "preserve_existing_fields": True,
+            "location": "Lotus Cheras",
+            "location_label": "Lotus Cheras",
+            "location_status": "resolved",
+            "location_source": "selected_geocode",
+            "explicit_user_location": True,
+            "resolved_location": {
+                "display_name": "Lotus Cheras",
+                "latitude": 3.09,
+                "longitude": 101.74,
+                "source": "selected_geocode",
+            },
+            "_user_message": "change grocery run location to Lotus Cheras",
+        }],
+        base_version=envelope["version"],
+    )
+
+    updated_grocery = _activity_by_title(result["envelope"], "Grocery Run")
+    assert updated_grocery["location"] == "Lotus Cheras"
+    assert updated_grocery["location_label"] == "Lotus Cheras"
+    assert updated_grocery["location_source"] == "selected_geocode"
+    assert updated_grocery["resolved_location"]["latitude"] == 3.09
+
+
+def test_backend_prunes_support_blocks_linked_to_deleted_activity():
+    engine = SchedulingEngine(DummyClient())
+    blocks = [
+        {"id": "dentist", "stable_activity_id": "dentist", "block_type": "activity", "title": "Dentist appointment"},
+        {
+            "id": "buffer-dentist-dinner",
+            "block_type": "buffer",
+            "title": "Prep / Buffer",
+            "source_activity_id": "dentist",
+            "destination_activity_id": "dinner",
+            "related_activity_ids": ["dentist", "dinner"],
+        },
+        {
+            "id": "travel-dentist-dinner",
+            "block_type": "transition",
+            "type": "travel",
+            "title": "Travel to Dinner",
+            "source_activity_id": "dentist",
+            "destination_activity_id": "dinner",
+            "related_activity_ids": ["dentist", "dinner"],
+        },
+        {"id": "dinner", "stable_activity_id": "dinner", "block_type": "activity", "title": "Dinner"},
+        {"id": "__start_route__", "type": "start_route", "is_start_route": True, "display_only": True, "title": "Leave Home"},
+    ]
+
+    pruned = engine._prune_support_blocks_for_deleted_activities(blocks, ["dinner"])
+
+    assert [block["id"] for block in pruned] == ["dentist", "__start_route__"]
+
+
+def test_route_transition_minutes_handles_none_prep_buffer():
+    engine = SchedulingEngine(DummyClient())
+    minutes = engine._transition_minutes(
+        {
+            "title": "Client Meeting",
+            "location": "Mid Valley",
+            "location_status": "resolved",
+            "travel_required": True,
+            "prep_buffer": None,
+        },
+        {
+            "title": "Grocery Run",
+            "location": "KB01 Mid Valley",
+            "location_status": "resolved",
+            "travel_required": True,
+            "prep_buffer": None,
+        },
+        0,
+    )
+
+    assert isinstance(minutes, int)
+    assert minutes >= 0
 
 
 def test_duplicate_guard_ambiguous_existing_match_clarifies_without_adding():
@@ -6138,6 +7116,7 @@ def test_module_a_generation_config_is_limited_and_prompt_keeps_safety_rules():
     assert "operations must not be empty" in prompt
     assert "unrelated fixed events" in prompt
     assert "generic travel" in prompt
+    assert "COMPACT_OUTPUT_MODE" not in prompt
 
 
 def test_module_8_generation_config_is_limited_and_truth_guards_remain():

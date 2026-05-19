@@ -55,11 +55,26 @@ class ModuleAParserMixin:
             ]
             jlog("MODULE_A", f"active_titles={active_titles}", "EDIT_CONTEXT")
         
-        prompt = self._build_parser_prompt(latest_request, history, current_schedule, saved_locations)
+        compact_output = self._should_use_compact_module_a_output(latest_request, current_schedule)
+        if compact_output:
+            jlog("MODULE_A", f"compact=true max_output_tokens={MODULE_A_MAX_OUTPUT_TOKENS}", "OUTPUT_MODE")
+        prompt = self._build_parser_prompt(
+            latest_request,
+            history,
+            current_schedule,
+            saved_locations,
+            compact_output=compact_output,
+        )
 
         contents: Any = prompt if audio_part is None else [prompt, audio_part]
         raw_llm_reply: Optional[str] = None
         raw_response_text: Optional[str] = None
+        fallback_disabled_reason = self._deterministic_fallback_disabled_reason(
+            latest_request,
+            current_schedule,
+            explicit_disable=disable_deterministic_fallback,
+            fallback_reason=fallback_reason,
+        )
 
         try:
             response = self._generate_parser_content_with_retry(contents)
@@ -85,7 +100,13 @@ class ModuleAParserMixin:
                 raw_llm_reply = str(parsed.get("reply") or "").strip() or None
         except json.JSONDecodeError as exc:
             self._debug(f"LLM parse exception | type={type(exc).__name__} | message={str(exc)}")
-            fallback = None if disable_deterministic_fallback else self._deterministic_fallback_parse(latest_request, current_schedule, history)
+            fallback = self._safe_deterministic_fallback_parse(
+                latest_request,
+                current_schedule,
+                history,
+                saved_locations,
+                fallback_disabled_reason,
+            )
             if fallback:
                 self._debug_json("Deterministic fallback parse result", fallback)
                 return fallback
@@ -101,7 +122,13 @@ class ModuleAParserMixin:
             return invalid
         except Exception as exc:
             self._debug(f"LLM call exception | type={type(exc).__name__} | message={str(exc)}")
-            fallback = None if disable_deterministic_fallback else self._deterministic_fallback_parse(latest_request, current_schedule, history)
+            fallback = self._safe_deterministic_fallback_parse(
+                latest_request,
+                current_schedule,
+                history,
+                saved_locations,
+                fallback_disabled_reason,
+            )
             if fallback:
                 self._debug_json("Deterministic fallback parse result", fallback)
                 return fallback
@@ -118,7 +145,25 @@ class ModuleAParserMixin:
             return invalid
 
         if not isinstance(parsed, dict):
-            fallback = None if disable_deterministic_fallback else self._deterministic_fallback_parse(latest_request, current_schedule, history)
+            if compact_output and fallback_disabled_reason and self._looks_like_incomplete_json(raw_response_text):
+                invalid = self._invalid_llm_parse(
+                    latest_request=latest_request,
+                    current_schedule=current_schedule,
+                    raw_llm_reply=raw_llm_reply,
+                    failure_type="llm_parse_error",
+                    failure_message="LLM did not return a complete JSON object.",
+                    raw_response_text=raw_response_text,
+                )
+                invalid["reply"] = "I couldn't safely parse the full-day plan. Please try again, or split it into fixed events and flexible tasks."
+                self._debug_json("Invalid LLM parse result", invalid)
+                return invalid
+            fallback = self._safe_deterministic_fallback_parse(
+                latest_request,
+                current_schedule,
+                history,
+                saved_locations,
+                fallback_disabled_reason,
+            )
             if fallback:
                 self._debug_json("Deterministic fallback parse result", fallback)
                 return fallback
@@ -146,18 +191,45 @@ class ModuleAParserMixin:
         parsed = self._normalize_plan_level_operations(parsed, latest_request, current_schedule)
         parsed = self._normalize_parsed_locations(parsed, latest_request, saved_locations)
         parsed = self._normalize_module_a_duplicate_relative_adds(parsed, current_schedule)
+        parse_rejection = self._module_a_parse_rejection_reason(parsed, latest_request)
+        if parse_rejection:
+            invalid = self._invalid_llm_parse(
+                latest_request=latest_request,
+                current_schedule=current_schedule,
+                raw_llm_reply=raw_llm_reply,
+                failure_type=parse_rejection,
+                failure_message=parse_rejection,
+                raw_response_text=raw_response_text,
+            )
+            invalid["reply"] = "I couldn't safely understand the full-day plan. Please try again, or split it into fixed events and flexible tasks."
+            if parse_rejection in {"expected_multi_activity_got_one", "missing_expected_operations"}:
+                jlog("MODULE_A", f"reason={parse_rejection}", "SCHEMA_INVALID")
+            else:
+                jlog("MODULE_A", "reason=giant_title_or_complex_fallback", "PARSE_REJECTED")
+            self._debug_json("Invalid LLM parse result", invalid)
+            return invalid
         if self._is_schedule_change_intent(parsed) and not parsed.get("operations") and not parsed.get("activities"):
             jlog(
                 "MODULE_A",
                 "Empty operations for edit intent. Attempting deterministic fallback parse.",
                 "SAFETY",
             )
-            fallback = None if disable_deterministic_fallback else self._deterministic_fallback_parse(latest_request, current_schedule, history)
+            fallback = self._safe_deterministic_fallback_parse(
+                latest_request,
+                current_schedule,
+                history,
+                saved_locations,
+                fallback_disabled_reason,
+            )
             if fallback:
                 self._debug_json("Deterministic fallback parse result", fallback)
                 return fallback
             parsed["intent"] = "no_operation"
-            parsed["reply"] = "I could not understand or apply the requested change. Please try again with the activity name and time."
+            parsed["reply"] = (
+                "I couldn't safely understand the full-day plan. Please try again, or split it into fixed events and flexible tasks."
+                if fallback_disabled_reason == "complex_or_travel_intent"
+                else "I could not understand or apply the requested change. Please try again with the activity name and time."
+            )
             parsed["_failure_type"] = "empty_operations"
         jlog(
             "MODULE_A",
@@ -190,6 +262,231 @@ class ModuleAParserMixin:
             needs = "needs coordinates" if clean_title(status) in {"needs_resolution", "unresolved", "fallback_used"} else status or "ok"
             lines.append(f"- {title} | {timing} | {duration} min | {location} ({needs})")
         jlog("SUMMARY", "Module A output:\n" + "\n".join(lines), "MODULE_A_OUTPUT")
+
+    def _safe_deterministic_fallback_parse(
+        self,
+        latest_request: str,
+        current_schedule: Optional[Dict[str, Any]],
+        history: Optional[List[Dict[str, Any]]],
+        saved_locations: Optional[List[Dict[str, Any]]],
+        disabled_reason: Optional[str],
+    ) -> Optional[Dict[str, Any]]:
+        if disabled_reason:
+            jlog("MODULE_A", f"reason={disabled_reason}", "FALLBACK_DISABLED")
+            return None
+        return self._deterministic_fallback_parse(
+            latest_request,
+            current_schedule,
+            history,
+            saved_locations=saved_locations or [],
+        )
+
+    def _should_use_compact_module_a_output(
+        self,
+        latest_request: str,
+        current_schedule: Optional[Dict[str, Any]],
+    ) -> bool:
+        if self._is_strict_atomic_command(latest_request):
+            return False
+        return self._request_is_complex_or_travel_intent(latest_request, current_schedule)
+
+    def _deterministic_fallback_disabled_reason(
+        self,
+        latest_request: str,
+        current_schedule: Optional[Dict[str, Any]],
+        *,
+        explicit_disable: bool = False,
+        fallback_reason: Optional[str] = None,
+    ) -> Optional[str]:
+        if explicit_disable:
+            return fallback_reason or "complex_or_travel_intent"
+        if self._is_strict_atomic_command(latest_request):
+            return None
+        if self._request_is_complex_or_travel_intent(latest_request, current_schedule):
+            return "complex_or_travel_intent"
+        return "not_strict_atomic_command"
+
+    def _request_is_complex_or_travel_intent(
+        self,
+        latest_request: str,
+        current_schedule: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        clean = clean_title(latest_request or "")
+        if not clean:
+            return False
+        preferences = (current_schedule or {}).get("preferences") or {}
+        if bool((current_schedule or {}).get("travel_intent") or preferences.get("travel_intent")):
+            return True
+        if clean.startswith("plan my day") or "plan my day" in clean:
+            return True
+        if re.search(r"\b(?:with|include|account for|consider|realistic with|make it realistic with)\b.{0,30}\b(?:travel|route|commute)\b", clean):
+            return True
+        if re.search(r"\bi have\b.*\band\b", clean) and len(clean.split()) > 14:
+            return True
+        if len(re.findall(r"\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b", clean)) >= 2:
+            return True
+        if len(re.findall(r"[,;]", latest_request or "")) >= 2:
+            return True
+        if len(clean.split()) > 22:
+            return True
+        activity_mentions = len(re.findall(
+            r"\b(?:appointment|doctor|dentist|meeting|lunch|dinner|gym|workout|shopping|grocery|groceries|pharmacy|work|documents?|coffee|class|seminar)\b",
+            clean,
+        ))
+        return activity_mentions >= 3
+
+    def _is_strict_atomic_command(self, latest_request: str) -> bool:
+        clean = clean_title(latest_request or "")
+        if not clean or len(clean.split()) > 12:
+            return False
+        if len(re.findall(r"[,;]", latest_request or "")) > 0:
+            return False
+        if len(re.findall(r"\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b", clean)) > 1:
+            return False
+        if clean.startswith("plan my day") or " i have " in f" {clean} ":
+            return False
+        atomic_patterns = (
+            r"^(?:move|shift|change|update)\s+.+\s+to\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?$",
+            r"^(?:remove|delete|cancel)\s+.+$",
+            r"^set\s+.+\s+priority\s+(?:low|medium|high)$",
+            r"^(?:put|place|arrange|rearrange)\s+.+\s+(?:right\s+after|right\s+before|after|before)\s+.+$",
+            r"^(?:add|schedule)\s+.+\s+(?:right\s+after|right\s+before|after|before)\s+.+$",
+            r"^(?:add|schedule)\s+(?:a\s+|an\s+)?\d{1,3}[-\s]*(?:minute|min|hour|hr).+$",
+        )
+        return any(re.search(pattern, clean) for pattern in atomic_patterns)
+
+    def _module_a_parse_rejection_reason(
+        self,
+        parsed: Dict[str, Any],
+        latest_request: str,
+    ) -> Optional[str]:
+        if not self._request_is_complex_or_travel_intent(latest_request, None):
+            return None
+        operations = [
+            item for item in list(parsed.get("operations") or []) + list(parsed.get("activities") or [])
+            if isinstance(item, dict) and clean_title(item.get("op") or "add") not in {"remove", "shift_plan_date"}
+        ]
+        if len(operations) == 1 and self._expected_multi_activity_count(latest_request) >= 3:
+            return "expected_multi_activity_got_one"
+        if self._missing_expected_operation_concepts(operations, latest_request):
+            return "missing_expected_operations"
+        for operation in operations:
+            title = str(operation.get("title") or operation.get("target_title") or "")
+            if self._operation_title_looks_like_giant_prompt(title, latest_request):
+                return "giant_title_or_complex_fallback"
+        return None
+
+    def _expected_multi_activity_count(self, latest_request: str) -> int:
+        clean = clean_title(latest_request or "")
+        matches = re.findall(
+            r"\b(?:appointment|doctor|dentist|meeting|lunch|dinner|gym|workout|shopping|grocery|groceries|pharmacy|work|documents?|coffee|class|seminar)\b",
+            clean,
+        )
+        return len(matches)
+
+    def _missing_expected_operation_concepts(
+        self,
+        operations: List[Dict[str, Any]],
+        latest_request: str,
+    ) -> List[str]:
+        expected = self._expected_operation_concepts(latest_request)
+        if len(expected) < 3:
+            return []
+        missing: List[str] = []
+        for label, aliases in expected:
+            if not any(self._operation_matches_expected_concept(operation, aliases) for operation in operations):
+                missing.append(label)
+        return missing
+
+    def _expected_operation_concepts(self, latest_request: str) -> List[Tuple[str, Tuple[str, ...]]]:
+        clean = clean_title(latest_request or "")
+        concepts: List[Tuple[str, Tuple[str, ...]]] = []
+        seen: set[str] = set()
+
+        def add(label: str, aliases: Tuple[str, ...]) -> None:
+            key = clean_title(label)
+            if key not in seen:
+                seen.add(key)
+                concepts.append((label, tuple(clean_title(alias) for alias in aliases if alias)))
+
+        if re.search(r"\bprepare\b.{0,30}\bdocuments?\b|\bdocuments?\b.{0,30}\bprepare\b", clean):
+            add("Prepare documents", ("prepare documents", "document preparation"))
+        if re.search(r"\bdoctor\b|\bmedical\b", clean):
+            add("Doctor appointment", ("doctor appointment", "doctor", "medical appointment"))
+        elif re.search(r"\bappointment\b", clean):
+            add("Appointment", ("appointment",))
+        if re.search(r"\blunch\b", clean):
+            add("Lunch meeting", ("lunch meeting", "lunch"))
+        if re.search(r"\bfocused work\b|\bfocus work\b|\bdeep work\b", clean):
+            add("Focused work", ("focused work", "focus work", "deep work"))
+        if re.search(r"\bgrocery\b|\bgroceries\b", clean):
+            add("Grocery shopping", ("grocery shopping", "grocery run", "grocery", "groceries"))
+        if re.search(r"\bpharmacy\b", clean):
+            add("Pharmacy stop", ("pharmacy stop", "pharmacy"))
+        if re.search(r"\bgym\b|\bworkout\b", clean):
+            add("Gym", ("gym", "workout"))
+        if re.search(r"\bdinner\b", clean):
+            add("Dinner with family", ("dinner with family", "dinner with parents", "dinner"))
+        if re.search(r"\bclient meeting\b", clean):
+            add("Client meeting", ("client meeting", "meeting"))
+        elif re.search(r"\bteam meeting\b", clean):
+            add("Team meeting", ("team meeting", "meeting"))
+        elif re.search(r"\bmeeting\b", clean) and not re.search(r"\blunch meeting\b", clean):
+            add("Meeting", ("meeting",))
+        return concepts
+
+    def _operation_matches_expected_concept(
+        self,
+        operation: Dict[str, Any],
+        aliases: Tuple[str, ...],
+    ) -> bool:
+        title = clean_title(operation.get("title") or operation.get("target_title") or "")
+        evidence = clean_title(
+            " ".join(
+                str(operation.get(field) or "")
+                for field in (
+                    "title",
+                    "target_title",
+                    "location_category",
+                    "no_location_reason",
+                    "raw_location_text",
+                )
+            )
+        )
+        for alias in aliases:
+            if not alias:
+                continue
+            if alias in evidence or (title and title in alias):
+                return True
+        return False
+
+    def _operation_title_looks_like_giant_prompt(self, title: str, latest_request: str) -> bool:
+        clean_title_value = clean_title(title or "")
+        if len(title or "") > 80:
+            return True
+        if re.search(r"\b(?:plan my day|i have|i still need|please make it realistic)\b", clean_title_value):
+            return True
+        if len(re.findall(r"\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b", clean_title_value)) >= 2:
+            return True
+        activity_mentions = len(re.findall(
+            r"\b(?:appointment|doctor|dentist|meeting|lunch|dinner|gym|shopping|grocery|pharmacy|documents?)\b",
+            clean_title_value,
+        ))
+        if activity_mentions >= 3:
+            return True
+        request_clean = clean_title(latest_request or "")
+        return bool(clean_title_value and len(clean_title_value) > 40 and clean_title_value in request_clean)
+
+    def _looks_like_incomplete_json(self, raw_response_text: Optional[str]) -> bool:
+        text = (raw_response_text or "").strip()
+        if not text:
+            return False
+        clean_text = text.replace("```json", "").replace("```", "").strip()
+        if not clean_text.startswith("{"):
+            return False
+        if not clean_text.endswith("}"):
+            return True
+        return clean_text.count("{") > clean_text.count("}") or clean_text.count("[") > clean_text.count("]")
 
     def _generate_parser_content_with_retry(self, contents: Any) -> Any:
         total_started = time.perf_counter()
@@ -352,20 +649,39 @@ class ModuleAParserMixin:
         history: List[Dict[str, Any]],
         current_schedule: Optional[Dict[str, Any]],
         saved_locations: Optional[List[Dict[str, Any]]] = None,
+        compact_output: bool = False,
     ) -> str:
         history_lines = self._summarize_history(history)
         local_context = self._local_datetime_context()
         current_activity_index = self._build_current_activity_index(current_schedule)
         saved_location_index = self._build_saved_location_index(saved_locations or [])
         schedule_date = (current_schedule or {}).get("date") or "(none)"
+        compact_rules = self._compact_module_a_output_rules(latest_request) if compact_output else ""
         return (
             f"{PARSER_PROMPT}\n\n"
+            f"{compact_rules}"
             f"{local_context}\n"
             f"CURRENT_SCHEDULE_DATE: {schedule_date}\n"
             f"CURRENT_ACTIVITY_INDEX:\n{current_activity_index}\n"
             f"SAVED_LOCATION_INDEX:\n{saved_location_index}\n"
             f"HISTORY:\n" + ("\n".join(history_lines) if history_lines else "(none)") + "\n\n"
             f"LATEST_REQUEST:\n{latest_request}\n"
+        )
+
+    def _compact_module_a_output_rules(self, latest_request: str) -> str:
+        expected = [label for label, _aliases in self._expected_operation_concepts(latest_request)]
+        expected_line = ", ".join(expected) if expected else "(derive from latest request)"
+        return (
+            "COMPACT_OUTPUT_MODE:\n"
+            "- Return compact JSON only. No markdown, no explanation.\n"
+            "- Top-level keys: intent, date, operations, and preferences only if needed.\n"
+            "- Do not output reply, transcription, conflict_analysis, or the full user message.\n"
+            "- For each operation always include only: op, title, timing_mode, duration_minutes.\n"
+            "- Include fixed_start/fixed_end only for fixed events; anchor_relation only for relative events; preferred_time_window only when semantically important.\n"
+            "- Include location semantic fields only when needed: raw_location_text, location_kind, location_category, travel_required, location_resolution_status, no_location_reason.\n"
+            "- Omit null fields, location=null, explicit_user_location=false, needs_clarification=false, sequence_index, location_warning, and high-confidence semantic_confidence/location_confidence.\n"
+            "- Omit parse_notes unless confidence is low or clarification is needed; if included, keep it under 12 words.\n"
+            f"- Ensure operations include these expected activity concepts when present: {expected_line}.\n\n"
         )
 
     def _build_current_activity_index(self, current_schedule: Optional[Dict[str, Any]]) -> str:

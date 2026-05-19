@@ -335,14 +335,20 @@ class StateModelMixin:
         location_status = clean_optional_text(raw.get("location_status"))
         location_source = clean_optional_text(raw.get("location_source"))
         location_confidence = raw.get("location_confidence")
+        location_kind = clean_optional_text(raw.get("location_kind"))
+        location_resolution_status = clean_optional_text(raw.get("location_resolution_status"))
         resolved_location = deepcopy(raw.get("resolved_location")) if isinstance(raw.get("resolved_location"), dict) else None
         location_category_clean = clean_title(location_category or "")
         location_status_clean = clean_title(location_status or "")
+        location_kind_clean = clean_title(location_kind or "")
+        semantic_status_clean = clean_title(location_resolution_status or "")
         travel_required_raw = raw.get("travel_required")
         if travel_required_raw is None:
             travel_required = not (
-                location_category_clean in {"home_or_online", "none"}
+                location_category_clean in {"home_or_online", "none", "no_location"}
                 or location_status_clean in {"not_required", "no_location_required"}
+                or location_kind_clean in {"no_location_required", "online"}
+                or semantic_status_clean in {"not_required", "no_location_required"}
             )
         elif isinstance(travel_required_raw, str):
             travel_required = travel_required_raw.strip().lower() not in {"0", "false", "no", "off"}
@@ -427,6 +433,13 @@ class StateModelMixin:
             "location_source": location_source,
             "location_confidence": location_confidence,
             "location_normalized": location_normalized,
+            "raw_location_text": raw.get("raw_location_text"),
+            "location_kind": location_kind,
+            "location_resolution_status": location_resolution_status,
+            "no_location_reason": raw.get("no_location_reason"),
+            "semantic_confidence": raw.get("semantic_confidence"),
+            "needs_clarification": bool(raw.get("needs_clarification", False)),
+            "parse_notes": raw.get("parse_notes"),
             "saved_location_label": raw.get("saved_location_label"),
             "resolved_location": resolved_location,
             "raw_llm_location": raw.get("raw_llm_location"),

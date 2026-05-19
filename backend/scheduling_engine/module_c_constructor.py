@@ -185,6 +185,17 @@ class ModuleCConstructorMixin:
             # A. Gap Handling (between last_end and start_min)
             if start_min > last_end:
                 gap_dur = start_min - last_end
+                source_activity_id = (last_activity or {}).get("stable_activity_id") or (last_activity or {}).get("id")
+                destination_activity_id = act.get("stable_activity_id") or act.get("id")
+                support_links = {
+                    "source_activity_id": source_activity_id,
+                    "destination_activity_id": destination_activity_id,
+                    "related_activity_ids": [
+                        activity_id
+                        for activity_id in (source_activity_id, destination_activity_id)
+                        if activity_id
+                    ],
+                }
                 
                 # Calculate required overhead
                 route_entry = self._route_context_entry(last_activity, act) if last_activity and current_loc else None
@@ -226,18 +237,21 @@ class ModuleCConstructorMixin:
                     if buffer_dur > 0:
                         b_start = last_end + idle_at_current
                         blocks.append({
+                            "id": f"buffer-{source_activity_id}-{destination_activity_id}" if source_activity_id and destination_activity_id else None,
                             "block_type": "buffer",
                             "title": "Prep / Buffer",
                             "start": format_clock(b_start),
                             "end": format_clock(b_start + buffer_dur),
                             "duration_minutes": buffer_dur,
-                            "reason": "Preparation before travel"
+                            "reason": "Preparation before travel",
+                            **support_links,
                         })
                     
                     # 3. Transition block (Travel)
                     if travel_time > 0:
                         t_start = last_end + idle_at_current + buffer_dur
                         blocks.append({
+                            "id": f"travel-{source_activity_id}-{destination_activity_id}" if source_activity_id and destination_activity_id else None,
                             "block_type": "transition",
                             "type": "travel",
                             "title": f"Travel to {current_loc}",
@@ -251,12 +265,14 @@ class ModuleCConstructorMixin:
                             "route_duration_minutes": route_duration,
                             "from_coordinate": deepcopy(from_coordinate) if isinstance(from_coordinate, dict) else from_coordinate,
                             "to_coordinate": deepcopy(to_coordinate) if isinstance(to_coordinate, dict) else to_coordinate,
-                            "reason": f"Travel timed to arrive exactly for {act['title']}"
+                            "reason": f"Travel timed to arrive exactly for {act['title']}",
+                            **support_links,
                         })
                 else:
                     # Not enough time for full buffer + travel? 
                     # Force move immediately and mark as potentially tight
                     blocks.append({
+                        "id": f"travel-{source_activity_id}-{destination_activity_id}" if source_activity_id and destination_activity_id else None,
                         "block_type": "transition",
                         "type": "travel",
                         "title": f"Travel to {current_loc} (Tight)",
@@ -272,7 +288,8 @@ class ModuleCConstructorMixin:
                         "to_coordinate": deepcopy(to_coordinate) if isinstance(to_coordinate, dict) else to_coordinate,
                         "is_tight": True,
                         "warning_code": WARNING_TIGHT_TRANSITION,
-                        "reason": "Immediate departure required due to tight schedule"
+                        "reason": "Immediate departure required due to tight schedule",
+                        **support_links,
                     })
 
             # B. Activity Block
@@ -1350,8 +1367,8 @@ class ModuleCConstructorMixin:
             travel = estimate_travel_minutes(left.get("location"), right.get("location"))
             travel = max(travel, min_travel or 0)
         prep = max(
-            left.get("prep_buffer", DEFAULT_PREP_BUFFER),
-            right.get("prep_buffer", DEFAULT_PREP_BUFFER),
+            int(left.get("prep_buffer", DEFAULT_PREP_BUFFER) or 0),
+            int(right.get("prep_buffer", DEFAULT_PREP_BUFFER) or 0),
         )
         return travel + prep
 

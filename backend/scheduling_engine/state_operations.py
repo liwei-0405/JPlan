@@ -255,6 +255,160 @@ class StateOperationsMixin:
             flags=re.IGNORECASE,
         ))
 
+    def _location_field_names(self) -> Tuple[str, ...]:
+        return (
+            "location",
+            "location_label",
+            "location_category",
+            "location_status",
+            "location_source",
+            "location_confidence",
+            "location_normalized",
+            "location_warning",
+            "saved_location_label",
+            "resolved_location",
+            "raw_location_text",
+            "location_kind",
+            "location_resolution_status",
+            "no_location_reason",
+            "semantic_confidence",
+            "needs_clarification",
+            "parse_notes",
+            "raw_llm_location",
+            "explicit_user_location",
+            "area_preference",
+            "same_location_as",
+            "inherited_from_activity_id",
+            "latitude",
+            "longitude",
+            "lat",
+            "lng",
+            "travel_required",
+        )
+
+    def _operation_has_location_payload(self, operation: Dict[str, Any]) -> bool:
+        return any(operation.get(field) is not None for field in self._location_field_names())
+
+    def _payload_has_coordinates(self, payload: Any) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        return (
+            payload.get("latitude") is not None
+            and payload.get("longitude") is not None
+        ) or (
+            payload.get("lat") is not None
+            and (payload.get("lng") is not None or payload.get("lon") is not None)
+        )
+
+    def _message_has_explicit_location_or_modality_change(self, message: str) -> bool:
+        clean = clean_title(message or "")
+        if not clean:
+            return False
+        if re.search(r"\b(change|update|set|switch)\s+(the\s+)?(location|place|venue)\s+(to|as)\b", clean):
+            return True
+        if re.search(r"\b(change|update|set|switch)\s+.*\b(to|at|near)\s+[a-z0-9]", clean) and not re.search(r"\b(to|at)\s+(after|before|earlier|later)\b", clean):
+            return True
+        if re.search(r"\b(at|near|inside|around)\s+(?!after\b|before\b|later\b|earlier\b)[a-z0-9]", clean):
+            return True
+        if re.search(r"\b(make|set|change|switch)\s+.*\b(online|virtual|remote|home|at home)\b", clean):
+            return True
+        return False
+
+    def _operation_has_explicit_location_change(self, operation: Dict[str, Any]) -> bool:
+        if operation.get("explicit_user_location") is True:
+            return True
+        if self._payload_has_coordinates(operation.get("resolved_location")):
+            return True
+        if operation.get("latitude") is not None and operation.get("longitude") is not None:
+            return True
+        if operation.get("lat") is not None and (operation.get("lng") is not None or operation.get("lon") is not None):
+            return True
+        source = clean_title(operation.get("location_source") or "")
+        if source in {
+            "saved_location",
+            "saved_profile",
+            "selected_geocode",
+            "geocode",
+            "geocode_result",
+            "map_pin",
+            "recent",
+            "recent_location",
+            "same_as_activity",
+            "same_label_reuse",
+            "user_selected",
+            "event_confirmed",
+        }:
+            return True
+        if operation.get("same_location_as") and source != "inferred_from_anchor":
+            return True
+        return self._message_has_explicit_location_or_modality_change(operation.get("_user_message") or "")
+
+    def _copy_operation_location_fields(self, target: Dict[str, Any], operation: Dict[str, Any]) -> None:
+        for field in self._location_field_names():
+            if field in operation:
+                target[field] = deepcopy(operation.get(field))
+
+    def _restore_location_fields(self, target: Dict[str, Any], source: Dict[str, Any]) -> None:
+        for field in self._location_field_names():
+            if field in source:
+                target[field] = deepcopy(source.get(field))
+            else:
+                target.pop(field, None)
+
+    def _parser_location_label_for_log(self, operation: Dict[str, Any]) -> str:
+        for field in ("location_label", "location", "location_normalized", "raw_location_text", "location_category", "raw_llm_location"):
+            value = operation.get(field)
+            if value:
+                return str(value)
+        return "(none)"
+
+    def _cleanup_block_kind(self, block: Dict[str, Any]) -> str:
+        return clean_title(block.get("block_type") or block.get("type") or "")
+
+    def _is_cleanup_support_block(self, block: Dict[str, Any]) -> bool:
+        block_kind = self._cleanup_block_kind(block)
+        title = clean_title(block.get("title") or "")
+        return (
+            block_kind in {"transition", "travel", "buffer", "prep"}
+            or title.startswith("travel to")
+            or "buffer" in title
+        )
+
+    def _support_block_related_ids(self, block: Dict[str, Any]) -> set[str]:
+        values: List[Any] = [
+            block.get("source_activity_id"),
+            block.get("destination_activity_id"),
+            block.get("from_activity_id"),
+            block.get("to_activity_id"),
+        ]
+        related = block.get("related_activity_ids")
+        if isinstance(related, list):
+            values.extend(related)
+        return {str(value) for value in values if value}
+
+    def _prune_support_blocks_for_deleted_activities(
+        self,
+        blocks: Optional[List[Dict[str, Any]]],
+        deleted_activity_ids: List[str],
+    ) -> List[Dict[str, Any]]:
+        if not blocks:
+            return []
+        deleted = {str(activity_id) for activity_id in deleted_activity_ids if activity_id}
+        if not deleted:
+            return blocks
+        pruned: List[Dict[str, Any]] = []
+        for block in blocks:
+            block_id = str(block.get("stable_activity_id") or block.get("id") or "")
+            if block_id in deleted:
+                continue
+            if self._is_cleanup_support_block(block):
+                related_ids = self._support_block_related_ids(block)
+                generated_id = str(block.get("id") or "")
+                if related_ids.intersection(deleted) or any(activity_id and activity_id in generated_id for activity_id in deleted):
+                    continue
+            pruned.append(block)
+        return pruned
+
     def _strip_parser_wrapper_from_title(self, title: str) -> str:
         text = clean_title(title or "")
         text = re.sub(
@@ -341,23 +495,8 @@ class StateOperationsMixin:
             converted.pop("duration_minutes", None)
         if not re.search(r"\bpriority\b", clean_title(message)):
             converted.pop("priority", None)
-        if converted.get("raw_llm_location") is None and not converted.get("explicit_user_location"):
-            for field in (
-                "location",
-                "location_label",
-                "location_category",
-                "location_status",
-                "location_source",
-                "location_confidence",
-                "location_normalized",
-                "location_warning",
-                "resolved_location",
-                "latitude",
-                "longitude",
-                "lat",
-                "lng",
-                "travel_required",
-            ):
+        if not self._operation_has_explicit_location_change(converted):
+            for field in self._location_field_names():
                 converted.pop(field, None)
 
         jlog(
@@ -765,8 +904,35 @@ class StateOperationsMixin:
         updated.setdefault("trace", [])
 
         priority_update_only = bool(operation.get("priority_update_only")) and operation.get("priority") is not None
+        preserve_location_metadata = (
+            bool(operation.get("preserve_existing_fields"))
+            and not self._operation_has_explicit_location_change(operation)
+        )
+        preserved_location_fields = {
+            field: deepcopy(existing.get(field))
+            for field in self._location_field_names()
+            if field in existing
+        }
+        if preserve_location_metadata and self._operation_has_location_payload(operation):
+            kept_label = (
+                existing.get("location_label")
+                or existing.get("location")
+                or existing.get("location_normalized")
+                or "(none)"
+            )
+            jlog(
+                "STATE",
+                (
+                    f"title={existing.get('title')} kept={kept_label} "
+                    f"ignored_parser_location={self._parser_location_label_for_log(operation)}"
+                ),
+                "PRESERVE_LOCATION",
+            )
+
         for field in ("title", "priority", "location", "notes", "edit_reason", "sequence_index"):
             if field == "title" and (operation.get("_preserve_resolved_title") or priority_update_only):
+                continue
+            if field == "location" and preserve_location_metadata:
                 continue
             if operation.get(field) is not None:
                 if field == "priority":
@@ -865,7 +1031,12 @@ class StateOperationsMixin:
             updated["priority_update_only"] = True
             updated["priority_direction"] = operation.get("priority_direction")
 
-        if updated.get("location"):
+        if preserve_location_metadata:
+            self._restore_location_fields(updated, preserved_location_fields)
+        elif self._operation_has_explicit_location_change(operation):
+            self._copy_operation_location_fields(updated, operation)
+
+        if updated.get("location") and not updated.get("location_normalized"):
             updated["location_normalized"] = _normalize_location(updated.get("location"))
 
         note = operation.get("notes") or f"{operation.get('op', 'update')} request applied to existing activity."
@@ -1121,6 +1292,12 @@ class StateOperationsMixin:
                     operation,
                     latest_operation_message,
                     operation_scopes.get(index),
+                )
+                normalized_operation = self._apply_semantic_location_payload(
+                    normalized_operation,
+                    latest_operation_message,
+                    operation_scopes.get(index),
+                    saved_locations or [],
                 )
                 if normalized_operation.get("location_status") and "raw_llm_location" in normalized_operation:
                     self._enrich_existing_location_payload(
@@ -1577,6 +1754,11 @@ class StateOperationsMixin:
         for key in REFINEMENT_META_KEYS:
             updated_envelope[key] = planned_result.get(key)
         updated_envelope = self._apply_accurate_travel_if_requested(updated_envelope, saved_locations or [])
+        if deleted_activity_ids:
+            updated_envelope["schedule_blocks"] = self._prune_support_blocks_for_deleted_activities(
+                updated_envelope.get("schedule_blocks") or [],
+                deleted_activity_ids,
+            )
         envelope_status = updated_envelope.get("status") or envelope_status
         if allow_clash and conflicts and not is_initial_generation_mode:
             result_status = "success"
@@ -1675,6 +1857,13 @@ class StateOperationsMixin:
             "location_source": item.get("location_source"),
             "location_confidence": item.get("location_confidence"),
             "location_normalized": item.get("location_normalized") or _normalize_location(location),
+            "raw_location_text": item.get("raw_location_text"),
+            "location_kind": item.get("location_kind"),
+            "location_resolution_status": item.get("location_resolution_status"),
+            "no_location_reason": item.get("no_location_reason"),
+            "semantic_confidence": item.get("semantic_confidence"),
+            "needs_clarification": bool(item.get("needs_clarification", False)),
+            "parse_notes": item.get("parse_notes"),
             "saved_location_label": item.get("saved_location_label"),
             "resolved_location": deepcopy(item.get("resolved_location")) if isinstance(item.get("resolved_location"), dict) else None,
             "raw_llm_location": item.get("raw_llm_location"),
@@ -1762,10 +1951,21 @@ class StateOperationsMixin:
                 continue
 
             prep_minutes = max(
-                current.get("prep_buffer", DEFAULT_PREP_BUFFER),
-                nxt.get("prep_buffer", DEFAULT_PREP_BUFFER),
+                int(current.get("prep_buffer", DEFAULT_PREP_BUFFER) or 0),
+                int(nxt.get("prep_buffer", DEFAULT_PREP_BUFFER) or 0),
             )
             travel_minutes = estimate_travel_minutes(current.get("location"), nxt.get("location"))
+            source_activity_id = current.get("stable_activity_id") or current.get("id")
+            destination_activity_id = nxt.get("stable_activity_id") or nxt.get("id")
+            support_links = {
+                "source_activity_id": source_activity_id,
+                "destination_activity_id": destination_activity_id,
+                "related_activity_ids": [
+                    activity_id
+                    for activity_id in (source_activity_id, destination_activity_id)
+                    if activity_id
+                ],
+            }
 
             block_cursor = current["scheduled_end"]
             # UI Fix: Only show buffers if they are substantial (> 5 minutes) to avoid clutter
@@ -1777,6 +1977,7 @@ class StateOperationsMixin:
                     "startTime": format_clock(block_cursor),
                     "endTime": format_clock(block_cursor + prep_minutes),
                     "duration": self._duration_label(prep_minutes),
+                    **support_links,
                 })
                 block_cursor += prep_minutes
 
@@ -1789,6 +1990,7 @@ class StateOperationsMixin:
                     "endTime": format_clock(block_cursor + travel_minutes),
                     "duration": self._duration_label(travel_minutes),
                     "location": nxt.get("location"),
+                    **support_links,
                 })
 
         for item in ordered:

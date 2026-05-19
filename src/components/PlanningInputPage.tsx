@@ -92,11 +92,18 @@ type RepairSuggestion = {
   type?: string;
   title?: string;
   from?: string;
+  from_end?: string;
   to?: string;
+  to_end?: string;
   reason?: string;
   impact?: string;
   requires_user_confirmation?: boolean;
+  would_change?: boolean;
 };
+
+function isAccurateTravelEnabled(schedule?: DailySchedule | null): boolean {
+  return Boolean(schedule?.accurate_travel_time || schedule?.preferences?.accurate_travel_time);
+}
 
 export function PlanningInputPage({
   onScheduleGenerated,
@@ -124,7 +131,7 @@ export function PlanningInputPage({
     activities: []
   });
   const [allowClash, setAllowClash] = useState<boolean>(Boolean(initialSchedule?.allow_clash));
-  const [accurateTravelTime, setAccurateTravelTime] = useState<boolean>(Boolean(initialSchedule?.accurate_travel_time));
+  const [accurateTravelTime, setAccurateTravelTime] = useState<boolean>(isAccurateTravelEnabled(initialSchedule));
   const [locationInputs, setLocationInputs] = useState<Record<string, string>>({});
   const [locationCandidates, setLocationCandidates] = useState<Record<string, GeocodeCandidate[]>>({});
   const [resolvingLocationId, setResolvingLocationId] = useState<string | null>(null);
@@ -148,7 +155,7 @@ export function PlanningInputPage({
           if (data) {
             setPreviewSchedule(data as DailySchedule);
             setAllowClash(Boolean((data as DailySchedule).allow_clash));
-            setAccurateTravelTime(Boolean((data as DailySchedule).accurate_travel_time));
+            setAccurateTravelTime(isAccurateTravelEnabled(data as DailySchedule));
           }
         } catch (err) {
           console.error("Failed to auto-load schedule:", err);
@@ -185,6 +192,22 @@ export function PlanningInputPage({
   const withPlanningPreferences = (schedule: DailySchedule): DailySchedule => (
     mergePlanningPreferences(schedule, user?.id, planningPreferences)
   );
+
+  const applyReturnedSchedule = (schedule: DailySchedule) => {
+    const scheduleWithPrefs = withPlanningPreferences(schedule);
+    const nextAccurateTravelTime = isAccurateTravelEnabled(scheduleWithPrefs);
+    setAccurateTravelTime(nextAccurateTravelTime);
+    setPreviewSchedule({
+      ...scheduleWithPrefs,
+      allow_clash: allowClash,
+      accurate_travel_time: nextAccurateTravelTime,
+      preferences: {
+        ...(scheduleWithPrefs.preferences || {}),
+        allow_clash: allowClash,
+        accurate_travel_time: nextAccurateTravelTime,
+      },
+    });
+  };
 
   const rememberRecentLocation = (location: PlanningLocation) => {
     setRecentLocations(addRecentLocation(user?.id, location));
@@ -478,6 +501,11 @@ export function PlanningInputPage({
       ...previewSchedule,
       activities: updatedActivities,
       schedule_blocks: removeDeletedActivityBlock(previewSchedule.schedule_blocks, editingEvent.id),
+      travel_validation_status: accurateTravelTime ? "not_requested" : previewSchedule.travel_validation_status,
+      route_repair_actions: [],
+      route_conflicts: [],
+      pending_repair_suggestions: [],
+      start_route_summary: null,
     });
     setEditingEvent(null);
   };
@@ -526,11 +554,7 @@ export function PlanningInputPage({
       }]);
 
       if (data.schedule_data) {
-        setPreviewSchedule({
-          ...(data.schedule_data as DailySchedule),
-          allow_clash: allowClash,
-          accurate_travel_time: accurateTravelTime,
-        });
+        applyReturnedSchedule(data.schedule_data as DailySchedule);
       }
     } catch (error) {
       setConversationHistory(prev => [...prev, {
@@ -550,13 +574,26 @@ export function PlanningInputPage({
   const routeUnfitActivities = (previewSchedule?.unfit_activities || []) as Array<Record<string, unknown>>;
   const isLocationPending = previewSchedule?.schedule_status === "location_pending" || previewSchedule?.status === "location_pending";
   const startRouteSummary = (previewSchedule?.start_route_summary || {}) as Record<string, unknown>;
+  const repairSuggestionHasChange = (suggestion: RepairSuggestion) => {
+    if (suggestion.would_change === false) return false;
+    const sameStart = String(suggestion.from || "") === String(suggestion.to || "");
+    const sameEnd = String(suggestion.from_end || "") === String(suggestion.to_end || "");
+    return !(sameStart && sameEnd);
+  };
+  const actionableRepairSuggestions = pendingRepairSuggestions.filter(repairSuggestionHasChange);
   const startRouteSummaryText = (() => {
     const startLocation = String(startRouteSummary.start_location || "").trim();
     const firstEvent = String(startRouteSummary.first_physical_event || "").trim();
+    const destinationLocation = String(
+      startRouteSummary.first_physical_event_location ||
+      startRouteSummary.destination_location ||
+      startRouteSummary.to_location ||
+      firstEvent
+    ).trim();
     const leaveBy = String(startRouteSummary.leave_by || "").trim();
     const duration = Number(startRouteSummary.travel_duration_minutes || 0);
-    if (!startLocation || !firstEvent || !leaveBy || !duration) return "";
-    return `Leave ${startLocation} by ${leaveBy} · ${duration} min travel to ${firstEvent}`;
+    if (!startLocation || !destinationLocation || !leaveBy || !duration) return "";
+    return `Leave ${startLocation} by ${leaveBy} · ${duration} min travel to ${destinationLocation}`;
   })();
 
   const normalizeLocationTarget = (value?: string | null) => (value || "").trim().toLowerCase();
@@ -571,7 +608,7 @@ export function PlanningInputPage({
   };
 
   const travelValidationMessage = (schedule: DailySchedule) => {
-    const suggestions = (schedule.pending_repair_suggestions || []) as RepairSuggestion[];
+    const suggestions = ((schedule.pending_repair_suggestions || []) as RepairSuggestion[]).filter(repairSuggestionHasChange);
     if (suggestions.length > 0) {
       const suggestion = suggestions[0];
       return {
@@ -879,13 +916,34 @@ export function PlanningInputPage({
 
   const runTravelValidation = async (source: "toggle" | "manual" = "manual") => {
     const hasScheduleItems = Boolean((previewSchedule?.schedule_blocks?.length || 0) || (previewSchedule?.activities?.length || 0));
-    if (!previewSchedule || !user?.id || !hasScheduleItems) {
-      setAccurateTravelTime(false);
+    if (!previewSchedule || !user?.id) {
       setConversationHistory(prev => [...prev, {
         role: "assistant",
         message: "Create or select a plan first, then I can calculate accurate travel time.",
         status: "clarification_needed",
       }]);
+      return;
+    }
+    if (!hasScheduleItems) {
+      if (source === "toggle") {
+        const scheduleWithPrefs = withPlanningPreferences(previewSchedule);
+        setPreviewSchedule({
+          ...scheduleWithPrefs,
+          allow_clash: allowClash,
+          accurate_travel_time: true,
+          preferences: {
+            ...(scheduleWithPrefs.preferences || {}),
+            accurate_travel_time: true,
+          },
+          travel_validation_status: "not_requested",
+        });
+      } else {
+        setConversationHistory(prev => [...prev, {
+          role: "assistant",
+          message: "Add at least one scheduled item first, then I can calculate accurate travel time.",
+          status: "clarification_needed",
+        }]);
+      }
       return;
     }
     setIsProcessing(true);
@@ -901,11 +959,7 @@ export function PlanningInputPage({
           accurate_travel_time: true,
         },
       }, user.id, source);
-      setPreviewSchedule({
-        ...withPlanningPreferences(validated),
-        allow_clash: allowClash,
-        accurate_travel_time: true,
-      });
+      applyReturnedSchedule(validated);
       const reply = travelValidationMessage(validated);
       setConversationHistory(prev => [...prev, {
         role: "assistant",
@@ -953,11 +1007,7 @@ export function PlanningInputPage({
         status: data.reply_status,
       }]);
       if (data.schedule_data) {
-        setPreviewSchedule({
-          ...withPlanningPreferences(data.schedule_data as DailySchedule),
-          allow_clash: allowClash,
-          accurate_travel_time: accurateTravelTime,
-        });
+        applyReturnedSchedule(data.schedule_data as DailySchedule);
       }
     } catch (error) {
       setConversationHistory(prev => [...prev, {
@@ -1135,7 +1185,7 @@ export function PlanningInputPage({
     setIsEditingPlanSettings(false);
   };
 
-  const timelineActivities = previewSchedule ? [...(previewSchedule.schedule_blocks || previewSchedule.activities || [])] : [];
+  const timelineActivities = previewSchedule ? withDisplayOnlyStartRouteRow(previewSchedule) : [];
 
   return (
     <div className="min-h-screen bg-gradient-to-b from-background to-secondary/10">
@@ -1341,13 +1391,13 @@ export function PlanningInputPage({
                         </div>
                       </div>
                     ))}
-                    {pendingRepairSuggestions.length > 0 && (
+                    {actionableRepairSuggestions.length > 0 && (
                       <div className="rounded-2xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-950">
                         <div className="flex items-start gap-2">
                           <Clock size={16} className="mt-0.5 shrink-0" />
                           <div className="min-w-0 flex-1">
                             <p className="font-medium">Accurate travel repair suggestion</p>
-                            {pendingRepairSuggestions.map((suggestion) => (
+                            {actionableRepairSuggestions.map((suggestion) => (
                               <p key={suggestion.id || suggestion.title} className="mt-1 text-xs text-amber-800">
                                 Move {suggestion.title || "activity"} from {suggestion.from || "its current time"} to {suggestion.to || "a safer time"}.
                                 {suggestion.reason ? ` ${suggestion.reason}.` : ""}
@@ -1376,47 +1426,57 @@ export function PlanningInputPage({
                         </div>
                       </div>
                     )}
-                    {previewSchedule && (startRouteSummaryText || routeRepairActions.length > 0 || routeUnfitActivities.length > 0 || previewSchedule.travel_validation_status === "route_conflict") && (
-                      <div className={`rounded-2xl border p-3 text-sm ${
-                        previewSchedule.travel_validation_status === "route_conflict"
-                          ? "border-red-200 bg-red-50 text-red-950"
-                          : previewSchedule.travel_validation_status === "partial_feasible_with_unfit"
-                            ? "border-amber-200 bg-amber-50 text-amber-950"
-                            : "border-emerald-200 bg-emerald-50 text-emerald-950"
-                      }`}>
+                    {previewSchedule && startRouteSummaryText && (
+                      <div className="rounded-2xl border border-sky-200 bg-sky-50 p-3 text-sm text-sky-950">
                         <div className="flex items-start gap-2">
                           <Clock size={16} className="mt-0.5 shrink-0" />
                           <div className="min-w-0 flex-1">
-                            <p className="font-medium">
-                              {previewSchedule.travel_validation_status === "repaired_validated"
-                                ? "Adjusted for accurate travel"
-                                : previewSchedule.travel_validation_status === "partial_feasible_with_unfit"
-                                  ? "Some items could not fit"
-                                  : previewSchedule.travel_validation_status === "route_conflict"
-                                    ? "Route timing needs attention"
-                                    : "Accurate travel start route"}
-                            </p>
-                            {startRouteSummaryText && (
-                              <p className="mt-1 text-xs opacity-90">
-                                {startRouteSummaryText}
-                              </p>
-                            )}
+                            <p className="font-medium">Start route</p>
+                            <p className="mt-1 text-xs text-sky-800">{startRouteSummaryText}</p>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                    {previewSchedule && routeRepairActions.length > 0 && (
+                      <div className="rounded-2xl border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-950">
+                        <div className="flex items-start gap-2">
+                          <Clock size={16} className="mt-0.5 shrink-0" />
+                          <div className="min-w-0 flex-1">
+                            <p className="font-medium">Accurate travel adjustments</p>
                             {routeRepairActions.map((action, index) => (
-                              <p key={`${action.title || "repair"}-${index}`} className="mt-1 text-xs opacity-90">
+                              <p key={`${action.title || "repair"}-${index}`} className="mt-1 text-xs text-emerald-800">
                                 {String(action.title || "Activity")} moved from {String(action.from || "its original time")} to {String(action.to || "a route-safe time")}.
                                 {action.reason ? ` ${String(action.reason)}.` : ""}
                               </p>
                             ))}
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                    {previewSchedule && routeUnfitActivities.length > 0 && (
+                      <div className="rounded-2xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-950">
+                        <div className="flex items-start gap-2">
+                          <Clock size={16} className="mt-0.5 shrink-0" />
+                          <div className="min-w-0 flex-1">
+                            <p className="font-medium">Some items could not fit</p>
                             {routeUnfitActivities.map((item, index) => (
-                              <p key={`${item.title || "unfit"}-${index}`} className="mt-1 text-xs opacity-90">
+                              <p key={`${item.title || "unfit"}-${index}`} className="mt-1 text-xs text-amber-800">
                                 {String(item.title || "One flexible activity")} could not fit after accurate travel time.
                               </p>
                             ))}
-                            {previewSchedule.travel_validation_status === "route_conflict" && routeRepairActions.length === 0 && routeUnfitActivities.length === 0 && (
-                              <p className="mt-1 text-xs opacity-90">
-                                Accurate travel time still creates an unresolved route conflict.
-                              </p>
-                            )}
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                    {previewSchedule?.travel_validation_status === "route_conflict" && (
+                      <div className="rounded-2xl border border-red-200 bg-red-50 p-3 text-sm text-red-950">
+                        <div className="flex items-start gap-2">
+                          <Clock size={16} className="mt-0.5 shrink-0" />
+                          <div className="min-w-0 flex-1">
+                            <p className="font-medium">Route timing needs attention</p>
+                            <p className="mt-1 text-xs text-red-800">
+                              Accurate travel time still creates an unresolved route conflict.
+                            </p>
                           </div>
                         </div>
                       </div>
@@ -1873,6 +1933,44 @@ function calculateEndTime(startTime: string, durationStr: string): string {
   return formatTo12Hour(`${h}:${m}`);
 }
 
+function withDisplayOnlyStartRouteRow(schedule: DailySchedule): ActivityBlock[] {
+  const baseBlocks = [...(schedule.schedule_blocks || schedule.activities || [])];
+  const summary = (schedule.start_route_summary || {}) as Record<string, unknown>;
+  const startLocation = String(summary.start_location || "").trim();
+  const firstEvent = String(summary.first_physical_event || "").trim();
+  const destinationLocation = String(
+    summary.first_physical_event_location ||
+    summary.destination_location ||
+    summary.to_location ||
+    firstEvent
+  ).trim();
+  const leaveBy = String(summary.leave_by || "").trim();
+  const duration = Number(summary.travel_duration_minutes || 0);
+  if (!startLocation || !destinationLocation || !leaveBy || !duration) {
+    return baseBlocks;
+  }
+
+  const explicitEnd = String(summary.first_physical_event_start || "").trim();
+  const endTime = explicitEnd || minutesTo12Hour(timeToMinutes(leaveBy) + duration);
+  const startRouteBlock: ActivityBlock = {
+    id: "__start_route__",
+    type: "start_route",
+    block_type: "start_route",
+    title: `Leave ${startLocation} by ${leaveBy}`,
+    startTime: leaveBy,
+    endTime,
+    start: leaveBy,
+    end: endTime,
+    duration_minutes: duration,
+    display_label: `Leave ${startLocation} by ${leaveBy} · ${duration} min travel to ${destinationLocation}`,
+    location: destinationLocation,
+    is_start_route: true,
+    display_only: true,
+  };
+
+  return [...baseBlocks, startRouteBlock];
+}
+
 function syncActivityBlocks(
   existingBlocks: ActivityBlock[] | undefined,
   activities: ActivityBlock[],
@@ -1921,9 +2019,68 @@ function removeDeletedActivityBlock(
   deletedId: string,
 ): ActivityBlock[] | undefined {
   if (!existingBlocks) return existingBlocks;
-  return existingBlocks.filter((block) => block.id !== deletedId);
+  const deletedIndex = existingBlocks.findIndex((block) => blockMatchesDeletedActivity(block, deletedId));
+  const fallbackSupportIndexes = new Set<number>();
+
+  if (deletedIndex >= 0) {
+    for (let index = deletedIndex - 1; index >= 0; index -= 1) {
+      const block = existingBlocks[index];
+      if (!isSupportCleanupBlock(block) || isDisplayOnlyStartRouteBlock(block)) break;
+      fallbackSupportIndexes.add(index);
+    }
+    for (let index = deletedIndex + 1; index < existingBlocks.length; index += 1) {
+      const block = existingBlocks[index];
+      if (!isSupportCleanupBlock(block) || isDisplayOnlyStartRouteBlock(block)) break;
+      fallbackSupportIndexes.add(index);
+    }
+  }
+
+  return existingBlocks.filter((block, index) => {
+    if (blockMatchesDeletedActivity(block, deletedId)) return false;
+    if (isDisplayOnlyStartRouteBlock(block)) return true;
+    if (isSupportLinkedToDeletedActivity(block, deletedId)) return false;
+    if (fallbackSupportIndexes.has(index)) return false;
+    return true;
+  });
 }
 
+function blockMatchesDeletedActivity(block: ActivityBlock, deletedId: string): boolean {
+  return String(block.id || "") === deletedId || String(block.stable_activity_id || "") === deletedId;
+}
+
+function isDisplayOnlyStartRouteBlock(block: ActivityBlock): boolean {
+  return Boolean(block.is_start_route || block.display_only || block.type === "start_route" || block.block_type === "start_route");
+}
+
+function isSupportCleanupBlock(block: ActivityBlock): boolean {
+  const blockType = String(block.block_type || block.type || "").toLowerCase();
+  const title = String(block.title || "").toLowerCase();
+  return blockType === "travel"
+    || blockType === "transition"
+    || blockType === "buffer"
+    || title.startsWith("travel to")
+    || title.includes("buffer");
+}
+
+function isSupportLinkedToDeletedActivity(block: ActivityBlock, deletedId: string): boolean {
+  if (!isSupportCleanupBlock(block)) return false;
+  const relatedIds = [
+    block.source_activity_id,
+    block.destination_activity_id,
+    ...(Array.isArray(block.related_activity_ids) ? block.related_activity_ids : []),
+  ].map((value) => String(value || "")).filter(Boolean);
+  if (relatedIds.includes(deletedId)) return true;
+  return Boolean(block.id && String(block.id).includes(deletedId));
+}
+
+function minutesTo12Hour(totalMinutes: number): string {
+  const normalized = ((totalMinutes % (24 * 60)) + (24 * 60)) % (24 * 60);
+  const hours = Math.floor(normalized / 60);
+  const minutes = normalized % 60;
+  const period = hours >= 12 ? "PM" : "AM";
+  const displayHour = hours % 12 || 12;
+  return `${displayHour}:${minutes.toString().padStart(2, "0")} ${period}`;
+}
 
 function formatTo12Hour(timeStr: string): string {
   if (!timeStr) return "";

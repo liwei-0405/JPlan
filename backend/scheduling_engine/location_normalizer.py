@@ -64,9 +64,14 @@ class LocationNormalizerMixin:
             jlog("SOFT_PREF", "\n".join(timing_lines), "SUMMARY")
 
     def _location_summary_line(self, title: str, operation: Dict[str, Any]) -> str:
+        semantic_status = clean_title(
+            operation.get("location_resolution_status")
+            or operation.get("location_status")
+            or ""
+        )
         if (
             operation.get("travel_required") is False
-            or clean_title(operation.get("location_status") or "") == "not_required"
+            or semantic_status == "not_required"
             or clean_title(operation.get("location_category") or "") == "home_or_online"
         ):
             return f"{title} -> no location required"
@@ -79,7 +84,9 @@ class LocationNormalizerMixin:
         )
         if self._operation_has_coordinates(operation):
             return f"{title} -> {label} (coordinates confirmed)"
-        if clean_title(operation.get("location_status") or "") in {"needs_resolution", "unresolved", "resolved_default"}:
+        if semantic_status == "resolved_coordinates":
+            return f"{title} -> {label} (resolved)"
+        if semantic_status in {"needs_resolution", "unresolved", "resolved_default", "needs_coordinates", "ambiguous"}:
             return f"{title} -> {label} (needs coordinates)"
         return f"{title} -> {label} (needs coordinates)"
 
@@ -97,6 +104,283 @@ class LocationNormalizerMixin:
             operation.get("lat") is not None
             and operation.get("lng") is not None
         )
+
+    def _operation_has_semantic_location_fields(self, operation: Dict[str, Any]) -> bool:
+        semantic_fields = {
+            "raw_location_text",
+            "location_kind",
+            "location_resolution_status",
+            "no_location_reason",
+            "semantic_confidence",
+            "location_confidence",
+            "needs_clarification",
+            "parse_notes",
+        }
+        return any(field in operation for field in semantic_fields)
+
+    def _clean_location_kind(self, value: Any) -> str:
+        kind = clean_title(value or "").replace(" ", "_").replace("-", "_")
+        aliases = {
+            "exact_place": "exact_named_place",
+            "named_place": "exact_named_place",
+            "area": "area_only",
+            "category": "category_only",
+            "physical_unknown": "unknown_physical",
+            "none": "no_location_required",
+            "no_location": "no_location_required",
+            "not_required": "no_location_required",
+            "virtual": "online",
+            "remote": "online",
+        }
+        return aliases.get(kind, kind)
+
+    def _clean_location_resolution_status(self, value: Any) -> str:
+        status = clean_title(value or "").replace(" ", "_").replace("-", "_")
+        aliases = {
+            "needs_resolution": "needs_coordinates",
+            "missing_coordinates": "needs_coordinates",
+            "unresolved": "needs_coordinates",
+            "fallback_used": "needs_coordinates",
+            "resolved": "resolved_coordinates",
+            "not_required": "not_required",
+            "no_location_required": "not_required",
+        }
+        return aliases.get(status, status)
+
+    def _normalize_semantic_category(self, value: Any) -> str:
+        category = clean_title(value or "").replace(" ", "_").replace("-", "_")
+        aliases = {
+            "hospital": "medical",
+            "clinic": "medical",
+            "doctor": "medical",
+            "restaurant": "meal_place",
+            "meal": "meal_place",
+            "food": "meal_place",
+            "grocery": "supermarket",
+            "groceries": "supermarket",
+            "store": "supermarket",
+            "fitness": "fitness_center",
+            "gym": "fitness_center",
+            "home_or_online": "home_or_online",
+            "online": "home_or_online",
+            "none": "no_location",
+            "no_location_required": "no_location",
+        }
+        return aliases.get(category, category or "unknown")
+
+    def _is_home_location_text(self, value: Any) -> bool:
+        return clean_title(value or "") in {"home", "at home", "my home", "my house", "house"}
+
+    def _is_online_location_text(self, value: Any) -> bool:
+        return clean_title(value or "") in {"online", "virtual", "remote", "zoom", "teams", "google meet"}
+
+    def _is_non_home_explicit_text(self, value: Any) -> bool:
+        text = clean_title(value or "")
+        return bool(text and text not in NULL_TEXT_VALUES and not self._is_home_location_text(text) and not self._is_online_location_text(text))
+
+    def _semantic_travel_required(self, operation: Dict[str, Any], category: str, kind: str) -> bool:
+        raw_text = operation.get("raw_location_text") or operation.get("raw_llm_location") or operation.get("location")
+        if operation.get("explicit_user_location") and self._is_non_home_explicit_text(raw_text):
+            return True
+        raw_value = operation.get("travel_required")
+        if isinstance(raw_value, str):
+            lowered = raw_value.strip().lower()
+            if lowered in {"0", "false", "no", "off"}:
+                raw_value = False
+            elif lowered in {"1", "true", "yes", "on"}:
+                raw_value = True
+        travel_required = bool(raw_value) if raw_value is not None else True
+        if kind in {"no_location_required", "online"} or category in {"home_or_online", "no_location", "none"}:
+            return False
+        if category in {"medical", "meal_place", "supermarket", "pharmacy", "fitness_center", "home", "institution", "campus_area", "office", "library"}:
+            return True
+        return travel_required
+
+    def _semantic_source(self, explicit_user_location: bool, status: str) -> str:
+        if explicit_user_location:
+            return "explicit_user"
+        if status == "not_required":
+            return "semantic_parser"
+        return "llm_semantic"
+
+    def _semantic_legacy_status(self, status: str, kind: str, has_coordinates: bool) -> str:
+        if kind in {"no_location_required", "online"} or status == "not_required":
+            return "not_required"
+        if has_coordinates or status == "resolved_coordinates":
+            return "resolved"
+        if status == "ambiguous":
+            return "unresolved"
+        return "needs_resolution"
+
+    def _generic_explicit_location_from_text(
+        self,
+        source_text: str,
+        title: str,
+    ) -> Optional[Dict[str, str]]:
+        text = re.sub(r"\s+", " ", source_text or "").strip()
+        if not text or not title:
+            return None
+        if self._is_no_location_required_activity(title, text, None, None):
+            return None
+        matches: List[Dict[str, str]] = []
+        for alias in self._activity_mention_aliases(title):
+            if not alias:
+                continue
+            alias_pattern = r"\b" + r"\s+".join(re.escape(token) for token in alias.split()) + r"\b"
+            for title_match in re.finditer(alias_pattern, text, flags=re.IGNORECASE):
+                window = text[title_match.end(): title_match.end() + 180]
+                location_match = re.search(
+                    r"\b(?:at|in|near)\s+([A-Za-z0-9@&.'’/()\- ]{2,80}?)(?=,|;|\.|\band\b|\bthen\b|\bfollowed\b|$)",
+                    window,
+                    flags=re.IGNORECASE,
+                )
+                if not location_match:
+                    continue
+                label = re.sub(r"\s+", " ", location_match.group(1)).strip(" .")
+                label = re.sub(
+                    r"\s+(?:from|between)\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b.*$",
+                    "",
+                    label,
+                    flags=re.IGNORECASE,
+                ).strip()
+                if not self._generic_location_label_is_plausible(label):
+                    continue
+                category = "home" if self._is_home_location_text(label) else self._infer_location_category(title, label)
+                matches.append({
+                    "label": label,
+                    "category": category,
+                    "kind": "home" if self._is_home_location_text(label) else "exact_named_place",
+                })
+        if not matches:
+            return None
+        non_home = [match for match in matches if not self._is_home_location_text(match.get("label"))]
+        return non_home[0] if non_home else matches[0]
+
+    def _generic_location_label_is_plausible(self, label: str) -> bool:
+        clean = clean_title(label or "")
+        if not clean or clean in {"a", "an", "the"}:
+            return False
+        if re.search(r"\b(?:morning|afternoon|evening|night|day|today|tomorrow|minutes?|minute|hours?|hour)\b", clean):
+            return False
+        if re.search(r"\b(?:way|rushed|realistic|productive|busy|focused|focus|documents?|assignment|implementation)\b", clean):
+            return False
+        if re.match(r"^(?:a|an|the)\s+\d", clean):
+            return False
+        return True
+
+    def _apply_semantic_location_payload(
+        self,
+        operation: Dict[str, Any],
+        source_text: str,
+        scoped_evidence: Optional[str],
+        saved_locations: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        if not self._operation_has_semantic_location_fields(operation):
+            return operation
+
+        updated = deepcopy(operation)
+        title = str(updated.get("title") or updated.get("target_title") or "").strip()
+        raw_location_text = clean_optional_text(
+            updated.get("raw_location_text")
+            or updated.get("raw_llm_location")
+            or (updated.get("location") if updated.get("explicit_user_location") else None)
+        )
+        kind = self._clean_location_kind(updated.get("location_kind"))
+        category = self._normalize_semantic_category(updated.get("location_category"))
+        status = self._clean_location_resolution_status(updated.get("location_resolution_status") or updated.get("location_status"))
+        explicit_user_location = bool(updated.get("explicit_user_location"))
+
+        generic_explicit = self._generic_explicit_location_from_text(scoped_evidence or source_text or "", title)
+        if generic_explicit and (
+            not raw_location_text
+            or (
+                clean_title(raw_location_text) in {"home", "store", "gym", "meal_place", "supermarket", "fitness center"}
+                and clean_title(generic_explicit.get("label")) != clean_title(raw_location_text)
+            )
+        ):
+            raw_location_text = generic_explicit.get("label")
+            kind = generic_explicit.get("kind") or kind or "exact_named_place"
+            if category in {"unknown", "home_or_online", "no_location"}:
+                category = self._normalize_semantic_category(generic_explicit.get("category"))
+            explicit_user_location = True
+
+        if raw_location_text and self._is_home_location_text(raw_location_text):
+            kind = "home"
+            category = "home"
+            explicit_user_location = True
+        elif raw_location_text and self._is_online_location_text(raw_location_text):
+            kind = "online"
+            category = "home_or_online"
+            explicit_user_location = True
+        elif self._is_non_home_explicit_text(raw_location_text) and kind in {"home", "online", "no_location_required"}:
+            ignored_default = kind
+            kind = "exact_named_place"
+            if category in {"home", "home_or_online", "no_location"}:
+                category = "unknown"
+            status = "needs_coordinates"
+            explicit_user_location = True
+            jlog(
+                "LOCATION_NORMALIZER",
+                f"title={title} kept=\"{raw_location_text}\" ignored_default=\"{ignored_default}\"",
+                "PRESERVE_EXPLICIT",
+            )
+
+        travel_required = self._semantic_travel_required(updated, category, kind)
+        if explicit_user_location and kind == "no_location_required":
+            kind = "exact_named_place"
+            travel_required = True
+            status = "needs_coordinates"
+        if status not in {"resolved_coordinates", "not_required", "ambiguous", "needs_coordinates"}:
+            status = "not_required" if not travel_required else "needs_coordinates"
+        if not travel_required:
+            kind = kind or "no_location_required"
+            status = "not_required"
+            category = "home_or_online" if kind == "online" else "no_location"
+
+        label: Optional[str]
+        if not travel_required:
+            label = None
+        elif kind == "home":
+            label = raw_location_text or updated.get("location") or "home"
+        elif kind == "category_only" and not raw_location_text:
+            label = None
+        else:
+            label = raw_location_text or clean_optional_text(updated.get("location"))
+
+        has_coordinates = self._operation_has_coordinates(updated)
+        legacy_status = self._semantic_legacy_status(status, kind, has_coordinates)
+        if kind == "home":
+            legacy_status = "resolved" if has_coordinates else "resolved"
+        source = self._semantic_source(explicit_user_location, status)
+        if label and kind == "home":
+            source = "explicit_user"
+
+        updated["raw_location_text"] = raw_location_text
+        updated["raw_llm_location"] = raw_location_text
+        updated["location_kind"] = kind or ("no_location_required" if not travel_required else "unknown_physical")
+        updated["location_resolution_status"] = status
+        updated["location_category"] = category or "unknown"
+        updated["location"] = label
+        updated["location_label"] = label
+        updated["location_normalized"] = _normalize_location(label)
+        updated["location_source"] = updated.get("location_source") or source
+        updated["location_status"] = legacy_status
+        updated["explicit_user_location"] = bool(explicit_user_location)
+        updated["travel_required"] = bool(travel_required)
+        if status == "ambiguous":
+            updated["needs_clarification"] = True
+        if legacy_status in {"needs_resolution", "unresolved"} and label:
+            updated.pop("location_warning", None)
+
+        jlog(
+            "SEMANTIC_PARSE",
+            (
+                f"title={title} raw=\"{raw_location_text}\" kind={updated.get('location_kind')} "
+                f"status={updated.get('location_resolution_status')}"
+            ),
+            "LOCATION",
+        )
+        return updated
 
     def _timing_summary_line(self, title: str, operation: Dict[str, Any]) -> str:
         parts: List[str] = []
@@ -133,6 +417,12 @@ class LocationNormalizerMixin:
                 operation,
                 source_text,
                 location_scopes.get(index),
+            )
+            operation = self._apply_semantic_location_payload(
+                operation,
+                source_text,
+                location_scopes.get(index),
+                saved_locations,
             )
             if operation.get("location_status") and "raw_llm_location" in operation:
                 self._enrich_existing_location_payload(
@@ -424,6 +714,25 @@ class LocationNormalizerMixin:
                 raw_location,
                 all_operations or [],
             )
+        generic_explicit = self._generic_explicit_location_from_text(transcription or request_text or scoped_evidence or "", title)
+        if generic_explicit and (
+            (not explicit_location and not self._is_non_home_explicit_text(raw_location))
+            or (
+                raw_location
+                and clean_title(raw_location) in {"home", "store", "gym", "meal_place", "supermarket", "fitness center"}
+                and clean_title(generic_explicit.get("label")) != clean_title(raw_location)
+            )
+        ):
+            if raw_location and self._is_non_home_explicit_text(generic_explicit.get("label")) and clean_title(raw_location) != clean_title(generic_explicit.get("label")):
+                jlog(
+                    "LOCATION_NORMALIZER",
+                    f"title={title} kept=\"{generic_explicit.get('label')}\" ignored_default=\"{raw_location}\"",
+                    "PRESERVE_EXPLICIT",
+                )
+            explicit_location = {
+                "label": generic_explicit.get("label") or "",
+                "category": generic_explicit.get("category") or "unknown",
+            }
         category = self._infer_location_category(title, scoped_evidence or operation.get("notes") or "")
         if self._is_no_location_required_activity(title, scoped_evidence, raw_location, explicit_location):
             category = "home_or_online"
@@ -433,7 +742,8 @@ class LocationNormalizerMixin:
             label = explicit_location["label"]
             category = explicit_location.get("category") or category
             source = "explicit_user"
-            status = "resolved"
+            known_generic = clean_title(label) in {"home", "school", "campus", "office", "library", "gym", "restaurant"}
+            status = "resolved" if known_generic else "needs_resolution"
             confidence = 0.95
         else:
             saved = None if category in {"home_or_online", "none"} else self._match_saved_location_for_category(category, saved_locations)

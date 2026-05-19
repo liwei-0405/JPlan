@@ -446,7 +446,11 @@ class Module8ReplyMixin:
 
         if status == "location_pending":
             requests = summary.get("location_resolution_requests") or []
-            titles = ", ".join(str(req.get("title") or "an activity") for req in requests[:4])
+            request_titles = [str(req.get("title") or "an activity") for req in requests]
+            if len(request_titles) <= 5:
+                titles = ", ".join(request_titles)
+            else:
+                titles = f"{', '.join(request_titles[:4])}, and {len(request_titles) - 4} more"
             return {
                 "reply": (
                     "I drafted the schedule, but accurate travel time is not complete yet. "

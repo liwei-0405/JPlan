@@ -52,6 +52,22 @@ class Module0RouterMixin:
         r"\b(?:recalculate|recompute|validate|check|update)\s+(?:the\s+)?(?:travel|route|commute)\s+time\b|"
         r"\b(?:regenerate|rebuild|refresh)\b.*\b(?:accurate|actual|real)\s+(?:travel|route|commute)\s+time\b"
     )
+    _TRAVEL_INTENT_PATTERN = (
+        r"\bwith\s+(?:the\s+)?(?:travel|route|commute)\s+time\b|"
+        r"\brealistic\s+with\s+(?:travel|route|commute)\b|"
+        r"\baccount\s+for\s+(?:travel|route|commute)\b|"
+        r"\binclude\s+(?:the\s+)?(?:travel|route|commute)\s+time\b|"
+        r"\bconsider\s+(?:the\s+)?(?:travel|route|commute)\s+time\b|"
+        r"\bmake\s+it\s+realistic\s+with\s+(?:travel|route|commute)\b"
+    )
+
+    def _detect_travel_intent(self, clean: str) -> bool:
+        return bool(re.search(self._TRAVEL_INTENT_PATTERN, clean or ""))
+
+    def _has_temporal_schedule_signal(self, clean: str) -> bool:
+        has_clock_time = bool(re.search(r"\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b", clean or ""))
+        has_duration = bool(re.search(r"\b\d+(?:\.\d+)?\s*(?:hours?|hrs?|minutes?|mins?)\b", clean or ""))
+        return has_clock_time or has_duration
 
     def _natural_edit_wording_skip_reason(self, clean: str, text: str) -> Optional[str]:
         has_relation = bool(re.search(r"\b(?:after|before|right\s+after|right\s+before|earlier|later)\b", clean))
@@ -84,7 +100,10 @@ class Module0RouterMixin:
     ) -> Dict[str, Any]:
         text = re.sub(r"\s+", " ", message or "").strip()
         clean = clean_title(text)
-        has_schedule = bool((current_schedule or {}).get("activities"))
+        has_schedule = bool(
+            (current_schedule or {}).get("activities")
+            or (current_schedule or {}).get("schedule_blocks")
+        )
 
         route = {
             "route": "ambiguous",
@@ -93,6 +112,7 @@ class Module0RouterMixin:
             "use_deterministic_parser": False,
             "use_module_a_llm": True,
             "use_advisory_llm": False,
+            "travel_intent": self._detect_travel_intent(clean),
             "reason": "schedule_related_but_unclear",
         }
 
@@ -318,6 +338,17 @@ class Module0RouterMixin:
             })
             return self._log_route_decision(route)
 
+        if has_schedule and self._has_temporal_schedule_signal(clean):
+            route.update({
+                "route": "simple_schedule_command",
+                "confidence": 0.7,
+                "should_mutate_schedule": True,
+                "use_deterministic_parser": False,
+                "use_module_a_llm": True,
+                "reason": "temporal_schedule_context_use_llm",
+            })
+            return self._log_route_decision(route)
+
         route.update({
             "route": "general_chat",
             "confidence": 0.82,
@@ -331,6 +362,24 @@ class Module0RouterMixin:
         clean: str,
         current_schedule: Optional[Dict[str, Any]] = None,
     ) -> bool:
+        activity_mentions = len(re.findall(
+            r"\b(meeting|seminar|lunch|dinner|gym|shopping|grocery|groceries|fyp|class|workout|coffee|appointment|doctor|dentist|work)\b",
+            clean,
+        ))
+        generation_markers = (
+            "plan my day",
+            "plan a day",
+            "schedule my day",
+            "generate",
+            "create",
+            "i have",
+            "i still need",
+            "fit in",
+            "please make it realistic",
+        )
+        if any(marker in clean for marker in generation_markers) and (activity_mentions >= 2 or len(clean.split()) > 18):
+            return False
+
         if re.search(self._ACCURATE_TRAVEL_REQUEST_PATTERN, clean):
             return True
         accurate_enabled = bool(
@@ -353,6 +402,7 @@ class Module0RouterMixin:
                 f"use_deterministic_parser={str(bool(route.get('use_deterministic_parser'))).lower()} "
                 f"use_module_a_llm={str(bool(route.get('use_module_a_llm'))).lower()} "
                 f"should_mutate_schedule={str(bool(route.get('should_mutate_schedule'))).lower()} "
+                f"travel_intent={str(bool(route.get('travel_intent'))).lower()} "
                 f"reason={route.get('reason')}"
             ),
             None,

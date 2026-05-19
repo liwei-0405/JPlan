@@ -242,6 +242,17 @@ Schema:
     "duration_minutes": 60,
     "priority": "low|medium|high",
     "location": "label or null",
+    "raw_location_text": "exact user location text or null",
+    "location_kind": "exact_named_place|area_only|category_only|home|online|no_location_required|unknown_physical",
+    "explicit_user_location": true,
+    "location_category": "medical|meal_place|supermarket|pharmacy|fitness_center|home|work|study|no_location|unknown",
+    "travel_required": true,
+    "location_resolution_status": "needs_coordinates|resolved_coordinates|not_required|ambiguous",
+    "no_location_reason": "document_preparation|admin_task|focused_work|online|none",
+    "semantic_confidence": 0.0,
+    "location_confidence": 0.0,
+    "needs_clarification": false,
+    "parse_notes": "short parser note if useful",
     "anchor_relation": {"kind":"after|before","target_title":"...","target_activity_id":"existing anchor id when known"},
     "edit_reason": "short rationale clause when user explains why",
     "preserve_existing_fields": true,
@@ -261,13 +272,19 @@ Critical rules:
 7. Use fixed only for exact times. Use relative for after/before/followed by/then.
 8. Use 24-hour time. Use reasonable durations if missing: lunch/dinner 60, coffee 15, gym 60, shopping 45.
 9. Use current activity titles when possible. Keep conflict_analysis short and non-decisive.
-10. Output only core scheduling fields. Do not output location_label, location_status, location_confidence, location_warning, or other normalized location metadata.
-11. Do not invent store/supermarket locations except for grocery/shopping activities.
+10. For every activity, output semantic location fields when possible. Use raw_location_text for the exact place/modality words the user wrote.
+11. Do not invent exact places. If the user gives only a category ("grocery shopping", "pharmacy stop", "gym"), use location_kind="category_only", travel_required=true, and location_resolution_status="needs_coordinates".
 12. Soft phrases like preferably, if possible, maybe, sometime after, not too late, later in the day, at night, or around are preferences, not hard anchor_relation.
 13. Use anchor_relation only for hard wording like right after, immediately after, must be after, only after, before X starts, or cannot happen before.
 14. For edits that refer to an existing activity in CURRENT_ACTIVITY_INDEX, output op="update" with activity_id when available; do not output op="add".
 15. Preserve existing duration, priority, location label/source, coordinates, travel_required, and title unless the user explicitly changes them. You may set preserve_existing_fields=true for update edits.
 16. If the user gives a rationale ("because", "cause", "so that", "to avoid"), put it in edit_reason. Never include rationale text in title or anchor_relation.target_title.
+17. Explicit user places must be preserved exactly: "doctor appointment at Sunway Medical" => raw_location_text="Sunway Medical", location_kind="exact_named_place", location_category="medical", travel_required=true, location_resolution_status="needs_coordinates". Never change it to home.
+18. Use location_kind="home" only when the user explicitly says home/at home/my house, or an existing selected saved home location is referenced.
+19. Work/admin/document-prep tasks do not need coordinates unless the user gives a physical place. "prepare documents" => travel_required=false, location_kind="no_location_required", location_resolution_status="not_required", no_location_reason="document_preparation".
+20. Focused/deep work does not need coordinates unless a physical place is explicitly given.
+21. Pharmacy stops are physical stops: location_category="pharmacy", travel_required=true, location_resolution_status="needs_coordinates" unless exact confirmed coordinates are already known.
+22. If unsure whether a physical location is needed, set needs_clarification=true and use location_resolution_status="ambiguous"; do not silently default to home.
 """
 
 

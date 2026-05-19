@@ -25,8 +25,8 @@ export type Page =
 export type ActivityBlock = {
   id: string;
   stable_activity_id?: string;
-  type?: "activity" | "travel" | "buffer" | "transition" | "idle";
-  block_type?: "activity" | "transition" | "buffer" | "idle";
+  type?: "activity" | "travel" | "buffer" | "transition" | "idle" | "start_route";
+  block_type?: "activity" | "transition" | "buffer" | "idle" | "start_route";
   title: string;
   startTime: string;
   endTime: string;
@@ -56,6 +56,11 @@ export type ActivityBlock = {
   travel_validation_status?: string;
   route_duration_minutes?: number;
   display_label?: string;
+  is_start_route?: boolean;
+  display_only?: boolean;
+  source_activity_id?: string;
+  destination_activity_id?: string;
+  related_activity_ids?: string[];
   from_location?: string;
   to_location?: string;
   from_coordinate?: { latitude: number; longitude: number };
