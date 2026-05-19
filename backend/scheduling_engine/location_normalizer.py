@@ -1120,22 +1120,6 @@ class LocationNormalizerMixin:
             return None
         return start + match.start()
 
-    def _activity_location_context(self, evidence: str, title: str) -> str:
-        text = re.sub(r"\s+", " ", evidence or "").strip()
-        clean_text = clean_title(text)
-        tokens = [token for token in re.split(r"[^a-z0-9]+", clean_title(title or "")) if token]
-        stop_words = {"quick", "the", "my", "a", "an"}
-        tokens = [token for token in tokens if token not in stop_words]
-        if not tokens:
-            return text
-
-        positions = [clean_text.find(token) for token in tokens if clean_text.find(token) >= 0]
-        if not positions:
-            return text
-        start = max(0, min(positions) - 60)
-        end = min(len(text), max(positions) + 140)
-        return text[start:end]
-
     def _detect_explicit_location(
         self,
         evidence: str,

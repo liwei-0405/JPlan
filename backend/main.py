@@ -1,5 +1,4 @@
 import os
-import json
 import time
 from copy import deepcopy
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends
@@ -9,7 +8,7 @@ from dotenv import load_dotenv
 from google import genai
 from typing import List, Dict, Any, Optional
 import database
-from jplan_logging import jjson, jlog
+from jplan_logging import jlog
 from scheduling_engine import SchedulingEngine, VersionMismatchError
 from travel_service import TravelService
 
@@ -275,10 +274,6 @@ def debug_log(message: str) -> None:
     jlog("API", message)
 
 
-def debug_json(label: str, payload: Any) -> None:
-    jjson("API", label, payload)
-
-
 def _location_has_coordinates(location: Optional[Dict[str, Any]]) -> bool:
     if not isinstance(location, dict):
         return False
@@ -333,23 +328,6 @@ def _merge_user_preferences_into_envelope(
         jlog("DEFAULT_LOCATION", f"start={label or 'configured'}")
     return updated
 
-
-def summarize_envelope(envelope: ScheduleEnvelope | dict | None) -> dict:
-    if not envelope: return {}
-    if isinstance(envelope, ScheduleEnvelope):
-        activities = envelope.activities
-        unscheduled = envelope.unscheduled_activities
-    else:
-        activities = envelope.get("activities") or envelope.get("items") or []
-        unscheduled = envelope.get("unscheduled_activities") or []
-    
-    activity_count = sum(1 for item in activities if (isinstance(item, ScheduleItem) and item.type == "activity") or (isinstance(item, dict) and item.get("type") == "activity"))
-    return {
-        "scheduleId": envelope.scheduleId if isinstance(envelope, ScheduleEnvelope) else envelope.get("scheduleId"),
-        "version": envelope.version if isinstance(envelope, ScheduleEnvelope) else envelope.get("version"),
-        "activity_count": activity_count,
-        "unscheduled_count": len(unscheduled),
-    }
 
 def extract_shift_target_date(operations: List[Dict[str, Any]]) -> Optional[str]:
     for operation in operations or []:

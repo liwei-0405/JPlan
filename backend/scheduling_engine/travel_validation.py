@@ -788,12 +788,6 @@ class TravelValidationMixin:
                 records.append(record)
         return records
 
-    def _repair_record_key(self, item: Dict[str, Any]) -> Tuple[str, str]:
-        return (
-            str(item.get("stable_activity_id") or item.get("id") or ""),
-            clean_title(item.get("title") or ""),
-        )
-
     def _find_repair_record(self, records: List[Dict[str, Any]], *, activity_id: Optional[str] = None, title: Optional[str] = None) -> Optional[Dict[str, Any]]:
         clean = clean_title(title or "")
         if activity_id:
@@ -805,71 +799,6 @@ class TravelValidationMixin:
                 if clean_title(record.get("title") or "") == clean:
                     return record
         return None
-
-    def _repair_suggestions_from_candidate(
-        self,
-        envelope: Dict[str, Any],
-        repaired: Dict[str, Any],
-        route_conflicts: List[Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
-        original_records = self._activity_records_for_repair(envelope)
-        repaired_records = self._activity_records_for_repair(repaired)
-        suggestions: List[Dict[str, Any]] = []
-        seen_ids: set[str] = set()
-
-        for index, conflict in enumerate(route_conflicts or [], start=1):
-            target_title = conflict.get("to_activity") or conflict.get("to")
-            target = self._find_repair_record(original_records, title=target_title)
-            if not target or not self._activity_can_auto_move_for_route_repair(target):
-                continue
-            activity_id = str(target.get("stable_activity_id") or target.get("id") or "")
-            if activity_id in seen_ids:
-                continue
-            candidate = self._find_repair_record(repaired_records, activity_id=activity_id, title=target_title)
-            if not candidate:
-                continue
-            if candidate["_repair_start"] == target["_repair_start"] and candidate["_repair_end"] == target["_repair_end"]:
-                continue
-            required = int(conflict.get("required_route_minutes") or conflict.get("required_travel_minutes") or 0)
-            from_end = parse_clock(conflict.get("from_end") or "")
-            suggested_start = candidate["_repair_start"]
-            duration = max(1, target["_repair_end"] - target["_repair_start"])
-            if from_end is not None and required > 0:
-                suggested_start = max(target["_repair_start"], from_end + required)
-            suggested_end = suggested_start + duration
-            if not self._repair_suggestion_would_change(target, suggested_start, suggested_end):
-                jlog(
-                    "PENDING_REPAIR",
-                    (
-                        f"title={target.get('title') or target_title} "
-                        f"from={format_clock(target['_repair_start'])} to={format_clock(suggested_start)}"
-                    ),
-                    "SKIP_NOOP",
-                )
-                continue
-            suggestion = {
-                "id": f"suggestion_{len(suggestions) + 1}",
-                "type": "move_activity",
-                "activity_id": activity_id,
-                "title": target.get("title") or target_title,
-                "from": format_clock(target["_repair_start"]),
-                "from_end": format_clock(target["_repair_end"]),
-                "to": format_clock(suggested_start),
-                "to_end": format_clock(suggested_end),
-                "to_start_minutes": suggested_start,
-                "to_end_minutes": suggested_end,
-                "duration_minutes": duration,
-                "reason": f"Travel from {conflict.get('from_activity') or conflict.get('from')} takes about {required} minutes",
-                "impact": "minimal_shift",
-                "requires_user_confirmation": True,
-                "would_change": True,
-                "schedule_version": int(envelope.get("version") or 1),
-                "route_conflict_index": index - 1,
-            }
-            suggestions.append(suggestion)
-            seen_ids.add(activity_id)
-            jlog("PENDING_REPAIR", f"id={suggestion['id']} action=created title={suggestion.get('title')}", None)
-        return suggestions
 
     def _protected_repair_suggestions_from_conflicts(
         self,
@@ -1734,16 +1663,6 @@ class TravelValidationMixin:
             })
         return affected
 
-    def _activity_coordinate(
-        self,
-        block: Dict[str, Any],
-        saved_locations: List[Dict[str, Any]],
-    ) -> Optional[Tuple[float, float]]:
-        embedded, _ = self._activity_coordinate_resolution(block, saved_locations)
-        if embedded:
-            return embedded
-        return None
-
     def _activity_coordinate_resolution(
         self,
         block: Dict[str, Any],
@@ -2150,67 +2069,6 @@ class TravelValidationMixin:
             "updated_transition_count": updated_transition_count,
             "start_route_summary": start_route_summary,
         }
-
-    def _start_route_replacement_blocks(
-        self,
-        idle_start: int,
-        right: Dict[str, Any],
-        route_minutes: int,
-        source: str,
-        transport_mode: str,
-        start_coord: Tuple[float, float],
-        right_coord: Tuple[float, float],
-        start_resolved: Dict[str, Any],
-    ) -> List[Dict[str, Any]]:
-        right_start = parse_clock(right.get("start") or right.get("startTime") or "") or 0
-        route_start = right_start - route_minutes
-        start_label = (
-            start_resolved.get("display_name")
-            or start_resolved.get("label")
-            or "Starting point"
-        )
-        replacement: List[Dict[str, Any]] = []
-        if route_start > idle_start:
-            replacement.append({
-                "block_type": "idle",
-                "type": "idle",
-                "title": "Free Time",
-                "start": format_clock(idle_start),
-                "end": format_clock(route_start),
-                "startTime": format_clock(idle_start),
-                "endTime": format_clock(route_start),
-                "duration_minutes": route_start - idle_start,
-                "reason": "Slack before route-based travel from starting point",
-            })
-        transition = {
-            "block_type": "transition",
-            "type": "travel",
-            "title": f"Travel to {right.get('location') or right.get('title')}",
-            "start": format_clock(route_start),
-            "end": format_clock(right_start),
-            "startTime": format_clock(route_start),
-            "endTime": format_clock(right_start),
-            "duration_minutes": route_minutes,
-            "from_location": start_label,
-            "to_location": right.get("location"),
-            "travel_estimate_source": source,
-            "travel_validation_status": "fallback_used" if source == "fallback" else "validated",
-            "transport_mode": transport_mode,
-            "route_duration_minutes": route_minutes,
-            "from_coordinate": {"latitude": start_coord[0], "longitude": start_coord[1]},
-            "to_coordinate": {"latitude": right_coord[0], "longitude": right_coord[1]},
-            "reason": "Route-based travel duration from starting point",
-        }
-        replacement.append(transition)
-        jlog(
-            "TRAVEL_BLOCK",
-            (
-                f"from=Starting point to={right.get('title')} "
-                f"start={transition['start']} end={transition['end']} duration={route_minutes}"
-            ),
-            "FINAL",
-        )
-        return replacement
 
     def _route_timing_replacement_blocks(
         self,

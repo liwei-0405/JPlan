@@ -91,18 +91,6 @@ class ModuleBValidationMixin:
         
         return True, ""
 
-    def _transition_block_between(
-        self,
-        blocks: List[Dict[str, Any]],
-        left_index: int,
-        right_index: int,
-    ) -> Optional[Dict[str, Any]]:
-        for index in range(left_index + 1, right_index):
-            block = blocks[index]
-            if block.get("block_type") == "transition" or block.get("type") in {"travel", "transition"}:
-                return block
-        return None
-
     def _transition_index_between(
         self,
         blocks: List[Dict[str, Any]],
