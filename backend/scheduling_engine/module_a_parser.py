@@ -319,7 +319,7 @@ class ModuleAParserMixin:
             return True
         if clean.startswith("plan my day") or "plan my day" in clean:
             return True
-        if re.search(r"\b(?:with|include|account for|consider|realistic with|make it realistic with)\b.{0,30}\b(?:travel|route|commute)\b", clean):
+        if detect_travel_intent(clean):
             return True
         if re.search(r"\bi have\b.*\band\b", clean) and len(clean.split()) > 14:
             return True
@@ -410,29 +410,29 @@ class ModuleAParserMixin:
                 concepts.append((label, tuple(clean_title(alias) for alias in aliases if alias)))
 
         if re.search(r"\bprepare\b.{0,30}\bdocuments?\b|\bdocuments?\b.{0,30}\bprepare\b", clean):
-            add("Prepare documents", ("prepare documents", "document preparation"))
+            add("Prepare documents", ("prepare documents", "document preparation", "prepare", "documents", "document", "paperwork", "doc"))
         if re.search(r"\bdoctor\b|\bmedical\b", clean):
-            add("Doctor appointment", ("doctor appointment", "doctor", "medical appointment"))
+            add("Doctor appointment", ("doctor appointment", "doctor", "medical appointment", "medical", "clinic", "hospital", "dentist", "dental", "physician", "checkup", "check-up", "sunway medical"))
         elif re.search(r"\bappointment\b", clean):
-            add("Appointment", ("appointment",))
+            add("Appointment", ("appointment", "appt", "session"))
         if re.search(r"\blunch\b", clean):
-            add("Lunch meeting", ("lunch meeting", "lunch"))
+            add("Lunch meeting", ("lunch meeting", "lunch", "meal", "eat", "dining"))
         if re.search(r"\bfocused work\b|\bfocus work\b|\bdeep work\b", clean):
-            add("Focused work", ("focused work", "focus work", "deep work"))
-        if re.search(r"\bgrocery\b|\bgroceries\b", clean):
-            add("Grocery shopping", ("grocery shopping", "grocery run", "grocery", "groceries"))
+            add("Focused work", ("focused work", "focus work", "deep work", "work", "study", "code", "coding", "writing", "research"))
+        if re.search(r"\bgocery\b|\bgrocery\b|\bgroceries\b", clean):
+            add("Grocery shopping", ("grocery shopping", "grocery run", "grocery", "groceries", "supermarket", "shopping", "mart", "buy food", "grocery store", "dpulze"))
         if re.search(r"\bpharmacy\b", clean):
-            add("Pharmacy stop", ("pharmacy stop", "pharmacy"))
+            add("Pharmacy stop", ("pharmacy stop", "pharmacy", "medicine", "chemist", "drugstore", "prescriptions", "selcare"))
         if re.search(r"\bgym\b|\bworkout\b", clean):
-            add("Gym", ("gym", "workout"))
+            add("Gym", ("gym", "workout", "fitness", "exercise", "training", "workout session"))
         if re.search(r"\bdinner\b", clean):
-            add("Dinner with family", ("dinner with family", "dinner with parents", "dinner"))
+            add("Dinner with family", ("dinner with family", "dinner with parents", "dinner", "family dinner", "eat with family"))
         if re.search(r"\bclient meeting\b", clean):
-            add("Client meeting", ("client meeting", "meeting"))
+            add("Client meeting", ("client meeting", "meeting", "discussion", "client"))
         elif re.search(r"\bteam meeting\b", clean):
-            add("Team meeting", ("team meeting", "meeting"))
+            add("Team meeting", ("team meeting", "meeting", "sync", "discussion"))
         elif re.search(r"\bmeeting\b", clean) and not re.search(r"\blunch meeting\b", clean):
-            add("Meeting", ("meeting",))
+            add("Meeting", ("meeting", "discussion", "talk"))
         return concepts
 
     def _operation_matches_expected_concept(
@@ -1082,15 +1082,10 @@ class ModuleAParserMixin:
         if not clean:
             return None
 
-        has_relation = bool(re.search(r"\b(?:after|before|right\s+after|right\s+before|earlier|later)\b", clean))
-        has_activity = bool(re.search(r"\b(?:lunch|dinner|breakfast|coffee|meeting|seminar|class|gym|workout|shopping|grocery|groceries|fyp|study|project)\b", clean))
-        if not (has_relation and has_activity):
-            return None
-
-        explicit_clean_command = bool(re.match(
-            r"^(?:(?:arrange|rearrange|put|place|make|set)\b|(?:add|schedule)\b|(?:move|shift|change|update)\b|(?:remove|delete|cancel)\b)",
-            clean,
-        ))
+        # Aggressively reject natural phrasing, soft adjustments, or complaints
+        if re.search(r"\b(?:earlier|early|later|late|too\s+late|not\s+so\s+late|a\s+bit\s+earlier|a\s+little\s+earlier|sooner)\b", clean):
+            return "natural_edit_wording"
+            
         if self._fast_path_has_rationale_clause(text):
             return "natural_edit_wording"
         if re.match(
@@ -1099,6 +1094,16 @@ class ModuleAParserMixin:
             clean,
         ):
             return "natural_edit_wording"
+
+        has_relation = bool(re.search(r"\b(?:after|before|right\s+after|right\s+before)\b", clean))
+        has_activity = bool(re.search(r"\b(?:lunch|dinner|breakfast|coffee|meeting|seminar|class|gym|workout|shopping|grocery|groceries|fyp|study|project)\b", clean))
+        if not (has_relation and has_activity):
+            return None
+
+        explicit_clean_command = bool(re.match(
+            r"^(?:(?:arrange|rearrange|put|place|make|set)\b|(?:add|schedule)\b|(?:move|shift|change|update)\b|(?:remove|delete|cancel)\b)",
+            clean,
+        ))
         if len(clean.split()) > 14 and not explicit_clean_command:
             return "natural_edit_wording"
         return None
@@ -1227,7 +1232,10 @@ class ModuleAParserMixin:
             title = self._clean_fast_path_new_activity_title(title_without_duration)
         if before_title and title and before_title != title:
             jlog("FAST_PATH", f'before="{before_title}" after="{title}"', "TITLE_CLEAN")
-        anchor, _ = self._resolve_fast_path_title(raw_anchor, current_schedule)
+        anchor, anchor_exists = self._resolve_fast_path_title(raw_anchor, current_schedule)
+        if not anchor_exists:
+            return None
+            
         kind = clean_title(match.group("kind")).replace("right ", "")
         op_type = "update" if target_exists else "add"
         jlog("FAST_PATH", f"parsed arrange_{kind} target={title} anchor={anchor}", None)

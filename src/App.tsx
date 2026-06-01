@@ -25,13 +25,15 @@ export type Page =
 export type ActivityBlock = {
   id: string;
   stable_activity_id?: string;
-  type?: "activity" | "travel" | "buffer" | "transition" | "idle" | "start_route";
-  block_type?: "activity" | "transition" | "buffer" | "idle" | "start_route";
+  type?: "activity" | "travel" | "buffer" | "transition" | "idle" | "start_route" | "route_conflict";
+  block_type?: "activity" | "transition" | "travel" | "buffer" | "idle" | "start_route" | "route_conflict";
   title: string;
   startTime: string;
   endTime: string;
   start?: string; // Backend compat
   end?: string;   // Backend compat
+  scheduled_start?: number;
+  scheduled_end?: number;
   location?: string;
   location_label?: string;
   location_category?: string;
@@ -57,10 +59,14 @@ export type ActivityBlock = {
   route_duration_minutes?: number;
   display_label?: string;
   is_start_route?: boolean;
+  is_route_conflict?: boolean;
+  reason_code?: string;
   display_only?: boolean;
   source_activity_id?: string;
   destination_activity_id?: string;
   related_activity_ids?: string[];
+  from_activity?: string;
+  to_activity?: string;
   from_location?: string;
   to_location?: string;
   from_coordinate?: { latitude: number; longitude: number };
@@ -69,10 +75,14 @@ export type ActivityBlock = {
   duration_minutes?: number;
   priority?: "low" | "medium" | "high";
   isMandatory?: boolean;
+  timing_mode?: string;
   original_timing_mode?: string;
   is_user_fixed?: boolean;
   is_system_scheduled?: boolean;
   user_fixed_start?: number | null;
+  fixed_start?: number | null;
+  fixed_end?: number | null;
+  preferred_start?: number | null;
   can_move_for_repair?: boolean;
   repair_protection?: "fixed" | "protected_social" | "flexible" | "optional" | string;
   notes?: string;
@@ -102,6 +112,7 @@ export type DailySchedule = {
   preferences?: Record<string, unknown>;
   activities: ActivityBlock[];
   schedule_blocks?: ActivityBlock[];
+  committed_schedule_blocks?: ActivityBlock[];
   explanations?: string[];
   conflicts?: Array<{
     conflict_id: string;
@@ -122,6 +133,8 @@ export type DailySchedule = {
   route_conflicts?: Array<Record<string, unknown>>;
   pending_repair_suggestions?: Array<Record<string, any>>;
   unfit_activities?: Array<Record<string, unknown>>;
+  optional_skipped?: Array<Record<string, unknown>>;
+  blocked_activities?: Array<Record<string, unknown>>;
   route_repair_actions?: Array<Record<string, unknown>>;
   route_efficiency?: Record<string, unknown>;
   route_total_before?: number | null;
@@ -133,6 +146,16 @@ export type DailySchedule = {
   revisit_penalty_before?: number | null;
   revisit_penalty_after?: number | null;
   start_route_summary?: Record<string, unknown> | null;
+  preview_id?: string | null;
+  preview_base_version?: number | null;
+  preview_status?: string | null;
+  preview_reason?: string | null;
+  preview_schedule?: Partial<DailySchedule> | null;
+  failed_repair_attempt?: Record<string, unknown> | null;
+  needs_reschedule?: boolean;
+  reschedule_reason?: "manual_edit" | "location_changed" | "time_changed" | "event_added" | "event_deleted" | "preferences_changed" | string | null;
+  needs_travel_validation?: boolean;
+  last_rescheduled_at?: string | null;
   unmet_items?: Array<Record<string, unknown>>;
   validation_issues?: string[];
   unscheduled_activities?: Array<{

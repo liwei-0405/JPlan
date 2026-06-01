@@ -44,25 +44,10 @@ class Module0RouterMixin:
         r"a\s+bit\s+earlier|a\s+little\s+earlier)\b"
     )
     _ROUTER_RELATION_PATTERN = r"\b(?:after|before|right\s+after|right\s+before|around|at)\b"
-    _ACCURATE_TRAVEL_REQUEST_PATTERN = (
-        r"\b(?:accurate|actual|real|route(?:-|\s*)aware)\s+(?:travel|route|commute)\s+time\b|"
-        r"\b(?:travel|route|commute)\s+time\s+(?:to\s+be\s+)?(?:accurate|actual|real)\b|"
-        r"\b(?:make|set)\s+(?:my\s+|the\s+)?(?:travel|route|commute)\s+time\s+(?:accurate|actual|real)\b|"
-        r"\b(?:add|include|consider|use|with|calculate)\s+(?:the\s+)?(?:accurate|actual|real)?\s*(?:travel|route|commute)\s+time\b|"
-        r"\b(?:recalculate|recompute|validate|check|update)\s+(?:the\s+)?(?:travel|route|commute)\s+time\b|"
-        r"\b(?:regenerate|rebuild|refresh)\b.*\b(?:accurate|actual|real)\s+(?:travel|route|commute)\s+time\b"
-    )
-    _TRAVEL_INTENT_PATTERN = (
-        r"\bwith\s+(?:the\s+)?(?:travel|route|commute)\s+time\b|"
-        r"\brealistic\s+with\s+(?:travel|route|commute)\b|"
-        r"\baccount\s+for\s+(?:travel|route|commute)\b|"
-        r"\binclude\s+(?:the\s+)?(?:travel|route|commute)\s+time\b|"
-        r"\bconsider\s+(?:the\s+)?(?:travel|route|commute)\s+time\b|"
-        r"\bmake\s+it\s+realistic\s+with\s+(?:travel|route|commute)\b"
-    )
 
     def _detect_travel_intent(self, clean: str) -> bool:
-        return bool(re.search(self._TRAVEL_INTENT_PATTERN, clean or ""))
+        return detect_travel_intent(clean)
+
 
     def _has_temporal_schedule_signal(self, clean: str) -> bool:
         has_clock_time = bool(re.search(r"\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b", clean or ""))
@@ -284,12 +269,17 @@ class Module0RouterMixin:
                 reason = "matched_swap_order_pattern"
             elif complaint_plus_action:
                 reason = "complaint_plus_action"
+            
+            # Strict deterministic rule: Only true clean commands can use fast-path.
+            is_clean_command = bool((arrange_after or swap_order) and not has_adjustment_word and not complaint_plus_action and not has_action_question)
+            use_deterministic = bool(is_clean_command and has_schedule)
+
             route.update({
                 "route": "simple_schedule_command",
                 "confidence": 0.9 if has_schedule or has_activity_entity else 0.78,
                 "should_mutate_schedule": True,
-                "use_deterministic_parser": bool(has_schedule or arrange_after or swap_order),
-                "use_module_a_llm": not bool(has_schedule or arrange_after or swap_order),
+                "use_deterministic_parser": use_deterministic,
+                "use_module_a_llm": not use_deterministic,
                 "reason": reason,
             })
             if complaint_plus_action:
@@ -307,12 +297,15 @@ class Module0RouterMixin:
         )
         if any(re.search(pattern, clean) for pattern in simple_patterns):
             confidence = 0.9 if has_schedule or re.search(r"\b(add|remove|delete|cancel)\b", clean) else 0.78
+            # Strict deterministic rule: Reject if contains soft adjustments/complaints
+            is_clean_command = not has_adjustment_word and not complaint_plus_action
+            use_deterministic = bool(confidence >= 0.85 and is_clean_command)
             route.update({
                 "route": "simple_schedule_command",
                 "confidence": confidence,
                 "should_mutate_schedule": True,
-                "use_deterministic_parser": confidence >= 0.85,
-                "use_module_a_llm": confidence < 0.85,
+                "use_deterministic_parser": use_deterministic,
+                "use_module_a_llm": not use_deterministic,
                 "reason": "matched_simple_schedule_pattern",
             })
             return self._log_route_decision(route)
@@ -380,7 +373,7 @@ class Module0RouterMixin:
         if any(marker in clean for marker in generation_markers) and (activity_mentions >= 2 or len(clean.split()) > 18):
             return False
 
-        if re.search(self._ACCURATE_TRAVEL_REQUEST_PATTERN, clean):
+        if bool(re.search(ACCURATE_TRAVEL_REQUEST_PATTERN, clean)):
             return True
         accurate_enabled = bool(
             (current_schedule or {}).get("accurate_travel_time")

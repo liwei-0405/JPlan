@@ -1848,6 +1848,13 @@ class StateOperationsMixin:
             "activity_type": item.get("activity_type") or ("mandatory" if item.get("is_mandatory", True) else "optional"),
             "title": item.get("title", "Untitled"),
             "normalized_title": item.get("normalized_title") or clean_title(item.get("title", "Untitled")),
+            "reason": (
+                item.get("reason")
+                or item.get("unscheduled_reason_detail")
+                or item.get("unscheduled_reason")
+                or item.get("conflict_reason")
+                or "Could not fit in the schedule."
+            ),
             "startTime": format_clock(s_start_val),
             "endTime": format_clock(s_end_val),
             "location": location,

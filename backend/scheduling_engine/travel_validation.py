@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 
 from jplan_logging import jjson, jlog, jlog_verbose, jsection
 from travel_service import MissingORSApiKey, TravelService, TravelServiceError, coordinate_from_saved_location
+from .module_d_refinement import REFINEMENT_META_KEYS
 from .types_utils import *
 from .types_utils import _normalize_location
 
@@ -25,8 +26,6 @@ class TravelValidationMixin:
             self._normalize_day_boundary_preferences(preferences)
         travel_intent = bool(preferences.get("travel_intent") or updated.get("travel_intent"))
         accurate = self._resolve_accurate_travel_time(preferences, updated)
-        if travel_intent:
-            accurate = True
         updated["accurate_travel_time"] = accurate
         preferences["accurate_travel_time"] = accurate
         updated["travel_intent"] = travel_intent
@@ -55,11 +54,13 @@ class TravelValidationMixin:
                         updated.get("explanations", []),
                         ["I drafted the plan, but exact travel validation is pending location confirmation."],
                     )
+                    self._clear_route_preview_metadata(updated)
                     self._mark_transition_estimate_source(updated, "heuristic_pending_locations")
                     jlog("TIMER", f"accurate_travel_validation_seconds={time.perf_counter() - validation_started:.2f}", None)
                     return updated
             updated["travel_validation_status"] = "not_requested"
             updated["location_resolution_requests"] = []
+            self._clear_route_preview_metadata(updated)
             self._mark_transition_estimate_source(updated, "heuristic")
             jlog("TIMER", f"accurate_travel_validation_seconds={time.perf_counter() - validation_started:.2f}", None)
             return updated
@@ -85,6 +86,7 @@ class TravelValidationMixin:
                 updated.get("explanations", []),
                 ["Accurate travel time is pending until the requested locations are confirmed."],
             )
+            self._clear_route_preview_metadata(updated)
             jlog("TIMER", f"accurate_travel_validation_seconds={time.perf_counter() - validation_started:.2f}", None)
             return updated
 
@@ -99,6 +101,9 @@ class TravelValidationMixin:
                 and "accurate travel time is pending" not in str(issue).lower()
             ]
         updated["explanations"] = self._without_pending_travel_explanations(updated.get("explanations", []))
+        committed_schedule_blocks = deepcopy(updated.get("schedule_blocks") or [])
+        committed_activities = deepcopy(updated.get("activities") or [])
+        committed_unscheduled = deepcopy(updated.get("unscheduled_activities") or [])
 
         validation = self._validate_routes_with_service(updated, saved_locations)
         if validation.get("route_conflicts"):
@@ -108,15 +113,22 @@ class TravelValidationMixin:
                 pending_suggestions = repair_meta.get("pending_repair_suggestions", [])
                 repaired_validation = repair_meta.get("repaired_validation")
                 repaired_envelope = repair_meta.get("repaired_envelope")
-                apply_repaired = bool(
-                    repaired_validation
-                    and repaired_envelope
-                    and not pending_suggestions
-                    and not repaired_validation.get("route_conflicts")
+                repaired_conflicts = list((repaired_validation or {}).get("route_conflicts") or [])
+                residual_fixed_route_conflicts = self._fixed_route_conflicts(repaired_conflicts)
+                blocking_repaired_conflicts = self._blocking_route_conflicts(repaired_conflicts)
+                has_usable_repair_candidate = bool(
+                    repaired_envelope
+                    and repaired_validation
+                    and self._has_renderable_repaired_chronology(repaired_validation)
+                    and not blocking_repaired_conflicts
+                    and (not pending_suggestions or residual_fixed_route_conflicts)
+                    and (not residual_fixed_route_conflicts or repair_meta.get("travel_validation_status") == "partial_feasible_with_fixed_route_conflicts")
                 )
                 validation["pending_repair_suggestions"] = pending_suggestions
                 validation["unfit_activities"] = repair_meta.get("unfit_activities", [])
-                validation["route_repair_actions"] = repair_meta.get("route_repair_actions", []) if apply_repaired else []
+                validation["optional_skipped"] = repair_meta.get("optional_skipped", [])
+                validation["blocked_activities"] = repair_meta.get("blocked_activities", [])
+                validation["route_repair_actions"] = []
                 validation["route_efficiency"] = repair_meta.get("route_efficiency", {})
                 for key in (
                     "route_total_before",
@@ -130,11 +142,7 @@ class TravelValidationMixin:
                 ):
                     if key in repair_meta.get("route_efficiency", {}):
                         validation[key] = repair_meta["route_efficiency"][key]
-                if apply_repaired:
-                    validation["travel_validation_status"] = repair_meta.get(
-                        "travel_validation_status",
-                        validation.get("travel_validation_status"),
-                    )
+                if has_usable_repair_candidate:
                     validation["schedule_blocks"] = repaired_validation.get(
                         "schedule_blocks",
                         repaired_envelope.get("schedule_blocks", validation.get("schedule_blocks", [])),
@@ -144,7 +152,7 @@ class TravelValidationMixin:
                         "unscheduled_activities",
                         updated.get("unscheduled_activities", []),
                     )
-                    validation["route_conflicts"] = repaired_validation.get("route_conflicts", [])
+                    validation["route_conflicts"] = repaired_conflicts
                     validation["warnings"] = repaired_validation.get("warnings", validation.get("warnings", []))
                     validation["updated_transition_count"] = repaired_validation.get(
                         "updated_transition_count",
@@ -152,16 +160,52 @@ class TravelValidationMixin:
                     )
                     if repaired_validation.get("start_route_summary"):
                         validation["start_route_summary"] = repaired_validation.get("start_route_summary")
-                elif pending_suggestions:
-                    validation["travel_validation_status"] = "repair_suggestion_pending"
-                elif repair_meta.get("travel_validation_status") == "partial_feasible_with_unfit":
-                    validation["travel_validation_status"] = "partial_feasible_with_unfit"
+                    validation["route_repair_actions"] = repair_meta.get("route_repair_actions", [])
+                    if residual_fixed_route_conflicts:
+                        validation["travel_validation_status"] = "partial_feasible_with_fixed_route_conflicts"
+                    else:
+                        validation["travel_validation_status"] = repair_meta.get(
+                            "travel_validation_status",
+                            validation.get("travel_validation_status"),
+                        )
+                    preview_status = validation.get("travel_validation_status")
+                    if preview_status in {
+                        "repaired_validated",
+                        "partial_feasible_with_unfit",
+                        "partial_feasible_with_fixed_route_conflicts",
+                    }:
+                        preview_id = f"preview_{uuid4().hex[:12]}"
+                        schedule_version = int(updated.get("version") or 1)
+                        bound_suggestions = self._bind_preview_to_repair_suggestions(
+                            validation.get("pending_repair_suggestions", []),
+                            preview_id,
+                            schedule_version,
+                        )
+                        validation["pending_repair_suggestions"] = bound_suggestions
+                        repair_meta["pending_repair_suggestions"] = bound_suggestions
+                        validation["preview_id"] = preview_id
+                        validation["preview_base_version"] = schedule_version
+                        validation["preview_status"] = preview_status
+                        validation["preview_reason"] = self._route_preview_reason(
+                            preview_status,
+                            validation,
+                            repair_meta,
+                        )
+                        validation["preview_schedule"] = self._build_route_preview_schedule(
+                            current=updated,
+                            repaired_envelope=repaired_envelope,
+                            repaired_validation=repaired_validation,
+                            repair_meta=repair_meta,
+                            preview_status=preview_status,
+                        )
         updated["location_resolution_requests"] = []
         updated["travel_validation_status"] = validation["travel_validation_status"]
         updated["route_conflicts"] = validation.get("route_conflicts", [])
         updated["route_repair_attempted"] = bool(validation.get("route_repair_attempted", False))
         updated["pending_repair_suggestions"] = validation.get("pending_repair_suggestions", [])
         updated["unfit_activities"] = validation.get("unfit_activities", [])
+        updated["optional_skipped"] = validation.get("optional_skipped", updated.get("optional_skipped", []))
+        updated["blocked_activities"] = validation.get("blocked_activities", [])
         updated["route_repair_actions"] = validation.get("route_repair_actions", [])
         updated["route_efficiency"] = validation.get("route_efficiency", updated.get("route_efficiency", {}))
         for key in (
@@ -186,6 +230,19 @@ class TravelValidationMixin:
             )
         updated["updated_transition_count"] = int(validation.get("updated_transition_count") or 0)
         updated["schedule_blocks"] = validation.get("schedule_blocks", updated.get("schedule_blocks", []))
+        if validation.get("preview_schedule"):
+            updated["committed_schedule_blocks"] = committed_schedule_blocks
+            updated["preview_id"] = validation.get("preview_id")
+            updated["preview_base_version"] = validation.get("preview_base_version")
+            updated["preview_status"] = validation.get("preview_status")
+            updated["preview_reason"] = validation.get("preview_reason")
+            updated["preview_schedule"] = validation.get("preview_schedule")
+            updated["schedule_blocks"] = committed_schedule_blocks
+            updated["activities"] = committed_activities
+            if validation.get("preview_status") != "partial_feasible_with_unfit":
+                updated["unscheduled_activities"] = committed_unscheduled
+        else:
+            self._clear_route_preview_metadata(updated)
         self._sync_resolved_locations_to_activities(updated)
         if validation.get("warnings"):
             updated["warnings"] = list(updated.get("warnings") or []) + validation["warnings"]
@@ -205,6 +262,17 @@ class TravelValidationMixin:
                     if conflict.get("reason")
                 ]
             ))
+        elif updated.get("travel_validation_status") == "partial_feasible_with_fixed_route_conflicts":
+            updated["schedule_status"] = "partial"
+            updated["status"] = "partial"
+            updated.setdefault("validation_issues", [])
+            for conflict in updated.get("route_conflicts") or []:
+                if conflict.get("reason"):
+                    updated["validation_issues"].append(conflict["reason"])
+            for item in updated.get("unfit_activities") or []:
+                title = item.get("title") or "One flexible activity"
+                updated["validation_issues"].append(f"{title} could not fit after accurate travel validation.")
+            updated["validation_issues"] = list(dict.fromkeys(updated["validation_issues"]))
         elif updated.get("travel_validation_status") == "partial_feasible_with_unfit":
             updated["schedule_status"] = "partial"
             updated["status"] = "partial"
@@ -254,6 +322,162 @@ class TravelValidationMixin:
         )
         jlog("TIMER", f"accurate_travel_validation_seconds={time.perf_counter() - validation_started:.2f}", None)
         return updated
+
+    def _clear_route_preview_metadata(self, envelope: Dict[str, Any]) -> None:
+        for key in (
+            "committed_schedule_blocks",
+            "preview_id",
+            "preview_base_version",
+            "preview_status",
+            "preview_reason",
+            "preview_schedule",
+        ):
+            envelope.pop(key, None)
+
+    def _bind_preview_to_repair_suggestions(
+        self,
+        suggestions: List[Dict[str, Any]],
+        preview_id: str,
+        schedule_version: int,
+    ) -> List[Dict[str, Any]]:
+        bound: List[Dict[str, Any]] = []
+        for suggestion in suggestions or []:
+            updated = deepcopy(suggestion)
+            updated["preview_id"] = preview_id
+            updated["schedule_version"] = schedule_version
+            cascades: List[Dict[str, Any]] = []
+            for cascade in updated.get("cascade_suggestions") or []:
+                cascade_updated = deepcopy(cascade)
+                if cascade_updated.get("from_start") is not None:
+                    cascade_updated.setdefault("from", format_clock(int(cascade_updated.get("from_start") or 0)))
+                if cascade_updated.get("from_end") is not None:
+                    cascade_updated.setdefault("from_end_label", format_clock(int(cascade_updated.get("from_end") or 0)))
+                if cascade_updated.get("to_start") is not None:
+                    cascade_updated.setdefault("to", format_clock(int(cascade_updated.get("to_start") or 0)))
+                if cascade_updated.get("to_end") is not None:
+                    cascade_updated.setdefault("to_end_label", format_clock(int(cascade_updated.get("to_end") or 0)))
+                cascades.append(cascade_updated)
+            updated["cascade_suggestions"] = cascades
+            bound.append(updated)
+        return bound
+
+    def _route_preview_reason(
+        self,
+        preview_status: str,
+        validation: Dict[str, Any],
+        repair_meta: Dict[str, Any],
+    ) -> str:
+        if preview_status == "partial_feasible_with_unfit":
+            unfit = repair_meta.get("unfit_activities") or validation.get("unfit_activities") or []
+            title = (unfit[0] or {}).get("title") if unfit else None
+            return (
+                f"Suggested route-aware plan excludes {title} because it could not fit."
+                if title
+                else "Suggested route-aware plan excludes activities that could not fit."
+            )
+        if preview_status == "repair_suggestion_pending":
+            suggestions = repair_meta.get("pending_repair_suggestions") or validation.get("pending_repair_suggestions") or []
+            title = (suggestions[0] or {}).get("title") if suggestions else None
+            if any(self._repair_suggestion_requires_fixed_move_approval(suggestion) for suggestion in suggestions):
+                return (
+                    "This preview is not fully feasible because fixed events cannot be reached on time. "
+                    "Fixed-event repair suggestions are advisory until you explicitly allow moving the fixed event."
+                )
+            return (
+                f"Suggested route-aware plan needs confirmation before moving {title}."
+                if title
+                else "Suggested route-aware plan needs confirmation before moving protected events."
+            )
+        if preview_status == "partial_feasible_with_fixed_route_conflicts":
+            return "Suggested route-aware plan keeps fixed events locked and marks unresolved fixed-route conflicts."
+        return "Suggested route-aware plan is ready to apply."
+
+    def _build_route_preview_schedule(
+        self,
+        *,
+        current: Dict[str, Any],
+        repaired_envelope: Optional[Dict[str, Any]],
+        repaired_validation: Optional[Dict[str, Any]],
+        repair_meta: Dict[str, Any],
+        preview_status: str,
+    ) -> Dict[str, Any]:
+        source = deepcopy(repaired_envelope or current)
+        validation = repaired_validation or {}
+        preview = {
+            "activities": source.get("activities", current.get("activities", [])),
+            "schedule_blocks": validation.get("schedule_blocks") or source.get("schedule_blocks") or current.get("schedule_blocks", []),
+            "start_route_summary": validation.get("start_route_summary") or repair_meta.get("start_route_summary") or current.get("start_route_summary"),
+            "route_repair_actions": repair_meta.get("route_repair_actions", []),
+            "pending_repair_suggestions": repair_meta.get("pending_repair_suggestions", []),
+            "unfit_activities": repair_meta.get("unfit_activities", []),
+            "optional_skipped": repair_meta.get("optional_skipped", []),
+            "blocked_activities": repair_meta.get("blocked_activities", []),
+            "unscheduled_activities": source.get("unscheduled_activities", current.get("unscheduled_activities", [])),
+            "travel_validation_status": preview_status,
+            "route_conflicts": validation.get("route_conflicts", []),
+            "warnings": validation.get("warnings", []),
+        }
+        if preview_status == "repair_suggestion_pending" and preview.get("pending_repair_suggestions"):
+            preview["schedule_blocks"] = self._preview_blocks_with_repair_suggestions(
+                preview.get("schedule_blocks") or current.get("schedule_blocks", []),
+                preview["pending_repair_suggestions"],
+            )
+        return preview
+
+    def _preview_blocks_with_repair_suggestions(
+        self,
+        blocks: List[Dict[str, Any]],
+        suggestions: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        preview_blocks = deepcopy(blocks or [])
+        moves: List[Dict[str, Any]] = []
+        for suggestion in suggestions or []:
+            if self._repair_suggestion_requires_fixed_move_approval(suggestion):
+                continue
+            moves.append({
+                "activity_id": suggestion.get("activity_id"),
+                "title": suggestion.get("title"),
+                "to": suggestion.get("to"),
+                "to_end": suggestion.get("to_end"),
+            })
+            for cascade in suggestion.get("cascade_suggestions") or []:
+                if clean_title(cascade.get("impact_type") or "") in {"fixed_target_move", "protected_cascade_move"}:
+                    continue
+                moves.append({
+                    "activity_id": cascade.get("activity_id"),
+                    "title": cascade.get("title"),
+                    "to": cascade.get("to") or format_clock(int(cascade.get("to_start") or 0)),
+                    "to_end": cascade.get("to_end_label") or format_clock(int(cascade.get("to_end") or 0)),
+                })
+        for move in moves:
+            new_start = move.get("to")
+            new_end = move.get("to_end")
+            if not new_start:
+                continue
+            for block in preview_blocks:
+                if not self._is_activity_schedule_block(block):
+                    continue
+                block_id = str(block.get("stable_activity_id") or block.get("id") or "")
+                title = clean_title(block.get("title") or "")
+                if (
+                    (move.get("activity_id") and block_id == str(move.get("activity_id")))
+                    or (move.get("title") and title == clean_title(move.get("title")))
+                ):
+                    old_start = block.get("start") or block.get("startTime")
+                    old_end = block.get("end") or block.get("endTime")
+                    block["preview_original_start"] = old_start
+                    block["preview_original_end"] = old_end
+                    block["start"] = new_start
+                    block["startTime"] = new_start
+                    if new_end:
+                        block["end"] = new_end
+                        block["endTime"] = new_end
+                    block["preview_pending_confirmation"] = True
+                    break
+        return sorted(
+            preview_blocks,
+            key=lambda block: parse_clock(block.get("start") or block.get("startTime") or "") or 0,
+        )
 
     def _without_pending_travel_explanations(self, explanations: List[str]) -> List[str]:
         stale_markers = (
@@ -543,10 +767,12 @@ class TravelValidationMixin:
         else:
             repaired["schedule_blocks"] = planned.get("schedule_blocks", [])
         jlog("SUPPORT_BLOCK", f"blocks={len(repaired.get('schedule_blocks') or [])}", "REBUILD_FINAL")
+        raw_unscheduled = list(planned.get("unscheduled_activities", [])) + conflict_unfit
         repaired["unscheduled_activities"] = [
             self._format_activity(item)
-            for item in list(planned.get("unscheduled_activities", [])) + conflict_unfit
+            for item in raw_unscheduled
         ]
+        optional_skipped = self._optional_skipped_from_unscheduled(raw_unscheduled)
         validation = self._final_validate_route_aware_repair(
             original=envelope,
             repaired=repaired,
@@ -565,22 +791,52 @@ class TravelValidationMixin:
             envelope,
             validation.get("route_conflicts", []),
         )
+        remaining_conflicts = validation.get("route_conflicts", [])
+        blocking_conflicts = self._blocking_route_conflicts(remaining_conflicts)
         unfit = self._repair_unfit_activities(
             active,
-            list(planned.get("unscheduled_activities", [])) + conflict_unfit,
-            validation.get("route_conflicts", []),
+            [
+                item for item in raw_unscheduled
+                if not self._route_repair_item_is_optional(item)
+            ],
+            blocking_conflicts,
+        )
+        blocked = self._blocked_activities_for_fixed_route_conflict(
+            active,
+            raw_unscheduled,
+            remaining_conflicts,
         )
         route_repair_actions = self._route_repair_actions_from_delta(
             envelope,
             repaired,
             route_context,
         )
+        unfit = self._filter_items_not_scheduled_in_repair(unfit, repaired)
+        blocked = self._filter_items_not_scheduled_in_repair(blocked, repaired)
+        optional_skipped = self._filter_items_not_scheduled_in_repair(optional_skipped, repaired)
+        accounting = self._account_for_route_repair_activities(
+            active,
+            repaired,
+            unfit,
+            optional_skipped,
+        )
+        unfit = accounting["unfit_activities"]
+        optional_skipped = accounting["optional_skipped"]
+        missing_after_accounting = accounting["missing_after_accounting"]
+        repaired["unfit_activities"] = unfit
+        repaired["optional_skipped"] = optional_skipped
         route_efficiency = planned.get("route_efficiency") or {}
-        if suggestions:
+        residual_fixed_conflicts = self._fixed_route_conflicts(remaining_conflicts)
+        has_non_fixed_repair_scope = self._has_non_fixed_repair_scope(active, unfit, route_repair_actions)
+        if blocking_conflicts and suggestions:
             status = "repair_suggestion_pending"
-        elif not validation.get("route_conflicts") and unfit:
+        elif residual_fixed_conflicts and has_non_fixed_repair_scope:
+            status = "partial_feasible_with_fixed_route_conflicts"
+        elif missing_after_accounting:
+            status = "route_conflict"
+        elif not blocking_conflicts and unfit:
             status = "partial_feasible_with_unfit"
-        elif not validation.get("route_conflicts") and route_repair_actions:
+        elif not blocking_conflicts and route_repair_actions:
             status = "repaired_validated"
         else:
             status = validation.get("travel_validation_status") or "route_conflict"
@@ -606,11 +862,13 @@ class TravelValidationMixin:
             "route_repair_attempted": True,
             "pending_repair_suggestions": suggestions,
             "unfit_activities": unfit,
+            "optional_skipped": optional_skipped,
+            "blocked_activities": blocked,
             "travel_validation_status": status,
             "route_repair_actions": route_repair_actions,
             "route_efficiency": route_efficiency,
-            "repaired_envelope": repaired if not suggestions and not validation.get("route_conflicts") else None,
-            "repaired_validation": validation if not suggestions and not validation.get("route_conflicts") else None,
+            "repaired_envelope": repaired,
+            "repaired_validation": validation,
             "start_route_summary": validation.get("start_route_summary"),
         }
 
@@ -682,7 +940,7 @@ class TravelValidationMixin:
 
     def _activity_repair_protection(self, item: Dict[str, Any]) -> str:
         protection = clean_title(item.get("repair_protection") or item.get("repairProtection") or "")
-        if protection in {"fixed", "protected_social", "flexible", "optional"}:
+        if protection in {"fixed", "protected_social", "flexible", "optional", "derived"}:
             return protection
         is_mandatory = bool(item.get("is_mandatory", item.get("isMandatory", True)))
         return self._infer_repair_protection(
@@ -698,6 +956,11 @@ class TravelValidationMixin:
         raw_can_move = item.get("can_move_for_repair")
         if raw_can_move is not None and not bool(raw_can_move):
             return False
+
+        title = clean_title(item.get("title") or "")
+        if "critical" in title or "fixed" in title:
+            return False
+
         if item.get("is_user_fixed") or item.get("user_fixed_start") is not None:
             return False
         if item.get("timing_mode") == TimingMode.FIXED or item.get("fixed_start") is not None:
@@ -723,6 +986,18 @@ class TravelValidationMixin:
         if protection == "protected_social":
             return not self._protected_social_can_auto_move(item)
         return False
+
+    def _repair_suggestion_requires_fixed_move_approval(self, suggestion: Dict[str, Any]) -> bool:
+        protection = clean_title(suggestion.get("repair_protection") or "")
+        if protection in {"fixed", "protected_social"}:
+            return True
+        if clean_title(suggestion.get("impact_type") or "") == "fixed_target_move":
+            return True
+        return any(
+            clean_title(cascade.get("impact_type") or "") in {"fixed_target_move", "protected_cascade_move"}
+            for cascade in suggestion.get("cascade_suggestions") or []
+            if isinstance(cascade, dict)
+        )
 
     def _protected_social_can_auto_move(self, item: Dict[str, Any]) -> bool:
         return not (
@@ -770,6 +1045,7 @@ class TravelValidationMixin:
 
     def _activity_records_for_repair(self, envelope: Dict[str, Any]) -> List[Dict[str, Any]]:
         records: List[Dict[str, Any]] = []
+        seen_ids: set[str] = set()
         for collection in (envelope.get("activities") or [], envelope.get("schedule_blocks") or []):
             for source in collection:
                 if not isinstance(source, dict):
@@ -777,6 +1053,9 @@ class TravelValidationMixin:
                 if (source.get("block_type") or source.get("type") or "activity") not in {"activity", None}:
                     continue
                 if source.get("block_type") and source.get("block_type") != "activity":
+                    continue
+                activity_id = str(source.get("stable_activity_id") or source.get("id") or "")
+                if activity_id and activity_id in seen_ids:
                     continue
                 start = parse_clock(source.get("start") or source.get("startTime") or "")
                 end = parse_clock(source.get("end") or source.get("endTime") or "")
@@ -786,6 +1065,10 @@ class TravelValidationMixin:
                 record["_repair_start"] = start
                 record["_repair_end"] = end if end > start else end + 24 * 60
                 records.append(record)
+                if activity_id:
+                    seen_ids.add(activity_id)
+
+        records.sort(key=lambda r: r["_repair_start"])
         return records
 
     def _find_repair_record(self, records: List[Dict[str, Any]], *, activity_id: Optional[str] = None, title: Optional[str] = None) -> Optional[Dict[str, Any]]:
@@ -809,7 +1092,7 @@ class TravelValidationMixin:
         suggestions: List[Dict[str, Any]] = []
         seen_ids: set[str] = set()
         for index, conflict in enumerate(route_conflicts or [], start=1):
-            if conflict.get("reason_code") == "start_route_blocker":
+            if conflict.get("reason_code") in {"start_route_blocker", "fixed_to_fixed_infeasible"}:
                 continue
             target_title = conflict.get("to_activity") or conflict.get("to")
             target = self._find_repair_record(
@@ -826,8 +1109,20 @@ class TravelValidationMixin:
             required = int(conflict.get("required_route_minutes") or conflict.get("required_travel_minutes") or 0)
             if from_end is None or required <= 0:
                 continue
+            source = self._find_repair_record(
+                records,
+                activity_id=conflict.get("source_activity_id") or conflict.get("from_activity_id"),
+                title=conflict.get("from_activity") or conflict.get("from"),
+            )
+            prep = (
+                DEFAULT_PREP_BUFFER
+                if source
+                and self._block_requires_travel_coordinate(source)
+                and self._block_requires_travel_coordinate(target)
+                else 0
+            )
             duration = max(1, target["_repair_end"] - target["_repair_start"])
-            suggested_start = max(target["_repair_start"], from_end + required)
+            suggested_start = max(target["_repair_start"], from_end + required + prep)
             suggested_end = suggested_start + duration
             title = target.get("title") or target_title or "activity"
             if not self._repair_suggestion_would_change(target, suggested_start, suggested_end):
@@ -838,10 +1133,71 @@ class TravelValidationMixin:
                 )
                 continue
             protection = self._activity_repair_protection(target)
-            if protection == "protected_social":
-                reason = f"Travel from {conflict.get('from_activity') or conflict.get('from')} takes about {required} minutes"
+            if protection in {"fixed", "protected_social"}:
+                jlog("PENDING_REPAIR", f"title={title} protection={protection}", "SKIP_FIXED_PROTECTED")
+                continue
+
+            # Cascade Simulation
+            cascade_suggestions = []
+            cascade_reason_parts = []
+            current_shifted_end = suggested_end
+            current_location = target.get("location")
+            target_index = next((i for i, r in enumerate(records) if r == target), -1)
+
+            if target_index >= 0:
+                for i in range(target_index + 1, len(records)):
+                    next_record = records[i]
+                    if not self._activity_requires_repair_confirmation(next_record) or not next_record.get("location"):
+                        continue
+
+                    travel_time = estimate_travel_minutes(current_location, next_record.get("location"))
+                    prep = int(next_record.get("prep_buffer", DEFAULT_PREP_BUFFER) or 0)
+                    required_next_start = current_shifted_end + prep + travel_time
+
+                    if next_record["_repair_start"] < required_next_start:
+                        next_duration = max(1, next_record["_repair_end"] - next_record["_repair_start"])
+                        next_new_start = required_next_start
+                        next_new_end = next_new_start + next_duration
+
+                        cascade_suggestions.append({
+                            "activity_id": str(next_record.get("stable_activity_id") or next_record.get("id") or ""),
+                            "title": next_record.get("title"),
+                            "from_start": next_record["_repair_start"],
+                            "from_end": next_record["_repair_end"],
+                            "to_start": next_new_start,
+                            "to_end": next_new_end,
+                            "impact_type": "protected_cascade_move",
+                        })
+                        cascade_reason_parts.append(f"{next_record.get('title')} to {format_clock(next_new_start)}–{format_clock(next_new_end)}")
+
+                        current_shifted_end = next_new_end
+                        current_location = next_record.get("location")
+                    else:
+                        break # Cascade chain broken
+
+            relative_cascades = self._relative_dependent_cascade_suggestions(
+                envelope,
+                target,
+                suggested_start,
+                suggested_end,
+            )
+            if relative_cascades:
+                cascade_suggestions.extend(relative_cascades)
+                for relative in relative_cascades:
+                    cascade_reason_parts.append(
+                        f"{relative.get('title')} after {title} at "
+                        f"{relative.get('to') or format_clock(int(relative.get('to_start') or 0))}"
+                    )
+
+            if cascade_suggestions:
+                cascade_text = ", ".join(cascade_reason_parts)
+                reason = f"Move {title} from {format_clock(target['_repair_start'])}–{format_clock(target['_repair_end'])} to {format_clock(suggested_start)}–{format_clock(suggested_end)} because travel needs {required} minutes. This will also shift: {cascade_text}."
             else:
-                reason = f"Can I move {title} to make room for about {required} minutes of accurate travel time?"
+                if protection == "protected_social":
+                    reason = f"Travel from {conflict.get('from_activity') or conflict.get('from')} takes about {required} minutes"
+                else:
+                    reason = f"Can I move {title} to make room for about {required} minutes of accurate travel time?"
+
             suggestion = {
                 "id": f"suggestion_{len(suggestions) + 1}",
                 "type": "move_activity",
@@ -855,8 +1211,12 @@ class TravelValidationMixin:
                 "to_end_minutes": suggested_end,
                 "duration_minutes": duration,
                 "reason": reason,
+                "cascade_suggestions": cascade_suggestions,
                 "impact": "minimal_shift",
+                "impact_type": "fixed_target_move",
                 "requires_user_confirmation": True,
+                "requires_explicit_fixed_move_approval": protection in {"fixed", "protected_social"},
+                "advisory_only": protection in {"fixed", "protected_social"},
                 "would_change": True,
                 "schedule_version": int(envelope.get("version") or 1),
                 "route_conflict_index": index - 1,
@@ -867,6 +1227,87 @@ class TravelValidationMixin:
                 seen_ids.add(activity_id)
             jlog("PENDING_REPAIR", f"id={suggestion['id']} action=created title={title}", None)
         return suggestions
+
+    def _relative_dependent_cascade_suggestions(
+        self,
+        envelope: Dict[str, Any],
+        target: Dict[str, Any],
+        target_new_start: int,
+        target_new_end: int,
+    ) -> List[Dict[str, Any]]:
+        active = [
+            item for item in self._load_canonical_activities(envelope)
+            if item.get("status") == "active"
+        ]
+        target_id = str(target.get("stable_activity_id") or target.get("id") or "")
+        target_title = clean_title(target.get("title") or "")
+        dependents: List[Dict[str, Any]] = []
+        known_ends: Dict[str, int] = {}
+        if target_id:
+            known_ends[f"id:{target_id}"] = target_new_end
+        if target_title:
+            known_ends[f"title:{target_title}"] = target_new_end
+
+        progress = True
+        while progress:
+            progress = False
+            for item in active:
+                item_id = str(item.get("stable_activity_id") or item.get("id") or "")
+                item_title = clean_title(item.get("title") or "")
+                if any(
+                    (item_id and existing.get("activity_id") == item_id)
+                    or (item_title and clean_title(existing.get("title") or "") == item_title)
+                    for existing in dependents
+                ):
+                    continue
+                relation = item.get("anchor_relation") or {}
+                if not relation:
+                    continue
+                relation_kind = clean_title(relation.get("kind") or "after")
+                if relation_kind != "after":
+                    continue
+                anchor_id = str(relation.get("target_activity_id") or relation.get("target_id") or "")
+                anchor_title = clean_title(relation.get("target_title") or "")
+                anchor_key = f"id:{anchor_id}" if anchor_id else (f"title:{anchor_title}" if anchor_title else "")
+                if not anchor_key or anchor_key not in known_ends:
+                    continue
+                old_start = item.get("scheduled_start")
+                if old_start is None:
+                    old_start = parse_clock(item.get("startTime") or "")
+                old_end = item.get("scheduled_end")
+                if old_end is None:
+                    old_end = parse_clock(item.get("endTime") or "")
+                duration = int(item.get("duration_minutes") or ((old_end or 0) - (old_start or 0)) or DEFAULT_DURATION)
+                transition = 0
+                if self._block_requires_travel_coordinate(target) and self._block_requires_travel_coordinate(item):
+                    transition += DEFAULT_PREP_BUFFER
+                    if clean_title(target.get("location") or "") != clean_title(item.get("location") or ""):
+                        transition += estimate_travel_minutes(target.get("location"), item.get("location"))
+                new_start = int(known_ends[anchor_key]) + transition
+                new_end = new_start + duration
+                cascade = {
+                    "activity_id": item.get("stable_activity_id") or item.get("id"),
+                    "title": item.get("title"),
+                    "from_start": old_start,
+                    "from_end": old_end,
+                    "from": format_clock(old_start) if old_start is not None else None,
+                    "from_end_label": format_clock(old_end) if old_end is not None else None,
+                    "to_start": new_start,
+                    "to_end": new_end,
+                    "to": format_clock(new_start),
+                    "to_end_label": format_clock(new_end),
+                    "impact_type": "anchor_dependent_recalculated",
+                    "depends_on_activity_id": target_id or None,
+                    "depends_on_title": target.get("title"),
+                    "reason": f"Recalculate {item.get('title')} after moved anchor {target.get('title')}.",
+                }
+                dependents.append(cascade)
+                if item_id:
+                    known_ends[f"id:{item_id}"] = new_end
+                if item_title:
+                    known_ends[f"title:{item_title}"] = new_end
+                progress = True
+        return dependents
 
     def _repair_suggestion_would_change(
         self,
@@ -943,18 +1384,119 @@ class TravelValidationMixin:
         return violations
 
     def _repair_unfit_score(self, item: Dict[str, Any]) -> float:
-        if not self._activity_can_move_for_route_repair(item):
+        is_relative_unfit = bool(item.get("anchor_relation")) and (
+            item.get("status") == "unscheduled" or item.get("is_conflict")
+        )
+        if not is_relative_unfit and not self._activity_can_move_for_route_repair(item):
             return float("inf")
         protection = self._activity_repair_protection(item)
         if protection == "fixed":
             return float("inf")
         priority = clean_title(item.get("priority") or "medium")
         priority_score = {"low": 10, "medium": 30, "high": 60}.get(priority, 30)
-        protection_score = {"optional": 0, "flexible": 50, "protected_social": 10000}.get(protection, 50)
+        protection_score = {"optional": 0, "derived": 40, "flexible": 50, "protected_social": 10000}.get(protection, 50)
         mandatory_score = 100 if item.get("is_mandatory", item.get("isMandatory", True)) else 0
         explicit_score = 20 if item.get("source") in {"initial_request", "user_operation"} else 0
         base_score = float(self._calculate_activity_base_score(item) if hasattr(self, "_calculate_activity_base_score") else 0)
         return protection_score + mandatory_score + priority_score + explicit_score + (base_score / 100.0)
+
+    def _is_fixed_route_conflict(self, conflict: Dict[str, Any]) -> bool:
+        return str(conflict.get("reason_code") or "") == "fixed_to_fixed_infeasible"
+
+    def _fixed_route_conflicts(self, conflicts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return [conflict for conflict in conflicts or [] if self._is_fixed_route_conflict(conflict)]
+
+    def _blocking_route_conflicts(self, conflicts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return [conflict for conflict in conflicts or [] if not self._is_fixed_route_conflict(conflict)]
+
+    def _has_non_fixed_repair_scope(
+        self,
+        active: List[Dict[str, Any]],
+        unfit: List[Dict[str, Any]],
+        route_repair_actions: List[Dict[str, Any]],
+    ) -> bool:
+        if unfit or route_repair_actions:
+            return True
+        for item in active or []:
+            if item.get("anchor_relation") and not item.get("is_user_fixed"):
+                return True
+            if self._activity_can_move_for_route_repair(item):
+                return True
+        return False
+
+    def _has_renderable_repaired_chronology(self, validation: Optional[Dict[str, Any]]) -> bool:
+        if not validation:
+            return False
+        blocks = validation.get("schedule_blocks") or []
+        if not blocks:
+            return False
+        activity_count = 0
+        for block in blocks:
+            if not isinstance(block, dict) or block.get("display_only"):
+                continue
+            start, end = self._block_time_bounds(block)
+            if start is None or end is None or end <= start:
+                return False
+            if self._is_activity_schedule_block(block):
+                activity_count += 1
+        return activity_count > 0
+
+    def _with_fixed_route_conflict_warning_blocks(
+        self,
+        blocks: List[Dict[str, Any]],
+        conflicts: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        fixed_conflicts = self._fixed_route_conflicts(conflicts)
+        if not fixed_conflicts:
+            return blocks
+        next_blocks = deepcopy(blocks or [])
+        existing_ids = {str(block.get("id") or "") for block in next_blocks if block.get("id")}
+        for index, conflict in enumerate(fixed_conflicts, start=1):
+            required = int(conflict.get("required_travel_minutes") or conflict.get("required_route_minutes") or 0)
+            available = int(conflict.get("available_gap_minutes") or conflict.get("available_minutes") or 0)
+            start_min = parse_clock(conflict.get("from_end") or "") or parse_clock(conflict.get("to_start") or "")
+            to_start = parse_clock(conflict.get("to_start") or "")
+            if start_min is None:
+                continue
+            visual_end = to_start if to_start is not None and to_start > start_min else start_min + max(5, min(required or 5, 15))
+            from_title = conflict.get("from_activity") or conflict.get("from") or "previous fixed event"
+            to_title = conflict.get("to_activity") or conflict.get("to") or "next fixed event"
+            block_id = f"fixed_route_conflict_{index}_{clean_title(from_title)}_{clean_title(to_title)}"
+            if block_id in existing_ids:
+                continue
+            existing_ids.add(block_id)
+            next_blocks.append({
+                "id": block_id,
+                "stable_activity_id": block_id,
+                "block_type": "route_conflict",
+                "type": "route_conflict",
+                "category": "route_conflict",
+                "title": f"Route conflict: {from_title} -> {to_title}",
+                "display_label": (
+                    f"Route conflict: {from_title} -> {to_title} needs {required} min, "
+                    f"but only {available} min available."
+                ),
+                "start": format_clock(start_min),
+                "startTime": format_clock(start_min),
+                "end": format_clock(visual_end),
+                "endTime": format_clock(visual_end),
+                "duration_minutes": max(0, visual_end - start_min),
+                "route_duration_minutes": required,
+                "available_gap_minutes": available,
+                "is_route_conflict": True,
+                "isConflict": False,
+                "display_only": True,
+                "travel_validation_status": "fixed_route_conflict",
+                "reason_code": "fixed_to_fixed_infeasible",
+                "from_activity": from_title,
+                "to_activity": to_title,
+                "from_location": conflict.get("from_location"),
+                "to_location": conflict.get("to_location"),
+            })
+        return sorted(
+            next_blocks,
+            key=lambda block: parse_clock(block.get("start") or block.get("startTime") or "") or 0,
+        )
 
     def _repair_unfit_activities(
         self,
@@ -981,10 +1523,59 @@ class TravelValidationMixin:
             score = self._repair_unfit_score(item)
             if score == float("inf"):
                 continue
-            reason = "Not enough time after accurate travel validation"
+            item_id = str(item.get("stable_activity_id") or item.get("id") or "")
+            item_title = clean_title(item.get("title") or "")
+            related_conflict = next(
+                (
+                    conflict for conflict in remaining_conflicts or []
+                    if (
+                        (item_id and str(conflict.get("blocker_activity_id") or "") == item_id)
+                        or (item_id and str(conflict.get("destination_activity_id") or "") == item_id)
+                        or (item_title and clean_title(conflict.get("blocker_activity_title") or "") == item_title)
+                        or (item_title and clean_title(conflict.get("to_activity") or conflict.get("to") or "") == item_title)
+                    )
+                ),
+                None,
+            )
+            reason_code = (
+                item.get("unscheduled_reason")
+                or item.get("reason_code")
+                or (related_conflict or {}).get("reason_code")
+                or "not_enough_time_after_travel"
+            )
+            reason = (
+                item.get("unscheduled_reason_detail")
+                or item.get("reason")
+                or (related_conflict or {}).get("reason")
+                or "Not enough time after accurate travel validation"
+            )
+            blocker_title = (
+                (related_conflict or {}).get("blocker_activity_title")
+                or (related_conflict or {}).get("from_activity")
+                or (related_conflict or {}).get("from")
+            )
+            blocking_constraint = {
+                "reason_code": reason_code,
+                "from_activity": (related_conflict or {}).get("from_activity") or (related_conflict or {}).get("from"),
+                "to_activity": (related_conflict or {}).get("to_activity") or (related_conflict or {}).get("to"),
+                "leave_by": (related_conflict or {}).get("leave_by"),
+                "required_travel_minutes": (related_conflict or {}).get("required_travel_minutes") or (related_conflict or {}).get("required_route_minutes"),
+                "available_gap_minutes": (related_conflict or {}).get("available_gap_minutes") or (related_conflict or {}).get("available_minutes"),
+            }
+            suggested_resolution = []
+            if blocker_title:
+                suggested_resolution.append(f"Move {blocker_title} earlier or later to create a route-safe gap.")
+            if item.get("duration_minutes"):
+                suggested_resolution.append(f"Shorten {item.get('title') or 'this activity'} below {item.get('duration_minutes')} minutes.")
+            suggested_resolution.append(f"Change {item.get('title') or 'this activity'} to flexible/optional or schedule it another day.")
             metadata = {
+                "activity_id": item.get("stable_activity_id") or item.get("id"),
                 "title": item.get("title"),
+                "duration_minutes": item.get("duration_minutes"),
                 "reason": reason,
+                "reason_code": reason_code,
+                "blocking_constraint": blocking_constraint,
+                "suggested_resolution": list(dict.fromkeys(suggested_resolution)),
                 "priority": item.get("priority", "medium"),
                 "timing_mode": item.get("timing_mode") or item.get("original_timing_mode") or TimingMode.UNSPECIFIED,
                 "score": round(float(score), 2),
@@ -993,13 +1584,253 @@ class TravelValidationMixin:
             jlog("TRAVEL_REPAIR", f"title={metadata['title']} score={metadata['score']} reason={reason}", "UNFIT")
         return unfit
 
+    def _route_repair_activity_key(self, item: Dict[str, Any]) -> str:
+        return str(
+            item.get("stable_activity_id")
+            or item.get("activity_id")
+            or item.get("id")
+            or clean_title(item.get("title") or "")
+            or ""
+        )
+
+    def _route_repair_item_is_optional(self, item: Dict[str, Any]) -> bool:
+        if item.get("optional_reason"):
+            return True
+        if item.get("is_mandatory") is False or item.get("isMandatory") is False:
+            return True
+        if clean_title(item.get("activity_type") or "") == "optional":
+            return True
+        return self._activity_repair_protection(item) == "optional"
+
+    def _optional_skipped_from_unscheduled(
+        self,
+        unscheduled: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        skipped: List[Dict[str, Any]] = []
+        for item in unscheduled or []:
+            if not self._route_repair_item_is_optional(item):
+                continue
+            reason_code = item.get("unscheduled_reason") or item.get("reason_code") or "optional_skipped"
+            reason = (
+                item.get("unscheduled_reason_detail")
+                or item.get("reason")
+                or "Optional activity skipped because no good route-safe slot was available."
+            )
+            skipped.append({
+                "activity_id": item.get("stable_activity_id") or item.get("id"),
+                "title": item.get("title"),
+                "duration_minutes": item.get("duration_minutes"),
+                "reason": reason,
+                "reason_code": reason_code,
+                "priority": item.get("priority", "low"),
+                "timing_mode": item.get("timing_mode") or item.get("original_timing_mode") or TimingMode.UNSPECIFIED,
+                "optional_reason": item.get("optional_reason") or "optional",
+            })
+        return skipped
+
+    def _route_repair_unfit_metadata(
+        self,
+        item: Dict[str, Any],
+        *,
+        reason_code: str,
+        reason: str,
+    ) -> Dict[str, Any]:
+        title = item.get("title") or "Activity"
+        duration = item.get("duration_minutes")
+        return {
+            "activity_id": item.get("stable_activity_id") or item.get("id"),
+            "title": title,
+            "duration_minutes": duration,
+            "reason": reason,
+            "reason_code": reason_code,
+            "blocking_constraint": {"reason_code": reason_code},
+            "suggested_resolution": list(dict.fromkeys([
+                f"Shorten {title} below {duration} minutes." if duration else f"Shorten {title}.",
+                f"Schedule {title} another day or free up a larger route-safe slot.",
+            ])),
+            "priority": item.get("priority", "medium"),
+            "timing_mode": item.get("timing_mode") or item.get("original_timing_mode") or TimingMode.UNSPECIFIED,
+        }
+
+    def _account_for_route_repair_activities(
+        self,
+        original_active: List[Dict[str, Any]],
+        repaired: Dict[str, Any],
+        unfit_activities: List[Dict[str, Any]],
+        optional_skipped: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        scheduled_keys: set[str] = set()
+        for item in repaired.get("activities") or []:
+            if not isinstance(item, dict):
+                continue
+            key = self._route_repair_activity_key(item)
+            if key:
+                scheduled_keys.add(key)
+        for block in repaired.get("schedule_blocks") or []:
+            if not isinstance(block, dict) or not self._is_activity_schedule_block(block):
+                continue
+            key = self._route_repair_activity_key(block)
+            if key:
+                scheduled_keys.add(key)
+
+        unfit_keys = {self._route_repair_activity_key(item) for item in unfit_activities or []}
+        optional_keys = {self._route_repair_activity_key(item) for item in optional_skipped or []}
+        updated_unfit = list(unfit_activities or [])
+        updated_optional = list(optional_skipped or [])
+        missing_after: List[str] = []
+
+        for item in original_active or []:
+            if item.get("status") not in {None, "active"}:
+                continue
+            key = self._route_repair_activity_key(item)
+            if not key:
+                continue
+            if key in scheduled_keys or key in unfit_keys or key in optional_keys:
+                continue
+            if self._route_repair_item_is_optional(item):
+                metadata = self._optional_skipped_from_unscheduled([
+                    {
+                        **deepcopy(item),
+                        "unscheduled_reason": "optional_skipped_after_route_repair",
+                        "reason": "Optional activity skipped after route-aware repair.",
+                    }
+                ])[0]
+                updated_optional.append(metadata)
+                optional_keys.add(key)
+            else:
+                updated_unfit.append(self._route_repair_unfit_metadata(
+                    item,
+                    reason_code="missing_after_route_repair",
+                    reason="Could not fit after route-aware repair.",
+                ))
+                unfit_keys.add(key)
+
+        accounted_keys = scheduled_keys | unfit_keys | optional_keys
+        for item in original_active or []:
+            key = self._route_repair_activity_key(item)
+            if key and key not in accounted_keys:
+                missing_after.append(key)
+
+        jlog(
+            "TRAVEL_REPAIR",
+            (
+                f"scheduled={len(scheduled_keys)} unfit={len(updated_unfit)} "
+                f"optional_skipped={len(updated_optional)} missing={missing_after}"
+            ),
+            "ACCOUNTING",
+        )
+        return {
+            "unfit_activities": updated_unfit,
+            "optional_skipped": updated_optional,
+            "missing_after_accounting": missing_after,
+        }
+
+    def _blocked_activities_for_fixed_route_conflict(
+        self,
+        active: List[Dict[str, Any]],
+        unscheduled: List[Dict[str, Any]],
+        remaining_conflicts: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        explicit_blocked = [
+            item for item in unscheduled or []
+            if item.get("reason_code") == "blocked_by_fixed_route_conflict"
+            or item.get("unscheduled_reason") == "blocked_by_fixed_route_conflict"
+        ]
+        if not explicit_blocked:
+            return []
+        fixed_conflict = next(
+            (
+                conflict for conflict in remaining_conflicts or []
+                if conflict.get("reason_code") == "fixed_to_fixed_infeasible"
+            ),
+            None,
+        )
+        if not fixed_conflict:
+            return []
+        candidates = list(explicit_blocked)
+        blocked: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        from_title = fixed_conflict.get("from_activity") or fixed_conflict.get("from") or "a fixed event"
+        to_title = fixed_conflict.get("to_activity") or fixed_conflict.get("to") or "another fixed event"
+        reason = (
+            f"{from_title} and {to_title} cannot both be reached on time with accurate travel. "
+            "Resolve that fixed route conflict before this activity can be safely placed."
+        )
+        for item in candidates:
+            item_id = str(item.get("stable_activity_id") or item.get("id") or item.get("title") or "")
+            if item_id in seen:
+                continue
+            seen.add(item_id)
+            title = item.get("title") or "Activity"
+            duration = item.get("duration_minutes")
+            blocked.append({
+                "activity_id": item.get("stable_activity_id") or item.get("id"),
+                "title": title,
+                "duration_minutes": duration,
+                "reason": reason,
+                "reason_code": "blocked_by_fixed_route_conflict",
+                "blocking_constraint": {
+                    "reason_code": "fixed_to_fixed_infeasible",
+                    "from_activity": fixed_conflict.get("from_activity") or fixed_conflict.get("from"),
+                    "to_activity": fixed_conflict.get("to_activity") or fixed_conflict.get("to"),
+                    "required_travel_minutes": fixed_conflict.get("required_travel_minutes") or fixed_conflict.get("required_route_minutes"),
+                    "available_gap_minutes": fixed_conflict.get("available_gap_minutes") or fixed_conflict.get("available_minutes"),
+                },
+                "suggested_resolution": [
+                    f"Allow moving {to_title} or convert it to flexible.",
+                    f"Move {from_title} earlier if that fixed event is actually movable.",
+                    f"Schedule {title} another day after resolving the fixed route conflict.",
+                ],
+            })
+        return blocked
+
+    def _filter_items_not_scheduled_in_repair(
+        self,
+        items: List[Dict[str, Any]],
+        repaired: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        if not items:
+            return []
+        scheduled_keys: set[str] = set()
+        for block in repaired.get("schedule_blocks") or []:
+            if not isinstance(block, dict) or not self._is_activity_schedule_block(block):
+                continue
+            for value in (
+                block.get("stable_activity_id"),
+                block.get("id"),
+                clean_title(block.get("title") or ""),
+            ):
+                if value:
+                    scheduled_keys.add(str(value))
+        filtered: List[Dict[str, Any]] = []
+        for item in items:
+            item_keys = {
+                str(value)
+                for value in (
+                    item.get("activity_id"),
+                    item.get("stable_activity_id"),
+                    item.get("id"),
+                    clean_title(item.get("title") or ""),
+                )
+                if value
+            }
+            if item_keys and item_keys.intersection(scheduled_keys):
+                continue
+            filtered.append(item)
+        return filtered
+
     def _final_validate_route_aware_repair(
         self,
         original: Dict[str, Any],
         repaired: Dict[str, Any],
         route_context: Dict[str, Any],
+        accepted_fixed_move_ids: Optional[set[str]] = None,
     ) -> Dict[str, Any]:
-        blocks = deepcopy(repaired.get("schedule_blocks") or [])
+        blocks = [
+            deepcopy(block)
+            for block in (repaired.get("schedule_blocks") or [])
+            if not (isinstance(block, dict) and (block.get("display_only") or block.get("is_route_conflict")))
+        ]
         preferences = repaired.get("preferences") or {}
         day_start = parse_clock(preferences.get("day_start") or preferences.get("day_start_time") or "") or DEFAULT_DAY_START
         day_end = parse_clock(preferences.get("day_end") or preferences.get("day_end_time") or "") or DEFAULT_DAY_END
@@ -1037,6 +1868,7 @@ class TravelValidationMixin:
 
         original_records = self._activity_records_for_repair(original)
         repaired_records = self._activity_records_for_repair(repaired)
+        accepted_fixed_move_ids = {str(value) for value in (accepted_fixed_move_ids or set()) if value}
         for original_record in original_records:
             if not (
                 original_record.get("is_user_fixed")
@@ -1062,6 +1894,9 @@ class TravelValidationMixin:
                 candidate.get("_repair_start") != original_record.get("_repair_start")
                 or candidate.get("_repair_end") != original_record.get("_repair_end")
             ):
+                record_id = str(original_record.get("stable_activity_id") or original_record.get("id") or "")
+                if record_id and record_id in accepted_fixed_move_ids:
+                    continue
                 route_conflicts.append({
                     "type": "route_conflict",
                     "to_activity": original_record.get("title"),
@@ -1134,8 +1969,26 @@ class TravelValidationMixin:
                             "required_route_minutes": route_minutes,
                             "required_travel_minutes": route_minutes,
                             "available_gap_minutes": max(0, leave_by - day_start),
-                            "reason": f"{block.get('title')} ends after the leave-by time for route-based travel to {first.get('title')}.",
-                            "reason_code": "start_route_blocker",
+                            "destination_movable": self._activity_can_move_for_route_repair(first),
+                            "destination_activity_id": first.get("stable_activity_id") or first.get("id"),
+                            "blocker_movable": self._activity_can_auto_move_for_route_repair(block),
+                            "reason": (
+                                f"{block.get('title')} and {first.get('title')} are fixed/protected around the required "
+                                f"leave-by time {format_clock(leave_by)}, so this start route is not physically feasible."
+                                if (
+                                    not self._activity_can_auto_move_for_route_repair(block)
+                                    and not self._activity_can_move_for_route_repair(first)
+                                )
+                                else f"{block.get('title')} ends after the leave-by time for route-based travel to {first.get('title')}."
+                            ),
+                            "reason_code": (
+                                "fixed_to_fixed_infeasible"
+                                if (
+                                    not self._activity_can_auto_move_for_route_repair(block)
+                                    and not self._activity_can_move_for_route_repair(first)
+                                )
+                                else "start_route_blocker"
+                            ),
                         })
 
         for left_pos, right_pos in zip(physical_indices, physical_indices[1:]):
@@ -1149,6 +2002,8 @@ class TravelValidationMixin:
             if left_end is None or right_start is None:
                 continue
             route_minutes = int(entry.get("duration_minutes") or 0)
+            if route_minutes <= 0 or clean_title(entry.get("source") or "") == "same_location":
+                continue
             prep = max(
                 int(left.get("prep_buffer", DEFAULT_PREP_BUFFER) or 0),
                 int(right.get("prep_buffer", DEFAULT_PREP_BUFFER) or 0),
@@ -1177,25 +2032,43 @@ class TravelValidationMixin:
                     "reason_code": "travel_overlaps_destination",
                 })
             if right_start < required_start:
-                route_conflicts.append({
-                    "type": "route_conflict",
-                    "from_activity": left.get("title"),
-                    "to_activity": right.get("title"),
-                    "from_location": left.get("location"),
-                    "to_location": right.get("location"),
-                    "from_end": format_clock(route_gap_start),
-                    "to_start": format_clock(right_start),
-                    "required_route_minutes": route_minutes,
-                    "required_travel_minutes": route_minutes,
-                    "available_gap_minutes": max(0, right_start - route_gap_start),
-                    "destination_movable": self._activity_can_move_for_route_repair(right),
-                    "destination_activity_id": right.get("stable_activity_id") or right.get("id"),
-                    "reason": (
-                        f"Accurate route from {left.get('title')} to {right.get('title')} needs "
-                        f"{route_minutes} minutes plus buffer, but the final repair did not leave enough time."
-                    ),
-                    "reason_code": "not_enough_travel_time",
-                })
+                if not self._activity_can_move_for_route_repair(left) and not self._activity_can_move_for_route_repair(right):
+                    route_conflicts.append({
+                        "type": "route_conflict",
+                        "from_activity": left.get("title"),
+                        "to_activity": right.get("title"),
+                        "from_location": left.get("location"),
+                        "to_location": right.get("location"),
+                        "from_end": format_clock(route_gap_start),
+                        "to_start": format_clock(right_start),
+                        "required_route_minutes": route_minutes,
+                        "required_travel_minutes": route_minutes,
+                        "available_gap_minutes": max(0, right_start - route_gap_start),
+                        "destination_movable": False,
+                        "destination_activity_id": right.get("stable_activity_id") or right.get("id"),
+                        "reason": f"Your {left.get('title')} ends at {left.get('location')} at {format_clock(left_end)}, but {right.get('title')} starts in {right.get('location')} at {format_clock(right_start)}. Accurate travel requires about {route_minutes} minutes, so this fixed sequence is not physically feasible.",
+                        "reason_code": "fixed_to_fixed_infeasible",
+                    })
+                else:
+                    route_conflicts.append({
+                        "type": "route_conflict",
+                        "from_activity": left.get("title"),
+                        "to_activity": right.get("title"),
+                        "from_location": left.get("location"),
+                        "to_location": right.get("location"),
+                        "from_end": format_clock(route_gap_start),
+                        "to_start": format_clock(right_start),
+                        "required_route_minutes": route_minutes,
+                        "required_travel_minutes": route_minutes,
+                        "available_gap_minutes": max(0, right_start - route_gap_start),
+                        "destination_movable": self._activity_can_move_for_route_repair(right),
+                        "destination_activity_id": right.get("stable_activity_id") or right.get("id"),
+                        "reason": (
+                            f"Accurate route from {left.get('title')} to {right.get('title')} needs "
+                            f"{route_minutes} minutes plus buffer, but the final repair did not leave enough time."
+                        ),
+                        "reason_code": "not_enough_travel_time",
+                    })
 
         for record in repaired_records:
             if self._activity_repair_protection(record) != "protected_social":
@@ -1227,6 +2100,7 @@ class TravelValidationMixin:
                     "reason_code": "violates_evening_or_social_commitment",
                 })
 
+        blocks = self._with_fixed_route_conflict_warning_blocks(blocks, route_conflicts)
         status = "route_conflict" if route_conflicts else (
             "fallback_used" if route_context.get("fallback_used") else "validated"
         )
@@ -1306,6 +2180,491 @@ class TravelValidationMixin:
             })
         return actions
 
+    def _find_active_activity_for_repair_confirmation(
+        self,
+        active: List[Dict[str, Any]],
+        *,
+        activity_id: Optional[str] = None,
+        title: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        clean = clean_title(title or "")
+        if activity_id:
+            for item in active:
+                if str(item.get("stable_activity_id") or item.get("id") or "") == str(activity_id):
+                    return item
+        if clean:
+            for item in active:
+                if clean_title(item.get("title") or "") == clean:
+                    return item
+        return None
+
+    def _repair_confirmation_move_specs(
+        self,
+        suggestion: Dict[str, Any],
+        active: List[Dict[str, Any]],
+    ) -> Tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]]]:
+        specs: Dict[str, Dict[str, Any]] = {}
+        ignored_cascades: List[Dict[str, Any]] = []
+
+        def add_spec(source: Dict[str, Any], *, default_impact: str) -> None:
+            target = self._find_active_activity_for_repair_confirmation(
+                active,
+                activity_id=source.get("activity_id"),
+                title=source.get("title"),
+            )
+            if not target:
+                ignored_cascades.append(source)
+                return
+            start = parse_clock(source.get("to") or "")
+            if start is None:
+                start = source.get("to_start") or source.get("to_start_minutes")
+            end = parse_clock(source.get("to_end") or source.get("to_end_label") or "")
+            if end is None:
+                end = source.get("to_end") or source.get("to_end_minutes")
+            duration = int(
+                source.get("duration_minutes")
+                or target.get("duration_minutes")
+                or ((int(end) - int(start)) if start is not None and end is not None else DEFAULT_DURATION)
+            )
+            if start is None:
+                ignored_cascades.append(source)
+                return
+            start = int(start)
+            end = int(end) if end is not None else start + duration
+            if end <= start:
+                end = start + duration
+            key = str(target.get("stable_activity_id") or target.get("id") or source.get("activity_id") or "")
+            if not key:
+                ignored_cascades.append(source)
+                return
+            specs[key] = {
+                "activity_id": key,
+                "title": target.get("title") or source.get("title"),
+                "start": start,
+                "end": end,
+                "impact_type": source.get("impact_type") or default_impact,
+                "source": deepcopy(source),
+            }
+
+        add_spec(suggestion, default_impact="fixed_target_move")
+        for cascade in suggestion.get("cascade_suggestions") or []:
+            impact = clean_title(cascade.get("impact_type") or "")
+            if impact in {"anchor_dependent_recalculated", "flex_replanned", "became_unfit"}:
+                continue
+            target = self._find_active_activity_for_repair_confirmation(
+                active,
+                activity_id=cascade.get("activity_id"),
+                title=cascade.get("title"),
+            )
+            if target and self._activity_requires_repair_confirmation(target):
+                add_spec(cascade, default_impact="protected_cascade_move")
+        return specs, ignored_cascades
+
+    def _activity_is_relative_to_any(
+        self,
+        item: Dict[str, Any],
+        changed_ids: set[str],
+        changed_titles: set[str],
+    ) -> bool:
+        relation = item.get("anchor_relation") or {}
+        if not relation:
+            return False
+        target_id = str(relation.get("target_activity_id") or relation.get("target_id") or "")
+        target_title = clean_title(relation.get("target_title") or "")
+        return bool((target_id and target_id in changed_ids) or (target_title and target_title in changed_titles))
+
+    def _release_activity_for_repair_confirmation(
+        self,
+        item: Dict[str, Any],
+        *,
+        keep_relative: bool = False,
+    ) -> None:
+        item["preserve_scheduled_time"] = False
+        item["locked_fixed"] = False
+        item.pop("scheduled_start", None)
+        item.pop("scheduled_end", None)
+        item.pop("startTime", None)
+        item.pop("endTime", None)
+        if keep_relative or item.get("anchor_relation"):
+            item["timing_mode"] = TimingMode.RELATIVE
+        else:
+            if item.get("timing_mode") == TimingMode.FIXED:
+                item["timing_mode"] = item.get("original_timing_mode") or TimingMode.UNSPECIFIED
+            if item.get("timing_mode") == TimingMode.FIXED:
+                item["timing_mode"] = TimingMode.UNSPECIFIED
+            item["fixed_start"] = None
+            item["fixed_end"] = None
+            item["user_fixed_start"] = None
+            item["is_user_fixed"] = False
+            item["can_move_for_repair"] = True
+
+    def _lock_activity_for_repair_confirmation(self, item: Dict[str, Any]) -> None:
+        duration = int(item.get("duration_minutes") or DEFAULT_DURATION)
+        start = item.get("fixed_start")
+        if start is None:
+            start = item.get("scheduled_start")
+        if start is None:
+            start = parse_clock(item.get("startTime") or "")
+        end = item.get("fixed_end")
+        if end is None:
+            end = item.get("scheduled_end")
+        if end is None:
+            end = parse_clock(item.get("endTime") or "")
+        if start is None:
+            return
+        start = int(start)
+        end = int(end) if end is not None else start + duration
+        if end <= start:
+            end = start + duration
+        item["scheduled_start"] = start
+        item["scheduled_end"] = end
+        item["fixed_start"] = start
+        item["fixed_end"] = end
+        item["earliest_start"] = start
+        item["latest_end"] = end
+        item["timing_mode"] = TimingMode.FIXED
+        item["locked_fixed"] = True
+        item["can_move_for_repair"] = False
+
+    def _prepare_active_for_repair_confirmation(
+        self,
+        active: List[Dict[str, Any]],
+        move_specs: Dict[str, Dict[str, Any]],
+    ) -> Tuple[List[Dict[str, Any]], set[str]]:
+        prepared = deepcopy(active)
+        accepted_ids = set(move_specs.keys())
+        changed_ids = set(move_specs.keys())
+        changed_titles = {
+            clean_title(spec.get("title") or "")
+            for spec in move_specs.values()
+            if spec.get("title")
+        }
+
+        progress = True
+        affected_relative_ids: set[str] = set()
+        while progress:
+            progress = False
+            for item in prepared:
+                item_id = str(item.get("stable_activity_id") or item.get("id") or "")
+                if item_id in affected_relative_ids:
+                    continue
+                if self._activity_is_relative_to_any(item, changed_ids, changed_titles):
+                    affected_relative_ids.add(item_id)
+                    if item_id:
+                        changed_ids.add(item_id)
+                    title = clean_title(item.get("title") or "")
+                    if title:
+                        changed_titles.add(title)
+                    progress = True
+
+        for item in prepared:
+            item_id = str(item.get("stable_activity_id") or item.get("id") or "")
+            spec = move_specs.get(item_id)
+            if spec:
+                duration = int(item.get("duration_minutes") or (spec["end"] - spec["start"]) or DEFAULT_DURATION)
+                item["scheduled_start"] = spec["start"]
+                item["scheduled_end"] = spec["end"]
+                item["fixed_start"] = spec["start"]
+                item["fixed_end"] = spec["end"]
+                item["earliest_start"] = spec["start"]
+                item["latest_end"] = spec["end"]
+                item["duration_minutes"] = duration
+                item["timing_mode"] = TimingMode.FIXED
+                item["is_user_fixed"] = True
+                item["user_fixed_start"] = spec["start"]
+                item["locked_fixed"] = False
+                item["preserve_scheduled_time"] = False
+                item["can_move_for_repair"] = False
+                item.setdefault("trace", []).append("Accepted accurate travel repair suggestion.")
+                continue
+
+            if item_id in affected_relative_ids or item.get("anchor_relation"):
+                self._release_activity_for_repair_confirmation(item, keep_relative=True)
+                continue
+
+            if self._activity_requires_repair_confirmation(item):
+                self._lock_activity_for_repair_confirmation(item)
+                continue
+
+            timing = clean_title(item.get("timing_mode") or item.get("original_timing_mode") or "")
+            if self._activity_can_auto_move_for_route_repair(item) or timing in {
+                "flexible",
+                TimingMode.PREFERRED,
+                TimingMode.UNSPECIFIED,
+                "",
+            }:
+                self._release_activity_for_repair_confirmation(item)
+                continue
+
+            item["preserve_scheduled_time"] = False
+        return prepared, accepted_ids
+
+    def _activity_can_be_unfit_after_repair_confirmation(
+        self,
+        item: Dict[str, Any],
+        accepted_ids: set[str],
+    ) -> bool:
+        item_id = str(item.get("stable_activity_id") or item.get("id") or "")
+        if item_id and item_id in accepted_ids:
+            return False
+        if self._activity_requires_repair_confirmation(item):
+            return False
+        if item.get("anchor_relation"):
+            return True
+        return self._activity_can_auto_move_for_route_repair(item)
+
+    def _remove_repair_confirmation_unfit_conflicts(
+        self,
+        planned_activities: List[Dict[str, Any]],
+        accepted_ids: set[str],
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        conflict_unfit = [
+            item for item in planned_activities
+            if item.get("is_conflict") and self._activity_can_be_unfit_after_repair_confirmation(item, accepted_ids)
+        ]
+        if not conflict_unfit:
+            return planned_activities, []
+        removed_ids = {
+            str(item.get("stable_activity_id") or item.get("id") or "")
+            for item in conflict_unfit
+        }
+        kept = [
+            item for item in planned_activities
+            if str(item.get("stable_activity_id") or item.get("id") or "") not in removed_ids
+        ]
+        for item in kept:
+            conflict_with = [
+                conflict_id for conflict_id in (item.get("conflict_with") or [])
+                if str(conflict_id) not in removed_ids
+            ]
+            item["conflict_with"] = conflict_with
+            if not conflict_with:
+                item.pop("is_conflict", None)
+                item.pop("conflict_reason", None)
+                item.pop("conflict_severity", None)
+                item.pop("conflict_priority", None)
+        for item in conflict_unfit:
+            item["status"] = "unscheduled"
+            item["unscheduled_reason"] = item.get("conflict_reason") or "no_route_safe_slot_after_repair_confirmation"
+            item["unscheduled_reason_detail"] = item.get("conflict_reason") or (
+                f"{item.get('title') or 'This activity'} could not fit after the accepted route repair."
+            )
+        return kept, conflict_unfit
+
+    def _repair_confirmation_failure_reason(
+        self,
+        suggestion: Dict[str, Any],
+        route_conflicts: List[Dict[str, Any]],
+    ) -> str:
+        if not route_conflicts:
+            return "The repair could not be applied safely."
+        first = route_conflicts[0]
+        reason = first.get("reason")
+        if reason:
+            return str(reason)
+        left = first.get("from_activity") or first.get("from")
+        right = first.get("to_activity") or first.get("to")
+        if left and right:
+            return f"The repair could not be applied because {left} and {right} still conflict."
+        return f"The repair for {suggestion.get('title') or 'the selected activity'} could not be applied safely."
+
+    def _mark_repair_confirmation_failed(
+        self,
+        envelope: Dict[str, Any],
+        suggestion: Dict[str, Any],
+        reason: str,
+        route_conflicts: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        updated = deepcopy(envelope)
+        suggestion_id = suggestion.get("id")
+        updated["pending_repair_suggestions"] = [
+            item for item in (updated.get("pending_repair_suggestions") or [])
+            if item.get("id") != suggestion_id
+        ]
+        updated.pop("preview_id", None)
+        updated.pop("preview_base_version", None)
+        updated.pop("preview_schedule", None)
+        updated.pop("committed_schedule_blocks", None)
+        updated["preview_status"] = "apply_failed"
+        updated["preview_reason"] = reason
+        updated["failed_repair_attempt"] = {
+            "suggestion_id": suggestion_id,
+            "title": suggestion.get("title"),
+            "reason": reason,
+            "route_conflicts": deepcopy(route_conflicts or []),
+            "attempted_at": self._now_iso(),
+        }
+        return updated
+
+    def _commit_repair_confirmation_candidate(
+        self,
+        envelope: Dict[str, Any],
+        suggestion: Dict[str, Any],
+        saved_locations: List[Dict[str, Any]],
+        *,
+        allow_fixed_event_move: bool = False,
+    ) -> Dict[str, Any]:
+        if self._repair_suggestion_requires_fixed_move_approval(suggestion) and not allow_fixed_event_move:
+            return {
+                "applied": False,
+                "needs_fixed_move_confirmation": True,
+                "envelope": envelope,
+                "reply_reason": "pending_fixed_repair_requires_confirmation",
+            }
+        current_version = int(envelope.get("version") or 1)
+        original = deepcopy(envelope)
+        self._sync_resolved_locations_to_activities(original)
+        active = [
+            item for item in self._load_canonical_activities(original)
+            if item.get("status") == "active"
+        ]
+        if not active:
+            return {
+                "applied": False,
+                "envelope": self._mark_repair_confirmation_failed(
+                    envelope,
+                    suggestion,
+                    "There are no active activities to repair.",
+                ),
+                "reply_reason": "pending_repair_apply_failed",
+            }
+
+        move_specs, ignored_cascades = self._repair_confirmation_move_specs(suggestion, active)
+        if not move_specs:
+            return {
+                "applied": False,
+                "envelope": self._mark_repair_confirmation_failed(
+                    envelope,
+                    suggestion,
+                    "That repair suggestion no longer targets an active activity.",
+                ),
+                "reply_reason": "pending_repair_apply_failed",
+            }
+
+        prepared_active, accepted_ids = self._prepare_active_for_repair_confirmation(active, move_specs)
+        preferences = deepcopy(original.get("preferences") or {})
+        preferences["accurate_travel_time"] = True
+        preferences["travel_intent"] = True
+        preferences["route_aware_repair"] = True
+        preferences["refinement_reason"] = "explicit_route_repair"
+        preferences["module_0_route"] = "repair_confirmation"
+        preferences["module_0_reason"] = "pending_repair_confirmation"
+
+        route_basis = deepcopy(original)
+        route_basis["preferences"] = preferences
+        route_basis["activities"] = prepared_active
+        route_context = self._build_route_context(route_basis, prepared_active, saved_locations)
+        preferences["_route_context"] = route_context
+        planned = self._plan_schedule(
+            original.get("date") or self._local_today_iso(),
+            prepared_active,
+            preferences,
+        )
+        planned_activities, conflict_unfit = self._remove_repair_confirmation_unfit_conflicts(
+            list(planned.get("activities", [])),
+            accepted_ids,
+        )
+        day_start = parse_clock(planned.get("day_start") or preferences.get("day_start") or preferences.get("day_start_time") or "") or DEFAULT_DAY_START
+        min_travel = int(preferences.get("min_travel_buffer_minutes") or 0)
+        schedule_blocks = (
+            self._materialize_blocks(planned_activities, day_start, min_travel)
+            if conflict_unfit
+            else planned.get("schedule_blocks", [])
+        )
+
+        candidate = deepcopy(original)
+        candidate_preferences = deepcopy(preferences)
+        candidate_preferences.pop("_route_context", None)
+        candidate_preferences.pop("route_aware_repair", None)
+        candidate["schema_version"] = 4
+        candidate["version"] = current_version + 1
+        candidate["status"] = "ok"
+        candidate["schedule_status"] = "ok"
+        candidate["accurate_travel_time"] = True
+        candidate["travel_intent"] = True
+        candidate["preferences"] = candidate_preferences
+        candidate["activities"] = [self._format_activity(item) for item in planned_activities]
+        candidate["schedule_blocks"] = schedule_blocks
+        unscheduled_raw = list(planned.get("unscheduled_activities", [])) + conflict_unfit
+        candidate["unscheduled_activities"] = [self._format_activity(item) for item in unscheduled_raw]
+        candidate["conflicts"] = self._build_conflicts(planned_activities, set())
+        candidate["warnings"] = self._collect_schedule_warnings(planned_activities, schedule_blocks)
+        for key in REFINEMENT_META_KEYS:
+            candidate[key] = planned.get(key)
+
+        validation = self._final_validate_route_aware_repair(
+            original=original,
+            repaired=candidate,
+            route_context=route_context,
+            accepted_fixed_move_ids=accepted_ids,
+        )
+        route_conflicts = validation.get("route_conflicts", [])
+        if route_conflicts:
+            reason = self._repair_confirmation_failure_reason(suggestion, route_conflicts)
+            return {
+                "applied": False,
+                "envelope": self._mark_repair_confirmation_failed(envelope, suggestion, reason, route_conflicts),
+                "reply_reason": "pending_repair_apply_failed",
+            }
+
+        unfit = self._repair_unfit_activities(
+            prepared_active,
+            unscheduled_raw,
+            validation.get("route_conflicts", []),
+        )
+        actions = []
+        for spec in move_specs.values():
+            source = spec.get("source") or {}
+            actions.append({
+                "type": "move_activity",
+                "impact_type": spec.get("impact_type"),
+                "activity_id": spec.get("activity_id"),
+                "title": spec.get("title"),
+                "from": source.get("from"),
+                "from_end": source.get("from_end") or source.get("from_end_label"),
+                "to": format_clock(spec.get("start")),
+                "to_end": format_clock(spec.get("end")),
+                "reason": source.get("reason") or suggestion.get("reason") or "Accepted route repair suggestion.",
+            })
+        actions.extend(self._route_repair_actions_from_delta(original, candidate, route_context))
+
+        candidate["location_resolution_requests"] = []
+        candidate["travel_validation_status"] = "partial_feasible_with_unfit" if unfit else "repaired_validated"
+        candidate["route_conflicts"] = []
+        candidate["route_repair_attempted"] = True
+        candidate["route_repair_actions"] = actions
+        candidate["route_efficiency"] = planned.get("route_efficiency") or {}
+        candidate["pending_repair_suggestions"] = []
+        candidate["unfit_activities"] = unfit
+        candidate["unscheduled_activities"] = candidate["unscheduled_activities"] if unfit else []
+        candidate["unmet_items"] = candidate["unscheduled_activities"]
+        candidate["unmet_optional"] = candidate["unscheduled_activities"]
+        candidate["validation_issues"] = [
+            f"{item.get('title') or 'One activity'} could not fit after accurate travel validation."
+            for item in unfit
+        ]
+        candidate["updated_transition_count"] = int(validation.get("updated_transition_count") or 0)
+        candidate["start_route_summary"] = validation.get("start_route_summary")
+        candidate["schedule_blocks"] = validation.get("schedule_blocks") or candidate["schedule_blocks"]
+        if candidate["travel_validation_status"] == "partial_feasible_with_unfit":
+            candidate["status"] = "partial"
+            candidate["schedule_status"] = "partial"
+        else:
+            candidate["status"] = "ok"
+            candidate["schedule_status"] = "ok"
+        if ignored_cascades:
+            candidate.setdefault("warnings", []).append({
+                "warning_code": "IGNORED_REPAIR_CASCADE",
+                "explanation": "Some stale cascade entries were ignored while applying the route repair.",
+            })
+        self._clear_route_preview_metadata(candidate)
+        self._sync_resolved_locations_to_activities(candidate)
+        return {
+            "applied": True,
+            "envelope": candidate,
+            "reply_reason": "pending_repair_accepted",
+        }
+
     def handle_pending_repair_confirmation(
         self,
         message: str,
@@ -1323,7 +2682,15 @@ class TravelValidationMixin:
         suggestion_id = suggestion.get("id")
         schedule_version = int(envelope.get("version") or 1)
         suggestion_version = int(suggestion.get("schedule_version") or -1)
-        if not suggestion_id or suggestion_version != schedule_version:
+        envelope_preview_id = envelope.get("preview_id")
+        suggestion_preview_id = suggestion.get("preview_id")
+        preview_base_version = int(envelope.get("preview_base_version") or schedule_version)
+        if (
+            not suggestion_id
+            or suggestion_version != schedule_version
+            or preview_base_version != schedule_version
+            or (envelope_preview_id and suggestion_preview_id != envelope_preview_id)
+        ):
             return {
                 "handled": True,
                 "reply": "That repair suggestion is out of date now, so I kept the schedule unchanged. Please run accurate travel validation again.",
@@ -1335,6 +2702,7 @@ class TravelValidationMixin:
         if action == "reject":
             updated = deepcopy(envelope)
             updated["pending_repair_suggestions"] = []
+            self._clear_route_preview_metadata(updated)
             jlog("PENDING_REPAIR", f"id={suggestion_id} action=rejected", None)
             return {
                 "handled": True,
@@ -1347,6 +2715,7 @@ class TravelValidationMixin:
         if not self._pending_suggestion_would_change(suggestion):
             updated = deepcopy(envelope)
             updated["pending_repair_suggestions"] = []
+            self._clear_route_preview_metadata(updated)
             jlog(
                 "PENDING_REPAIR",
                 (
@@ -1364,33 +2733,52 @@ class TravelValidationMixin:
                 "envelope": updated,
             }
 
-        jlog("PENDING_REPAIR", f"id={suggestion_id} action=accepted", None)
-        operation = {
-            "op": "update",
-            "target_id": suggestion.get("activity_id"),
-            "target_title": suggestion.get("title"),
-            "fixed_start": suggestion.get("to"),
-            "duration_minutes": suggestion.get("duration_minutes"),
-            "notes": "Accepted accurate travel repair suggestion.",
-        }
-        result = self.apply_operations(
-            envelope=envelope,
-            operations=[operation],
-            base_version=schedule_version,
-            new_date=envelope.get("date"),
-            saved_locations=saved_locations,
+        if action == "accept" and self._repair_suggestion_requires_fixed_move_approval(suggestion):
+            title = suggestion.get("title") or "this fixed event"
+            reply = (
+                f"This will move your fixed/protected {title} from {suggestion.get('from')}–{suggestion.get('from_end')} "
+                f"to {suggestion.get('to')}–{suggestion.get('to_end')}. Are you sure you want to allow this fixed event to move?"
+            )
+            jlog("PENDING_REPAIR", f"id={suggestion_id} action=needs_fixed_confirmation", None)
+            return {
+                "handled": True,
+                "reply": reply,
+                "reply_status": "warning",
+                "reply_reason": "pending_fixed_repair_requires_confirmation",
+                "envelope": envelope,
+            }
+
+        jlog("PENDING_REPAIR", f"id={suggestion_id} action={action}", None)
+        result = self._commit_repair_confirmation_candidate(
+            envelope,
+            suggestion,
+            saved_locations,
+            allow_fixed_event_move=(action == "allow_fixed_move"),
         )
         updated_envelope = result.get("envelope") or envelope
-        if updated_envelope.get("travel_validation_status") != "route_conflict" and not updated_envelope.get("route_conflicts"):
-            updated_envelope["pending_repair_suggestions"] = []
+        if result.get("applied"):
             jlog("PENDING_REPAIR", f"id={suggestion_id} action=cleared", None)
-            reply = f"I applied the repair suggestion and moved {suggestion.get('title')} to {suggestion.get('to')}."
-            reply_status = "success"
-            reply_reason = "pending_repair_accepted"
+            if updated_envelope.get("travel_validation_status") == "partial_feasible_with_unfit":
+                reply = (
+                    "I applied the repair suggestion and rescheduled the route-safe activities. "
+                    "Some activities still could not fit and remain listed as unfit."
+                )
+                reply_status = "warning"
+                reply_reason = "pending_repair_accepted_with_unfit"
+            else:
+                reply = f"I applied the repair suggestion and moved {suggestion.get('title')} to {suggestion.get('to')}."
+                reply_status = "success"
+                reply_reason = "pending_repair_accepted"
         else:
-            reply = "I applied that repair suggestion, but accurate travel time still found a route conflict."
+            reason = updated_envelope.get("preview_reason") or "The previous repair could not be applied safely."
+            reply = (
+                f"The previous repair could not be applied because {reason} "
+                "Please choose a different repair or allow the system to reschedule flexible activities."
+            )
             reply_status = "warning"
-            reply_reason = "pending_repair_accepted_with_remaining_conflict"
+            reply_reason = result.get("reply_reason") or "pending_repair_apply_failed"
+            jlog("PENDING_REPAIR", f"id={suggestion_id} action=failed reason={reason}", None)
+
         result.update({
             "handled": True,
             "reply": reply,
@@ -1402,6 +2790,12 @@ class TravelValidationMixin:
 
     def _pending_repair_confirmation_action(self, message: str) -> Optional[str]:
         clean = clean_title(message or "")
+        if re.search(r"\b(allow|approve|permit)\b.*\b(fixed|protected|critical)\b.*\b(move|moving|change)\b", clean):
+            return "allow_fixed_move"
+        if re.search(r"\b(convert|make)\b.*\b(flexible|movable)\b", clean):
+            return "allow_fixed_move"
+        if re.search(r"\ballow\b.*\b(move|moving)\b.*\b(fixed|protected|critical)\b", clean):
+            return "allow_fixed_move"
         if re.fullmatch(r"(yes|y|yes apply it|apply it|apply the change|confirm|ok|okay|do it)", clean):
             return "accept"
         if re.fullmatch(r"(no|n|keep it|keep the current schedule|dont change it|don t change it|don't change it|cancel)", clean):
@@ -1715,6 +3109,7 @@ class TravelValidationMixin:
             or block.get("location_label")
             or block.get("location")
         )
+        block["location"] = block["location_label"]
         if resolved_location.get("saved_location_label"):
             block["saved_location_label"] = resolved_location.get("saved_location_label")
 
@@ -1760,6 +3155,7 @@ class TravelValidationMixin:
                 updated["location_status"] = "resolved"
                 updated["location_source"] = block.get("location_source")
                 updated["location_label"] = block.get("location_label") or updated.get("location_label")
+                updated["location"] = updated["location_label"] or updated.get("location")
                 if block.get("saved_location_label"):
                     updated["saved_location_label"] = block.get("saved_location_label")
                 synced.append(updated)
@@ -1872,6 +3268,9 @@ class TravelValidationMixin:
                     if blockers or route_minutes > max(0, right_start - day_start):
                         if blockers:
                             for blocker, blocker_end in blockers:
+                                blocker_movable = self._activity_can_auto_move_for_route_repair(blocker)
+                                destination_movable = self._activity_can_move_for_route_repair(right)
+                                hard_start_route_conflict = not blocker_movable and not destination_movable
                                 jlog(
                                     "START_ROUTE",
                                     f"blocker={blocker.get('title')} ends={format_clock(blocker_end)} leave_by={format_clock(leave_by)}",
@@ -1894,16 +3293,25 @@ class TravelValidationMixin:
                                     "available_gap_minutes": max(0, leave_by - day_start),
                                     "required_route_minutes": route_minutes,
                                     "required_travel_minutes": route_minutes,
-                                    "destination_movable": self._activity_can_move_for_route_repair(right),
+                                    "destination_movable": destination_movable,
                                     "destination_activity_id": right.get("stable_activity_id") or right.get("id"),
                                     "blocker_activity_id": blocker.get("stable_activity_id") or blocker.get("id"),
                                     "blocker_activity_title": blocker.get("title"),
-                                    "blocker_movable": self._activity_can_auto_move_for_route_repair(blocker),
+                                    "blocker_movable": blocker_movable,
                                     "reason": (
-                                        f"{blocker.get('title')} ends after the leave-by time for route-based travel "
-                                        f"to {right.get('title')}."
+                                        f"{blocker.get('title')} and {right.get('title')} are fixed/protected around the required "
+                                        f"leave-by time {format_clock(leave_by)}, so this start route is not physically feasible."
+                                        if hard_start_route_conflict
+                                        else (
+                                            f"{blocker.get('title')} ends after the leave-by time for route-based travel "
+                                            f"to {right.get('title')}."
+                                        )
                                     ),
-                                    "reason_code": "start_route_blocker",
+                                    "reason_code": (
+                                        "fixed_to_fixed_infeasible"
+                                        if hard_start_route_conflict
+                                        else "start_route_blocker"
+                                    ),
                                 })
                         else:
                             available_gap = max(0, right_start - day_start)
@@ -1946,6 +3354,8 @@ class TravelValidationMixin:
                 continue
             self._apply_resolved_location_to_block(left, left_resolved)
             self._apply_resolved_location_to_block(right, right_resolved)
+            if left_coord == right_coord:
+                continue
             left_end = parse_clock(left.get("end") or left.get("endTime") or "")
             right_start = parse_clock(right.get("start") or right.get("startTime") or "")
             if left_end is None or right_start is None:
@@ -1990,6 +3400,8 @@ class TravelValidationMixin:
                 })
 
             route_minutes = int(route_minutes or 0)
+            if route_minutes <= 0:
+                continue
             transition_index = self._transition_index_between(blocks, left_index, right_index)
             transition = blocks[transition_index] if transition_index is not None else None
             if transition:
@@ -2003,6 +3415,8 @@ class TravelValidationMixin:
 
             if route_minutes > available_gap:
                 destination_movable = self._activity_can_move_for_route_repair(right)
+                source_movable = self._activity_can_move_for_route_repair(left)
+                hard_fixed_conflict = not source_movable and not destination_movable
                 route_conflicts.append({
                     "type": "route_conflict",
                     "from": left.get("title"),
@@ -2020,10 +3434,15 @@ class TravelValidationMixin:
                     "destination_movable": destination_movable,
                     "destination_activity_id": right.get("stable_activity_id") or right.get("id"),
                     "reason": (
-                        f"Accurate route from {left.get('title')} to {right.get('title')} needs "
-                        f"{route_minutes} minutes, but only {available_gap} minutes are available."
+                        f"{left.get('title')} and {right.get('title')} are fixed/protected, but accurate travel needs "
+                        f"{route_minutes} minutes and only {available_gap} minutes are available."
+                        if hard_fixed_conflict
+                        else (
+                            f"Accurate route from {left.get('title')} to {right.get('title')} needs "
+                            f"{route_minutes} minutes, but only {available_gap} minutes are available."
+                        )
                     ),
-                    "reason_code": "not_enough_travel_time",
+                    "reason_code": "fixed_to_fixed_infeasible" if hard_fixed_conflict else "not_enough_travel_time",
                 })
                 continue
 
@@ -2059,6 +3478,7 @@ class TravelValidationMixin:
         if support_overlaps:
             route_conflicts.extend(support_overlaps)
 
+        blocks = self._with_fixed_route_conflict_warning_blocks(blocks, route_conflicts)
         status = "route_conflict" if route_conflicts else ("fallback_used" if fallback_used else "validated")
         return {
             "travel_validation_status": status,
@@ -2185,6 +3605,8 @@ class TravelValidationMixin:
     def _support_block_overlaps(self, blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         timed: List[Tuple[int, int, Dict[str, Any], bool]] = []
         for block in blocks or []:
+            if block.get("display_only") or block.get("is_route_conflict"):
+                continue
             start, end = self._block_time_bounds(block)
             if start is None or end is None:
                 continue

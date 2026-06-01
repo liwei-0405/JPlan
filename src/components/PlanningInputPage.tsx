@@ -8,6 +8,7 @@ import {
   getPlanningPreferences,
   getRecentLocations,
   getSavedLocations,
+  runScheduler,
   type GeocodeCandidate,
   type SavedLocation,
 } from "../services/planService";
@@ -29,7 +30,9 @@ import {
   Loader2,
   Mic,
   Edit3,
-  Lightbulb
+  Lightbulb,
+  RefreshCw,
+  AlertTriangle
 } from "lucide-react";
 import type { DailySchedule, ActivityBlock } from "../App";
 import { EventEditModal } from "./EventEditModal";
@@ -97,12 +100,78 @@ type RepairSuggestion = {
   to_end?: string;
   reason?: string;
   impact?: string;
+  impact_type?: string;
+  repair_protection?: string;
   requires_user_confirmation?: boolean;
+  requires_explicit_fixed_move_approval?: boolean;
+  advisory_only?: boolean;
   would_change?: boolean;
 };
 
 function isAccurateTravelEnabled(schedule?: DailySchedule | null): boolean {
   return Boolean(schedule?.accurate_travel_time || schedule?.preferences?.accurate_travel_time);
+}
+
+function hasRouteRepairPreview(schedule?: DailySchedule | null): boolean {
+  return Boolean(schedule?.preview_id && schedule.preview_schedule);
+}
+
+function routePreviewStatus(schedule?: DailySchedule | null): string {
+  return String(schedule?.preview_status || schedule?.preview_schedule?.travel_validation_status || "");
+}
+
+function clearRouteRepairPreview<T extends DailySchedule>(schedule: T): T {
+  const {
+    committed_schedule_blocks,
+    preview_id,
+    preview_base_version,
+    preview_status,
+    preview_reason,
+    preview_schedule,
+    ...rest
+  } = schedule;
+  void committed_schedule_blocks;
+  void preview_id;
+  void preview_base_version;
+  void preview_status;
+  void preview_reason;
+  void preview_schedule;
+  return {
+    ...rest,
+    pending_repair_suggestions: [],
+  } as T;
+}
+
+function displayScheduleForTimeline(schedule: DailySchedule): DailySchedule {
+  if (!hasRouteRepairPreview(schedule)) return schedule;
+  const preview = schedule.preview_schedule || {};
+  return {
+    ...schedule,
+    ...preview,
+    date: schedule.date,
+    activities: (preview.activities as ActivityBlock[] | undefined) || schedule.activities || [],
+    schedule_blocks: (preview.schedule_blocks as ActivityBlock[] | undefined) || schedule.schedule_blocks || [],
+    start_route_summary: preview.start_route_summary || schedule.start_route_summary,
+    route_repair_actions: preview.route_repair_actions || schedule.route_repair_actions || [],
+    pending_repair_suggestions: preview.pending_repair_suggestions || schedule.pending_repair_suggestions || [],
+    unfit_activities: preview.unfit_activities || schedule.unfit_activities || [],
+    optional_skipped: preview.optional_skipped || schedule.optional_skipped || [],
+    blocked_activities: preview.blocked_activities || schedule.blocked_activities || [],
+    unscheduled_activities: preview.unscheduled_activities || schedule.unscheduled_activities || [],
+  };
+}
+
+function previewCanCommitLocally(status: string): boolean {
+  return status === "partial_feasible_with_unfit"
+    || status === "partial_feasible_with_fixed_route_conflicts"
+    || status === "repaired_validated";
+}
+
+function isFixedOrProtectedActivityBlock(block: Partial<ActivityBlock>): boolean {
+  return Boolean(block.is_user_fixed || block.user_fixed_start != null)
+    || ["fixed", "protected", "protected_social", "critical"].includes(String(block.repair_protection || ""))
+    || String(block.timing_mode || "").toLowerCase() === "fixed"
+    || String(block.original_timing_mode || "").toLowerCase() === "fixed";
 }
 
 export function PlanningInputPage({
@@ -194,7 +263,7 @@ export function PlanningInputPage({
   );
 
   const applyReturnedSchedule = (schedule: DailySchedule) => {
-    const scheduleWithPrefs = withPlanningPreferences(schedule);
+    const scheduleWithPrefs = materializeAutoRoutePreview(withPlanningPreferences(schedule));
     const nextAccurateTravelTime = isAccurateTravelEnabled(scheduleWithPrefs);
     setAccurateTravelTime(nextAccurateTravelTime);
     setPreviewSchedule({
@@ -259,6 +328,8 @@ export function PlanningInputPage({
   // Chat state
   const [chatInput, setChatInput] = useState("");
   const [isProcessing, setIsProcessing] = useState(false);
+  const [isRunningScheduler, setIsRunningScheduler] = useState(false);
+  const [saveWithoutRerunNotice, setSaveWithoutRerunNotice] = useState(false);
   const [progressSteps, setProgressSteps] = useState<string[]>([]);
   const [activeProgressIndex, setActiveProgressIndex] = useState(0);
   const [conversationHistory, setConversationHistory] = useState<Array<{ role: "user" | "assistant", message: string, status?: "success" | "partial" | "warning" | "location_pending" | "conflict" | "error" | "clarification_needed" | "not_applied" }>>([
@@ -371,6 +442,74 @@ export function PlanningInputPage({
     return () => window.clearInterval(interval);
   }, [isProcessing, progressSteps]);
 
+  const markDirtySchedule = (
+    schedule: DailySchedule,
+    reason: NonNullable<DailySchedule["reschedule_reason"]>,
+    activityTitle?: string,
+  ): DailySchedule => {
+    console.debug(`[JPLAN][DIRTY] reason=${reason} activity=${activityTitle || "(plan)"}`);
+    const baseDraft = clearRouteRepairPreview(schedule);
+    return {
+      ...baseDraft,
+      travel_validation_status: accurateTravelTime ? "not_requested" : baseDraft.travel_validation_status,
+      route_repair_actions: [],
+      route_conflicts: [],
+      pending_repair_suggestions: [],
+      unfit_activities: [],
+      blocked_activities: [],
+      start_route_summary: null,
+      needs_reschedule: true,
+      reschedule_reason: reason,
+      needs_travel_validation: accurateTravelTime ? true : Boolean(baseDraft.needs_travel_validation),
+    };
+  };
+
+  const locationFingerprint = (event?: Partial<ActivityBlock> | null) => JSON.stringify({
+    location: event?.location || "",
+    location_label: event?.location_label || "",
+    location_source: event?.location_source || "",
+    resolved_location: event?.resolved_location || null,
+  });
+
+  const normalizeManualTimeEdit = (original: ActivityBlock, updated: ActivityBlock): ActivityBlock => {
+    const start = timeToMinutes(updated.startTime);
+    const rawEnd = timeToMinutes(updated.endTime || calculateEndTime(updated.startTime, updated.duration || "1h"));
+    const end = rawEnd < start ? rawEnd + 24 * 60 : rawEnd;
+    const isFixed = isFixedOrProtectedActivityBlock(original);
+
+    if (isFixed) {
+      return {
+        ...updated,
+        scheduled_start: start,
+        scheduled_end: end,
+        fixed_start: start,
+        fixed_end: end,
+        user_fixed_start: start,
+        is_user_fixed: true,
+        timing_mode: "fixed",
+        original_timing_mode: updated.original_timing_mode || original.original_timing_mode || "fixed",
+        can_move_for_repair: false,
+        repair_protection: original.repair_protection || updated.repair_protection || "fixed",
+      };
+    }
+
+    return {
+      ...updated,
+      scheduled_start: start,
+      scheduled_end: end,
+      preferred_start: start,
+      fixed_start: null,
+      fixed_end: null,
+      user_fixed_start: null,
+      is_user_fixed: false,
+      timing_mode: updated.timing_mode && updated.timing_mode !== "fixed" ? updated.timing_mode : "preferred",
+      can_move_for_repair: true,
+      repair_protection: ["fixed", "protected", "protected_social", "critical"].includes(String(updated.repair_protection || ""))
+        ? "flexible"
+        : (updated.repair_protection || "flexible"),
+    };
+  };
+
   const handleAddManualActivity = () => {
     if (!activityName.trim() || !activityTime.trim()) return;
 
@@ -390,7 +529,8 @@ export function PlanningInputPage({
     }
 
     // Collision Detection
-    const currentActivities = previewSchedule?.activities || [];
+    const baseDraft = previewSchedule ? clearRouteRepairPreview(previewSchedule) : null;
+    const currentActivities = baseDraft?.activities || [];
     const hasCollision = currentActivities.some(activity => {
       const actStart = timeToMinutes(activity.startTime);
       let actEnd = timeToMinutes(activity.endTime || calculateEndTime(activity.startTime, activity.duration || ""));
@@ -429,12 +569,14 @@ export function PlanningInputPage({
       (a, b) => timeToMinutes(a.startTime) - timeToMinutes(b.startTime)
     );
 
-    setPreviewSchedule({
-      ...(previewSchedule || {}),
+    setPreviewSchedule(markDirtySchedule({
+      ...(baseDraft || {}),
       date: isoDateStr,
       activities: updatedActivities,
-      schedule_blocks: syncActivityBlocks(previewSchedule?.schedule_blocks, updatedActivities),
-    });
+      schedule_blocks: syncActivityBlocks(baseDraft?.schedule_blocks, updatedActivities),
+      travel_validation_status: baseDraft?.travel_validation_status,
+    } as DailySchedule, "event_added", newActivity.title));
+    setSaveWithoutRerunNotice(false);
 
     // Reset form
     setActivityName(""); setActivityTime(""); setActivityDuration(""); setActivityLocation("");
@@ -449,6 +591,23 @@ export function PlanningInputPage({
 
   const handleSaveEdit = (updatedEvent: ActivityBlock) => {
     if (!previewSchedule) return;
+    const baseDraft = clearRouteRepairPreview(previewSchedule);
+    const originalEvent = editingEvent || baseDraft.activities.find(a => a.id === updatedEvent.id) || updatedEvent;
+    const timeChanged = Boolean(
+      originalEvent.startTime !== updatedEvent.startTime ||
+      originalEvent.endTime !== updatedEvent.endTime
+    );
+    const locationChanged = locationFingerprint(originalEvent) !== locationFingerprint(updatedEvent);
+    const normalizedEvent = timeChanged ? normalizeManualTimeEdit(originalEvent, updatedEvent) : {
+      ...updatedEvent,
+      timing_mode: isFixedOrProtectedActivityBlock(originalEvent) ? (updatedEvent.timing_mode || originalEvent.timing_mode || "fixed") : updatedEvent.timing_mode,
+      is_user_fixed: originalEvent.is_user_fixed,
+      user_fixed_start: originalEvent.user_fixed_start,
+      fixed_start: originalEvent.fixed_start,
+      fixed_end: originalEvent.fixed_end,
+      can_move_for_repair: originalEvent.can_move_for_repair,
+      repair_protection: originalEvent.repair_protection,
+    };
     const newStartTimeMins = timeToMinutes(updatedEvent.startTime);
     const endTimeStr = updatedEvent.endTime || calculateEndTime(updatedEvent.startTime, updatedEvent.duration || "1h");
     let newEndTimeMins = timeToMinutes(endTimeStr);
@@ -459,7 +618,7 @@ export function PlanningInputPage({
     }
 
     // Collision Detection
-    const hasCollision = previewSchedule.activities.some(activity => {
+    const hasCollision = baseDraft.activities.some(activity => {
       if (activity.id === updatedEvent.id) return false; // skip self
 
       const actStart = timeToMinutes(activity.startTime);
@@ -478,35 +637,41 @@ export function PlanningInputPage({
     }
 
     // 3. If there is no conflict, execute the update and sort
-    const existingIndex = previewSchedule.activities.findIndex(a => a.id === updatedEvent.id);
+    const existingIndex = baseDraft.activities.findIndex(a => a.id === updatedEvent.id);
     const updatedActivities = (
       existingIndex >= 0
-        ? previewSchedule.activities.map(a => a.id === updatedEvent.id ? updatedEvent : a)
-        : [...previewSchedule.activities, updatedEvent]
+        ? baseDraft.activities.map(a => a.id === updatedEvent.id ? normalizedEvent : a)
+        : [...baseDraft.activities, normalizedEvent]
     ).sort((a, b) => timeToMinutes(a.startTime) - timeToMinutes(b.startTime));
 
-    setPreviewSchedule({
-      ...previewSchedule,
+    const reason = timeChanged ? "time_changed" : (locationChanged ? "location_changed" : "manual_edit");
+    if (locationChanged) {
+      console.debug(
+        `[JPLAN][MANUAL_LOCATION_EDIT] activity_id=${normalizedEvent.stable_activity_id || normalizedEvent.id} title=${normalizedEvent.title} updated_activities=true updated_schedule_blocks=true`
+      );
+    }
+    setPreviewSchedule(markDirtySchedule({
+      ...baseDraft,
       activities: updatedActivities,
-      schedule_blocks: syncActivityBlocks(previewSchedule.schedule_blocks, updatedActivities),
-    });
+      schedule_blocks: syncActivityBlocks(baseDraft.schedule_blocks, updatedActivities),
+      travel_validation_status: baseDraft.travel_validation_status,
+    }, reason, normalizedEvent.title));
+    setSaveWithoutRerunNotice(false);
     setEditingEvent(null);
     setIsConflict(false);
   };
 
   const handleDeleteEvent = () => {
     if (!editingEvent || !previewSchedule) return;
-    const updatedActivities = previewSchedule.activities.filter(a => a.id !== editingEvent.id);
-    setPreviewSchedule({
-      ...previewSchedule,
+    const baseDraft = clearRouteRepairPreview(previewSchedule);
+    const updatedActivities = baseDraft.activities.filter(a => a.id !== editingEvent.id);
+    setPreviewSchedule(markDirtySchedule({
+      ...baseDraft,
       activities: updatedActivities,
-      schedule_blocks: removeDeletedActivityBlock(previewSchedule.schedule_blocks, editingEvent.id),
-      travel_validation_status: accurateTravelTime ? "not_requested" : previewSchedule.travel_validation_status,
-      route_repair_actions: [],
-      route_conflicts: [],
-      pending_repair_suggestions: [],
-      start_route_summary: null,
-    });
+      schedule_blocks: removeDeletedActivityBlock(baseDraft.schedule_blocks, editingEvent.id),
+      travel_validation_status: previewSchedule.travel_validation_status,
+    }, "event_deleted", editingEvent.title));
+    setSaveWithoutRerunNotice(false);
     setEditingEvent(null);
   };
 
@@ -514,6 +679,13 @@ export function PlanningInputPage({
     if (!chatInput.trim()) return;
 
     const userMessage = chatInput;
+    const isPreviewConfirmation = /^(yes|y|apply|apply changes|accept|no|n|keep|keep current)/i.test(userMessage.trim());
+    const scheduleForChat = previewSchedule && hasRouteRepairPreview(previewSchedule) && !isPreviewConfirmation
+      ? clearRouteRepairPreview(previewSchedule)
+      : previewSchedule;
+    if (scheduleForChat !== previewSchedule) {
+      setPreviewSchedule(scheduleForChat);
+    }
 
     // Add user message to conversation
     const currentHistory = [...conversationHistory, { role: "user" as const, message: userMessage }];
@@ -533,7 +705,7 @@ export function PlanningInputPage({
         body: JSON.stringify({
           message: userMessage,
           history: currentHistory, // send full history for context
-          current_schedule: previewSchedule ? withPlanningPreferences(previewSchedule) : previewSchedule, // send current schedule if any
+          current_schedule: scheduleForChat ? withPlanningPreferences(scheduleForChat) : scheduleForChat, // send current schedule if any
           user_id: user?.id,
           allow_clash: allowClash,
           accurate_travel_time: accurateTravelTime,
@@ -568,33 +740,41 @@ export function PlanningInputPage({
     }
   };
 
+  const hasPendingRoutePreview = hasRouteRepairPreview(previewSchedule);
+  const activeDisplaySchedule = previewSchedule ? displayScheduleForTimeline(previewSchedule) : null;
+  const isDirtySchedule = Boolean(previewSchedule?.needs_reschedule);
   const pendingLocationRequests = (previewSchedule?.location_resolution_requests || []) as LocationResolutionRequest[];
-  const pendingRepairSuggestions = (previewSchedule?.pending_repair_suggestions || []) as RepairSuggestion[];
-  const routeRepairActions = (previewSchedule?.route_repair_actions || []) as Array<Record<string, unknown>>;
-  const routeUnfitActivities = (previewSchedule?.unfit_activities || []) as Array<Record<string, unknown>>;
-  const isLocationPending = previewSchedule?.schedule_status === "location_pending" || previewSchedule?.status === "location_pending";
-  const startRouteSummary = (previewSchedule?.start_route_summary || {}) as Record<string, unknown>;
+  const pendingRepairSuggestions = (activeDisplaySchedule?.pending_repair_suggestions || previewSchedule?.pending_repair_suggestions || []) as RepairSuggestion[];
+  const routeUnfitActivities = (activeDisplaySchedule?.unfit_activities || previewSchedule?.unfit_activities || []) as Array<Record<string, unknown>>;
+  const routeBlockedActivities = (activeDisplaySchedule?.blocked_activities || previewSchedule?.blocked_activities || []) as Array<Record<string, unknown>>;
+  const fixedRouteConflicts = ((activeDisplaySchedule?.route_conflicts || previewSchedule?.route_conflicts || []) as Array<Record<string, unknown>>)
+    .filter(conflict => String(conflict.reason_code || "") === "fixed_to_fixed_infeasible");
+  const isLocationPending = Boolean(
+    previewSchedule?.schedule_status === "location_pending"
+    || previewSchedule?.status === "location_pending"
+    || previewSchedule?.needs_travel_validation
+  );
   const repairSuggestionHasChange = (suggestion: RepairSuggestion) => {
     if (suggestion.would_change === false) return false;
     const sameStart = String(suggestion.from || "") === String(suggestion.to || "");
     const sameEnd = String(suggestion.from_end || "") === String(suggestion.to_end || "");
     return !(sameStart && sameEnd);
   };
-  const actionableRepairSuggestions = pendingRepairSuggestions.filter(repairSuggestionHasChange);
-  const startRouteSummaryText = (() => {
-    const startLocation = String(startRouteSummary.start_location || "").trim();
-    const firstEvent = String(startRouteSummary.first_physical_event || "").trim();
-    const destinationLocation = String(
-      startRouteSummary.first_physical_event_location ||
-      startRouteSummary.destination_location ||
-      startRouteSummary.to_location ||
-      firstEvent
-    ).trim();
-    const leaveBy = String(startRouteSummary.leave_by || "").trim();
-    const duration = Number(startRouteSummary.travel_duration_minutes || 0);
-    if (!startLocation || !destinationLocation || !leaveBy || !duration) return "";
-    return `Leave ${startLocation} by ${leaveBy} · ${duration} min travel to ${destinationLocation}`;
-  })();
+  const isFixedMoveRepairSuggestion = (suggestion: RepairSuggestion) => (
+    Boolean(suggestion.advisory_only || suggestion.requires_explicit_fixed_move_approval)
+    || String(suggestion.impact_type || "") === "fixed_target_move"
+    || ["fixed", "protected_social"].includes(String(suggestion.repair_protection || ""))
+  );
+  const actionableRepairSuggestions = pendingRepairSuggestions.filter(
+    suggestion => repairSuggestionHasChange(suggestion) && !isFixedMoveRepairSuggestion(suggestion)
+  );
+  const compactUnfitReason = (item: Record<string, unknown>) => {
+    const reasonCode = String(item.reason_code || (item.blocking_constraint as Record<string, unknown> | undefined)?.reason_code || "");
+    if (reasonCode === "not_enough_time_after_travel") return "Not enough route-safe time.";
+    if (reasonCode === "day_boundary") return "Outside the available day.";
+    if (reasonCode === "overlap") return "No non-overlapping slot.";
+    return String(item.reason || "Could not fit.");
+  };
 
   const normalizeLocationTarget = (value?: string | null) => (value || "").trim().toLowerCase();
 
@@ -603,14 +783,30 @@ export function PlanningInputPage({
     const requestId = String(request.activity_id || "");
     const itemId = String(item.stable_activity_id || item.id || "");
     if (requestId && itemId && requestId === itemId) return true;
-    if (itemId && (request.related_activity_ids || []).map(String).includes(itemId)) return true;
+    if (requestId) {
+      if (itemId && (request.related_activity_ids || []).map(String).includes(itemId)) return true;
+      return false;
+    }
     return normalizeLocationTarget(item.title) === normalizeLocationTarget(request.title);
   };
 
   const travelValidationMessage = (schedule: DailySchedule) => {
-    const suggestions = ((schedule.pending_repair_suggestions || []) as RepairSuggestion[]).filter(repairSuggestionHasChange);
+    const firstUnfit = (schedule.unfit_activities || [])[0] as Record<string, unknown> | undefined;
+    const firstOptionalSkipped = (schedule.optional_skipped || [])[0] as Record<string, unknown> | undefined;
+    const optionalSkippedText = firstOptionalSkipped?.title
+      ? ` Optional item skipped: ${String(firstOptionalSkipped.title)}.`
+      : "";
+
+    const suggestions = ((schedule.pending_repair_suggestions || []) as RepairSuggestion[])
+      .filter(suggestion => repairSuggestionHasChange(suggestion) && !isFixedMoveRepairSuggestion(suggestion));
     if (suggestions.length > 0) {
       const suggestion = suggestions[0];
+      if (suggestion.advisory_only || suggestion.requires_explicit_fixed_move_approval) {
+        return {
+          message: `Accurate travel time found a fixed-event conflict. ${suggestion.title || "One fixed event"} would need to move from ${suggestion.from || "its current time"} to ${suggestion.to || "a later time"}, but I will not move it without explicit permission.`,
+          status: "warning" as const,
+        };
+      }
       return {
         message: `Accurate travel time found a route conflict. ${suggestion.title || "One activity"} needs to move to ${suggestion.to || "a later time"}. Apply this change?`,
         status: "warning" as const,
@@ -622,21 +818,42 @@ export function PlanningInputPage({
         status: "warning" as const,
       };
     }
+    if (schedule.travel_validation_status === "partial_feasible_with_fixed_route_conflicts") {
+      const fixedConflict = ((schedule.route_conflicts || []) as Array<Record<string, unknown>>)
+        .find(conflict => String(conflict.reason_code || "") === "fixed_to_fixed_infeasible");
+      const fromTitle = String(fixedConflict?.from_activity || fixedConflict?.from || "one fixed event");
+      const toTitle = String(fixedConflict?.to_activity || fixedConflict?.to || "another fixed event");
+      const required = Number(fixedConflict?.required_travel_minutes || fixedConflict?.required_route_minutes || 0);
+      const available = Number(fixedConflict?.available_gap_minutes || fixedConflict?.available_minutes || 0);
+      return {
+        message: `Route warning: ${fromTitle} -> ${toTitle} needs ${required} min, only ${available} min. Fixed times kept.`,
+        status: "warning" as const,
+      };
+    }
     if (schedule.travel_validation_status === "partial_feasible_with_unfit") {
-      const firstUnfit = (schedule.unfit_activities || [])[0] as Record<string, unknown> | undefined;
       return {
         message: firstUnfit?.title
-          ? `Most of the plan is route-safe, but ${String(firstUnfit.title)} could not fit after accurate travel time.`
-          : "Most of the plan is route-safe, but one flexible activity could not fit after accurate travel time.",
+          ? `Accurate travel updated the schedule, but ${String(firstUnfit.title)} could not fit.${optionalSkippedText}`
+          : `Accurate travel updated the schedule, but one flexible activity could not fit.${optionalSkippedText}`,
         status: "warning" as const,
       };
     }
     if (schedule.travel_validation_status === "repaired_validated") {
-      const firstAction = (schedule.route_repair_actions || [])[0] as Record<string, unknown> | undefined;
+      if (firstUnfit?.title) {
+        return {
+          message: `Accurate travel updated the schedule, but ${String(firstUnfit.title)} could not fit.${optionalSkippedText}`,
+          status: "warning" as const,
+        };
+      }
+      const actionCount = (schedule.route_repair_actions || []).length;
+      const movementText = actionCount > 0
+        ? " Some flexible items were moved to route-safe times."
+        : "";
+      const fitText = firstOptionalSkipped?.title
+        ? "Required activities still fit."
+        : "All activities still fit.";
       return {
-        message: firstAction?.title
-          ? `Adjusted for accurate travel: ${String(firstAction.title)} shifted to ${String(firstAction.to || "a route-safe time")}.`
-          : "Adjusted the plan for accurate travel time.",
+        message: `Accurate travel updated the schedule. ${fitText}${movementText}${optionalSkippedText}`,
         status: "success" as const,
       };
     }
@@ -644,6 +861,18 @@ export function PlanningInputPage({
       return {
         message: "Please confirm the exact locations first so I can calculate accurate travel time.",
         status: "location_pending" as const,
+      };
+    }
+    const fixedConflict = ((schedule.route_conflicts || []) as Array<Record<string, unknown>>)
+      .find(conflict => String(conflict.reason_code || "") === "fixed_to_fixed_infeasible");
+    if (fixedConflict) {
+      const fromTitle = String(fixedConflict.from_activity || fixedConflict.from || "one fixed event");
+      const toTitle = String(fixedConflict.to_activity || fixedConflict.to || "another fixed event");
+      const required = Number(fixedConflict.required_travel_minutes || fixedConflict.required_route_minutes || 0);
+      const available = Number(fixedConflict.available_gap_minutes || fixedConflict.available_minutes || 0);
+      return {
+        message: `${fromTitle} to ${toTitle} needs about ${required} min travel, but only ${available} min is available. I kept fixed times unchanged and scheduled flexible items where possible.`,
+        status: "warning" as const,
       };
     }
     if (schedule.schedule_status === "route_conflict" || schedule.status === "route_conflict") {
@@ -742,21 +971,25 @@ export function PlanningInputPage({
     rememberRecentLocation(candidateToPlanningLocation(candidate, request.category));
     setPreviewSchedule(prev => {
       if (!prev) return prev;
+      const baseDraft = clearRouteRepairPreview(prev);
       if (request.request_type === "start_location") {
-        const remaining = ((prev.location_resolution_requests || []) as LocationResolutionRequest[])
+        const remaining = ((baseDraft.location_resolution_requests || []) as LocationResolutionRequest[])
           .filter(item => item.activity_id !== request.activity_id);
         return {
-          ...prev,
+          ...baseDraft,
           preferences: {
-            ...(prev.preferences || {}),
+            ...(baseDraft.preferences || {}),
             day_start_location_override: candidateToPlanningLocation(candidate, "start_location"),
           },
           location_resolution_requests: remaining,
-          schedule_status: remaining.length ? prev.schedule_status : "location_pending",
-          travel_validation_status: remaining.length ? prev.travel_validation_status : "pending_locations",
+          schedule_status: remaining.length ? "location_pending" : (baseDraft.schedule_status === "location_pending" ? "ok" : baseDraft.schedule_status),
+          travel_validation_status: remaining.length ? "pending_locations" : "not_requested",
+          needs_travel_validation: true,
+          needs_reschedule: Boolean(baseDraft.needs_reschedule),
+          reschedule_reason: baseDraft.reschedule_reason,
         };
       }
-      const remaining = ((prev.location_resolution_requests || []) as LocationResolutionRequest[])
+      const remaining = ((baseDraft.location_resolution_requests || []) as LocationResolutionRequest[])
         .filter(item => {
           if (item.activity_id === request.activity_id) return false;
           if ((request.related_activity_ids || []).map(String).includes(String(item.activity_id))) return false;
@@ -768,14 +1001,24 @@ export function PlanningInputPage({
           ) return false;
           return true;
         });
+      const updatedActivities = (baseDraft.activities || []).map(item => attachResolvedLocation(item, request, candidate));
+      const updatedScheduleBlocks = (baseDraft.schedule_blocks || []).map(item => attachResolvedLocation(item, request, candidate));
+      const updatedActivitiesChanged = JSON.stringify(updatedActivities) !== JSON.stringify(baseDraft.activities || []);
+      const updatedScheduleBlocksChanged = JSON.stringify(updatedScheduleBlocks) !== JSON.stringify(baseDraft.schedule_blocks || []);
+      console.debug(
+        `[JPLAN][MANUAL_LOCATION_EDIT] activity_id=${request.activity_id} title=${request.title} updated_activities=${updatedActivitiesChanged} updated_schedule_blocks=${updatedScheduleBlocksChanged}`
+      );
       return {
-        ...prev,
-        activities: (prev.activities || []).map(item => attachResolvedLocation(item, request, candidate)),
-        schedule_blocks: (prev.schedule_blocks || []).map(item => attachResolvedLocation(item, request, candidate)),
+        ...baseDraft,
+        activities: updatedActivities,
+        schedule_blocks: updatedScheduleBlocks,
         location_resolution_requests: remaining,
-        schedule_status: remaining.length ? prev.schedule_status : "location_pending",
-        travel_validation_status: remaining.length ? prev.travel_validation_status : "pending_locations",
-        validation_issues: (prev.validation_issues || []).filter(issue => !String(issue).includes(request.title)),
+        validation_issues: (baseDraft.validation_issues || []).filter(issue => !String(issue).includes(request.title)),
+        schedule_status: remaining.length ? "location_pending" : (baseDraft.schedule_status === "location_pending" ? "ok" : baseDraft.schedule_status),
+        travel_validation_status: remaining.length ? "pending_locations" : "not_requested",
+        needs_travel_validation: true,
+        needs_reschedule: Boolean(baseDraft.needs_reschedule),
+        reschedule_reason: baseDraft.reschedule_reason,
       };
     });
     setLocationCandidates(prev => {
@@ -1022,13 +1265,143 @@ export function PlanningInputPage({
     }
   };
 
+  const isFixedOrProtectedBlock = (block: Partial<ActivityBlock>) => (
+    Boolean(block.is_user_fixed || block.user_fixed_start != null)
+    || ["fixed", "protected_social"].includes(String(block.repair_protection || ""))
+    || (String(block.original_timing_mode || "").toLowerCase() === "fixed")
+  );
+
+  const blockIdentity = (block: Partial<ActivityBlock>) => (
+    String(block.stable_activity_id || block.id || block.title || "").trim().toLowerCase()
+  );
+
+  const preserveFixedCommittedTimes = (candidate: ActivityBlock[], committed: ActivityBlock[]) => {
+    const committedByKey = new Map(
+      (committed || [])
+        .filter(isFixedOrProtectedBlock)
+        .map(block => [blockIdentity(block), block])
+    );
+    return (candidate || []).map(block => {
+      const committedBlock = committedByKey.get(blockIdentity(block));
+      if (!committedBlock) return block;
+      return {
+        ...block,
+        start: committedBlock.start || committedBlock.startTime,
+        startTime: committedBlock.startTime || committedBlock.start,
+        end: committedBlock.end || committedBlock.endTime,
+        endTime: committedBlock.endTime || committedBlock.end,
+        scheduled_start: committedBlock.scheduled_start,
+        scheduled_end: committedBlock.scheduled_end,
+      } as ActivityBlock;
+    });
+  };
+
+  const materializeAutoRoutePreview = (schedule: DailySchedule): DailySchedule => {
+    const status = routePreviewStatus(schedule);
+    if (!previewCanCommitLocally(status) || !schedule.preview_schedule) return schedule;
+
+    const preview = schedule.preview_schedule;
+    const base = clearRouteRepairPreview(schedule);
+    const previewActivities = (preview.activities as ActivityBlock[] | undefined) || base.activities || [];
+    const previewBlocks = (preview.schedule_blocks as ActivityBlock[] | undefined) || base.schedule_blocks || [];
+    const unfitActivities = (preview.unfit_activities || schedule.unfit_activities || []) as Array<Record<string, unknown>>;
+    const optionalSkipped = (preview.optional_skipped || schedule.optional_skipped || []) as Array<Record<string, unknown>>;
+    const blockedActivities = (preview.blocked_activities || schedule.blocked_activities || []) as Array<Record<string, unknown>>;
+    const unscheduledActivities = (preview.unscheduled_activities || schedule.unscheduled_activities || []) as DailySchedule["unscheduled_activities"];
+    const isPartial = status === "partial_feasible_with_unfit" || status === "partial_feasible_with_fixed_route_conflicts";
+
+    return {
+      ...base,
+      activities: preserveFixedCommittedTimes(previewActivities, base.activities || []),
+      schedule_blocks: preserveFixedCommittedTimes(previewBlocks, base.schedule_blocks || []),
+      start_route_summary: preview.start_route_summary || base.start_route_summary,
+      route_repair_actions: (preview.route_repair_actions || base.route_repair_actions || []) as Array<Record<string, unknown>>,
+      pending_repair_suggestions: [],
+      route_conflicts: status === "partial_feasible_with_fixed_route_conflicts"
+        ? (preview.route_conflicts || base.route_conflicts || []) as Array<Record<string, unknown>>
+        : [],
+      travel_validation_status: isPartial ? status : "repaired_validated",
+      schedule_status: isPartial ? "partial" : "ok",
+      status: isPartial ? "partial" : "ok",
+      unfit_activities: isPartial ? unfitActivities : [],
+      optional_skipped: optionalSkipped,
+      blocked_activities: isPartial ? blockedActivities : [],
+      unscheduled_activities: isPartial ? unscheduledActivities : [],
+    };
+  };
+
   const handleCompleteTravelValidation = async () => {
     await runTravelValidation("manual");
+  };
+
+  const handleRunScheduler = async () => {
+    if (!previewSchedule || !user?.id) return;
+    setIsRunningScheduler(true);
+    setIsProcessing(true);
+    setProgressSteps([
+      "Running schedule optimizer...",
+      accurateTravelTime ? "Checking accurate travel routes..." : "Refreshing route-aware draft...",
+      "Preparing updated plan...",
+    ]);
+    setActiveProgressIndex(0);
+    try {
+      const scheduleWithPrefs = withPlanningPreferences(previewSchedule);
+      console.debug(`[JPLAN][RUN_SCHEDULER] source=manual_button accurate_travel_time=${Boolean(accurateTravelTime)}`);
+      const replanned = await runScheduler({
+        ...scheduleWithPrefs,
+        accurate_travel_time: accurateTravelTime,
+        preferences: {
+          ...(scheduleWithPrefs.preferences || {}),
+          accurate_travel_time: accurateTravelTime,
+        },
+      }, user.id);
+      applyReturnedSchedule(replanned);
+      setSaveWithoutRerunNotice(false);
+      const pendingLocations = replanned.travel_validation_status === "pending_locations" || replanned.needs_travel_validation;
+      setConversationHistory(prev => [...prev, {
+        role: "assistant",
+        message: pendingLocations
+          ? "I reran the scheduler, but travel validation still needs locations."
+          : "Scheduler reran the plan. Fixed events stayed locked; flexible items were re-optimized.",
+        status: pendingLocations ? "location_pending" : "success",
+      }]);
+    } catch (error) {
+      setConversationHistory(prev => [...prev, {
+        role: "assistant",
+        message: error instanceof Error ? error.message : "I couldn't run the scheduler.",
+        status: "warning",
+      }]);
+    } finally {
+      setIsRunningScheduler(false);
+      setIsProcessing(false);
+      setProgressSteps([]);
+      setActiveProgressIndex(0);
+    }
+  };
+
+  const handleSaveCurrentPlan = () => {
+    const baseSchedule = materializeAutoRoutePreview(withPlanningPreferences(previewSchedule || { date: isoDateStr, activities: [] }));
+    const finalSchedule = {
+      ...baseSchedule,
+      allow_clash: allowClash,
+      accurate_travel_time: accurateTravelTime,
+      preferences: {
+        ...(baseSchedule.preferences || {}),
+        allow_clash: allowClash,
+        accurate_travel_time: accurateTravelTime,
+      },
+      planning_mode: allowClash ? "clash_allowed" : "feasibility_first",
+    };
+    if (finalSchedule.needs_reschedule) {
+      setSaveWithoutRerunNotice(true);
+    }
+    onScheduleGenerated(finalSchedule);
   };
 
   const handleAccurateTravelToggle = async (checked: boolean) => {
     if (!checked) {
       setAccurateTravelTime(false);
+      setPreviewSchedule(prev => prev ? clearRouteRepairPreview(prev) : prev);
       return;
     }
     setAccurateTravelTime(true);
@@ -1165,8 +1538,9 @@ export function PlanningInputPage({
     setPreviewSchedule((prev) => {
       if (!prev) return prev;
       const selectedSavedLocation = savedStartLocationOptions.find((location) => locationOptionKey(location) === draftStartLocationKey);
+      const baseDraft = clearRouteRepairPreview(prev);
       const nextPreferences: Record<string, unknown> = {
-        ...(prev.preferences || {}),
+        ...(baseDraft.preferences || {}),
         day_start_time: draftDayStart,
         day_end_time: draftDayEnd,
         day_start: draftDayStart,
@@ -1177,15 +1551,17 @@ export function PlanningInputPage({
       } else if (selectedSavedLocation) {
         nextPreferences.day_start_location_override = savedLocationToPlanningLocation(selectedSavedLocation);
       }
-      return {
-        ...prev,
+      return markDirtySchedule({
+        ...baseDraft,
         preferences: nextPreferences,
-      };
+        travel_validation_status: baseDraft.travel_validation_status,
+      }, "preferences_changed", "Plan settings");
     });
+    setSaveWithoutRerunNotice(false);
     setIsEditingPlanSettings(false);
   };
 
-  const timelineActivities = previewSchedule ? withDisplayOnlyStartRouteRow(previewSchedule) : [];
+  const timelineActivities = activeDisplaySchedule ? withDisplayOnlyStartRouteRow(activeDisplaySchedule) : [];
 
   return (
     <div className="min-h-screen bg-gradient-to-b from-background to-secondary/10">
@@ -1303,9 +1679,9 @@ export function PlanningInputPage({
               {previewSchedule && (previewSchedule.schedule_blocks?.length || previewSchedule.activities.length > 0) ? (
                 <TimelineGrid
                   activities={timelineActivities}
-                  interactive={true}
+                  interactive={!hasPendingRoutePreview}
                   onActivityClick={handleEventClick}
-                  showEditIcon={true}
+                  showEditIcon={!hasPendingRoutePreview}
                 />
               ) : (
                 <div className="h-full flex flex-col items-center justify-center text-muted-foreground opacity-30 italic">
@@ -1338,6 +1714,45 @@ export function PlanningInputPage({
                 <Settings2 size={16} /> Manual Mode
               </Button>
             </div>
+
+            {isDirtySchedule && (
+              <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-amber-950 shadow-sm">
+                <div className="flex items-start gap-3">
+                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
+                  <div className="min-w-0 flex-1">
+                    <p className="text-sm font-medium">This plan has manual changes that have not been re-optimized.</p>
+                    <p className="mt-1 text-xs text-amber-800">
+                      Run scheduler reruns full optimization. Complete travel validation only refreshes routes.
+                    </p>
+                    {saveWithoutRerunNotice && (
+                      <p className="mt-1 text-xs font-medium text-amber-900">Saved, but not re-optimized.</p>
+                    )}
+                  </div>
+                </div>
+                <div className="mt-3 grid grid-cols-2 gap-2">
+                  <Button
+                    type="button"
+                    size="sm"
+                    className="rounded-xl gap-2"
+                    onClick={handleRunScheduler}
+                    disabled={isProcessing || isRunningScheduler}
+                  >
+                    {isRunningScheduler ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+                    Run scheduler
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    className="rounded-xl bg-white"
+                    onClick={handleSaveCurrentPlan}
+                    disabled={!previewSchedule || previewSchedule.activities.length === 0 || isProcessing}
+                  >
+                    Save without rerun
+                  </Button>
+                </div>
+              </div>
+            )}
 
             <div className="flex items-center justify-between rounded-2xl border border-border bg-card px-4 py-3 shadow-sm">
               <div>
@@ -1391,7 +1806,7 @@ export function PlanningInputPage({
                         </div>
                       </div>
                     ))}
-                    {actionableRepairSuggestions.length > 0 && (
+                    {!hasPendingRoutePreview && actionableRepairSuggestions.length > 0 && (
                       <div className="rounded-2xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-950">
                         <div className="flex items-start gap-2">
                           <Clock size={16} className="mt-0.5 shrink-0" />
@@ -1399,8 +1814,12 @@ export function PlanningInputPage({
                             <p className="font-medium">Accurate travel repair suggestion</p>
                             {actionableRepairSuggestions.map((suggestion) => (
                               <p key={suggestion.id || suggestion.title} className="mt-1 text-xs text-amber-800">
+                                {suggestion.advisory_only || suggestion.requires_explicit_fixed_move_approval ? "Advisory only: " : ""}
                                 Move {suggestion.title || "activity"} from {suggestion.from || "its current time"} to {suggestion.to || "a safer time"}.
                                 {suggestion.reason ? ` ${suggestion.reason}.` : ""}
+                                {suggestion.advisory_only || suggestion.requires_explicit_fixed_move_approval
+                                  ? " This requires explicit permission because the event is fixed/protected."
+                                  : ""}
                               </p>
                             ))}
                           </div>
@@ -1426,29 +1845,23 @@ export function PlanningInputPage({
                         </div>
                       </div>
                     )}
-                    {previewSchedule && startRouteSummaryText && (
-                      <div className="rounded-2xl border border-sky-200 bg-sky-50 p-3 text-sm text-sky-950">
+                    {previewSchedule && fixedRouteConflicts.length > 0 && (
+                      <div className="rounded-2xl border border-red-200 bg-red-50 p-3 text-sm text-red-950">
                         <div className="flex items-start gap-2">
                           <Clock size={16} className="mt-0.5 shrink-0" />
                           <div className="min-w-0 flex-1">
-                            <p className="font-medium">Start route</p>
-                            <p className="mt-1 text-xs text-sky-800">{startRouteSummaryText}</p>
-                          </div>
-                        </div>
-                      </div>
-                    )}
-                    {previewSchedule && routeRepairActions.length > 0 && (
-                      <div className="rounded-2xl border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-950">
-                        <div className="flex items-start gap-2">
-                          <Clock size={16} className="mt-0.5 shrink-0" />
-                          <div className="min-w-0 flex-1">
-                            <p className="font-medium">Accurate travel adjustments</p>
-                            {routeRepairActions.map((action, index) => (
-                              <p key={`${action.title || "repair"}-${index}`} className="mt-1 text-xs text-emerald-800">
-                                {String(action.title || "Activity")} moved from {String(action.from || "its original time")} to {String(action.to || "a route-safe time")}.
-                                {action.reason ? ` ${String(action.reason)}.` : ""}
-                              </p>
-                            ))}
+                            <p className="font-medium">Fixed route conflict</p>
+                            {fixedRouteConflicts.map((conflict, index) => {
+                              const fromTitle = String(conflict.from_activity || conflict.from || "Previous fixed event");
+                              const toTitle = String(conflict.to_activity || conflict.to || "Next fixed event");
+                              const required = Number(conflict.required_travel_minutes || conflict.required_route_minutes || 0);
+                              const available = Number(conflict.available_gap_minutes || conflict.available_minutes || 0);
+                              return (
+                                <p key={`${fromTitle}-${toTitle}-${index}`} className="mt-1 text-xs text-red-800">
+                                  {fromTitle} {"->"} {toTitle}: needs {required} min, only {available} min. Fixed times kept.
+                                </p>
+                              );
+                            })}
                           </div>
                         </div>
                       </div>
@@ -1458,11 +1871,46 @@ export function PlanningInputPage({
                         <div className="flex items-start gap-2">
                           <Clock size={16} className="mt-0.5 shrink-0" />
                           <div className="min-w-0 flex-1">
-                            <p className="font-medium">Some items could not fit</p>
+                            <p className="font-medium">These activities could not fit</p>
                             {routeUnfitActivities.map((item, index) => (
-                              <p key={`${item.title || "unfit"}-${index}`} className="mt-1 text-xs text-amber-800">
-                                {String(item.title || "One flexible activity")} could not fit after accurate travel time.
-                              </p>
+                              <div key={`${item.title || "unfit"}-${index}`} className="mt-2 text-xs text-amber-800">
+                                <p className="font-medium text-amber-900">
+                                  {String(item.title || "One flexible activity")}
+                                  {item.duration_minutes ? ` · ${String(item.duration_minutes)} min` : ""}
+                                </p>
+                                <p>{compactUnfitReason(item)}</p>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                    {previewSchedule && routeBlockedActivities.length > 0 && (
+                      <div className="rounded-2xl border border-red-200 bg-red-50 p-3 text-sm text-red-950">
+                        <div className="flex items-start gap-2">
+                          <Clock size={16} className="mt-0.5 shrink-0" />
+                          <div className="min-w-0 flex-1">
+                            <p className="font-medium">These activities are blocked by fixed route conflict</p>
+                            {routeBlockedActivities.map((item, index) => (
+                              <div key={`${item.title || "blocked"}-${index}`} className="mt-2 text-xs text-red-800">
+                                <p className="font-medium text-red-900">
+                                  {String(item.title || "One activity")}
+                                  {item.duration_minutes ? ` · ${String(item.duration_minutes)} min` : ""}
+                                </p>
+                                <p>{String(item.reason || "A fixed route conflict must be resolved before this can be placed.")}</p>
+                                {item.blocking_constraint && (
+                                  <p>
+                                    Blocking constraint: {String((item.blocking_constraint as Record<string, unknown>).reason_code || "fixed route conflict")}
+                                  </p>
+                                )}
+                                {Array.isArray(item.suggested_resolution) && item.suggested_resolution.length > 0 && (
+                                  <ul className="mt-1 list-disc pl-4">
+                                    {(item.suggested_resolution as unknown[]).map((suggestion, suggestionIndex) => (
+                                      <li key={suggestionIndex}>{String(suggestion)}</li>
+                                    ))}
+                                  </ul>
+                                )}
+                              </div>
                             ))}
                           </div>
                         </div>
@@ -1535,7 +1983,7 @@ export function PlanningInputPage({
                           disabled={isProcessing || pendingLocationRequests.length > 0}
                           onClick={handleCompleteTravelValidation}
                         >
-                          Complete travel-aware schedule
+                          Complete travel validation
                         </Button>
                         {pendingLocationRequests.length > 0 && (
                           <p className="text-xs text-muted-foreground">
@@ -1551,7 +1999,7 @@ export function PlanningInputPage({
                         disabled={isProcessing}
                         onClick={handleCompleteTravelValidation}
                       >
-                        Complete travel-aware schedule
+                        Complete travel validation
                       </Button>
                     )}
                     {isProcessing && (
@@ -1757,23 +2205,9 @@ export function PlanningInputPage({
 
             {/* Save Button */}
             <Button
-              onClick={() => {
-                const baseSchedule = withPlanningPreferences(previewSchedule || { date: isoDateStr, activities: [] });
-                const finalSchedule = {
-                  ...baseSchedule,
-                  allow_clash: allowClash,
-                  accurate_travel_time: accurateTravelTime,
-                  preferences: {
-                    ...(baseSchedule.preferences || {}),
-                    allow_clash: allowClash,
-                    accurate_travel_time: accurateTravelTime,
-                  },
-                  planning_mode: allowClash ? "clash_allowed" : "feasibility_first",
-                };
-                onScheduleGenerated(finalSchedule);
-              }}
+              onClick={handleSaveCurrentPlan}
               className="w-full rounded-xl py-6 text-lg font-semibold shadow-lg hover:shadow-xl transition-all"
-              disabled={!previewSchedule || previewSchedule.activities.length === 0 || isProcessing || isLocationPending}
+              disabled={!previewSchedule || previewSchedule.activities.length === 0 || isProcessing}
             >
               {isProcessing ? (
                 <>
@@ -1785,10 +2219,15 @@ export function PlanningInputPage({
               ) : (
                 <>
                   <CheckCircle className="mr-2 h-5 w-5" />
-                  {isLocationPending ? "Resolve locations before saving" : "Save & Implement Plan"}
+                  {isDirtySchedule ? "Save without rerun" : "Save & Implement Plan"}
                 </>
               )}
             </Button>
+            {isDirtySchedule && (
+              <p className="text-center text-xs text-muted-foreground">
+                Saving now keeps the badge: Saved, but not re-optimized.
+              </p>
+            )}
           </div>
 
         </div>
@@ -1935,7 +2374,21 @@ function calculateEndTime(startTime: string, durationStr: string): string {
 
 function withDisplayOnlyStartRouteRow(schedule: DailySchedule): ActivityBlock[] {
   const baseBlocks = [...(schedule.schedule_blocks || schedule.activities || [])];
+  const blocksWithRouteWarnings = withDisplayOnlyFixedRouteConflictRows(baseBlocks, schedule);
   const summary = (schedule.start_route_summary || {}) as Record<string, unknown>;
+  const hasUnresolvedStartRouteConflict = (schedule.route_conflicts || []).some((conflict) => {
+    const reasonCode = String(conflict.reason_code || "");
+    const hasStartRouteMarker = Boolean(
+      conflict.leave_by ||
+      conflict.first_physical_event ||
+      conflict.blocker_activity_id ||
+      conflict.blocker_activity_title,
+    );
+    return reasonCode === "start_route_blocker" || (reasonCode === "fixed_to_fixed_infeasible" && hasStartRouteMarker);
+  });
+  if (hasUnresolvedStartRouteConflict) {
+    return blocksWithRouteWarnings;
+  }
   const startLocation = String(summary.start_location || "").trim();
   const firstEvent = String(summary.first_physical_event || "").trim();
   const destinationLocation = String(
@@ -1947,7 +2400,7 @@ function withDisplayOnlyStartRouteRow(schedule: DailySchedule): ActivityBlock[] 
   const leaveBy = String(summary.leave_by || "").trim();
   const duration = Number(summary.travel_duration_minutes || 0);
   if (!startLocation || !destinationLocation || !leaveBy || !duration) {
-    return baseBlocks;
+    return blocksWithRouteWarnings;
   }
 
   const explicitEnd = String(summary.first_physical_event_start || "").trim();
@@ -1968,7 +2421,64 @@ function withDisplayOnlyStartRouteRow(schedule: DailySchedule): ActivityBlock[] 
     display_only: true,
   };
 
-  return [...baseBlocks, startRouteBlock];
+  return [...blocksWithRouteWarnings, startRouteBlock];
+}
+
+function withDisplayOnlyFixedRouteConflictRows(blocks: ActivityBlock[], schedule: DailySchedule): ActivityBlock[] {
+  const existingKeys = new Set(
+    blocks
+      .filter(block => block.is_route_conflict || block.reason_code === "fixed_to_fixed_infeasible" || block.block_type === "route_conflict")
+      .map(block => String(block.id || block.title || "")),
+  );
+  const warningRows = ((schedule.route_conflicts || []) as Array<Record<string, unknown>>)
+    .filter(conflict => String(conflict.reason_code || "") === "fixed_to_fixed_infeasible")
+    .map((conflict, index): ActivityBlock | null => {
+      const fromTitle = String(conflict.from_activity || conflict.from || "Previous fixed event");
+      const toTitle = String(conflict.to_activity || conflict.to || "Next fixed event");
+      const required = Number(conflict.required_travel_minutes || conflict.required_route_minutes || 0);
+      const available = Number(conflict.available_gap_minutes || conflict.available_minutes || 0);
+      if (required <= 0) return null;
+      const id = `fixed_route_conflict_${index}_${fromTitle}_${toTitle}`;
+      if (existingKeys.has(id)) return null;
+      const start = String(conflict.from_end || conflict.to_start || "").trim();
+      if (!start) return null;
+      const toStart = String(conflict.to_start || "").trim();
+      const startMinutes = timeToMinutes(start);
+      const toStartMinutes = toStart ? timeToMinutes(toStart) : NaN;
+      const visualDuration = Math.max(5, Math.min(required, 15));
+      const visualStartMinutes = Number.isFinite(toStartMinutes) && toStartMinutes <= startMinutes
+        ? Math.max(0, startMinutes - visualDuration)
+        : startMinutes;
+      const visualEndMinutes = Number.isFinite(toStartMinutes) && toStartMinutes > startMinutes
+        ? toStartMinutes
+        : startMinutes;
+      const visualStart = minutesTo12Hour(visualStartMinutes);
+      const end = minutesTo12Hour(visualEndMinutes);
+      return {
+        id,
+        stable_activity_id: id,
+        type: "route_conflict",
+        block_type: "route_conflict",
+        title: `Route conflict: ${fromTitle} -> ${toTitle}`,
+        startTime: visualStart,
+        endTime: end,
+        start: visualStart,
+        end,
+        duration_minutes: Math.max(1, visualEndMinutes - visualStartMinutes),
+        route_duration_minutes: required,
+        display_label: `${fromTitle} -> ${toTitle}: needs ${required} min, only ${available} min.`,
+        is_route_conflict: true,
+        display_only: true,
+        reason_code: "fixed_to_fixed_infeasible",
+        from_activity: fromTitle,
+        to_activity: toTitle,
+        from_location: String(conflict.from_location || ""),
+        to_location: String(conflict.to_location || ""),
+      };
+    })
+    .filter((row): row is ActivityBlock => Boolean(row));
+
+  return warningRows.length ? [...blocks, ...warningRows] : blocks;
 }
 
 function syncActivityBlocks(

@@ -1,15 +1,8 @@
-import json
 import os
 import re
-import time
-from copy import deepcopy
-from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
-from uuid import uuid4
-from zoneinfo import ZoneInfo
+from typing import Any, Optional
 
-from jplan_logging import jjson, jlog, jsection
-from travel_service import MissingORSApiKey, TravelService, TravelServiceError, coordinate_from_saved_location
+from jplan_logging import jlog
 
 # Constants for the Rich Scheduling Model
 class TimingMode:
@@ -177,23 +170,31 @@ GENERIC_SYSTEM_ACTIVITY_TYPES = {
 }
 
 NO_LOCATION_REQUIRED_TITLE_KEYWORDS = {
+    "admin",
     "assignment",
     "call",
     "calling",
     "coding",
+    "document",
+    "documents",
     "fyp",
     "implementation",
+    "laptop",
     "online meeting",
+    "paperwork",
     "parents",
     "phone",
     "phone call",
     "plan tomorrow",
     "planning",
+    "proposal",
     "review",
+    "writing",
     "work",
 }
 
 PHYSICAL_PLACE_TITLE_KEYWORDS = {
+    "bank",
     "cafe",
     "campus",
     "class",
@@ -218,11 +219,50 @@ PREFERRED_TIME_WINDOWS = {
     "morning": (8 * 60, 12 * 60),
     "afternoon": (12 * 60, 17 * 60),
     "lunch": (12 * 60, 14 * 60),
+    "coffee_break": (10 * 60, 16 * 60),
+    "business_hours": (9 * 60, 16 * 60),
     "after_lunch": (12 * 60, 17 * 60),
     "evening": (18 * 60, 21 * 60),
     "night": (20 * 60, DEFAULT_DAY_END),
     "not_too_late": (DEFAULT_DAY_START, 20 * 60),
 }
+
+ACCURATE_TRAVEL_REQUEST_PATTERN = re.compile(
+    r"\b(?:accurate|actual|real|route(?:-|\s*)aware)\s+(?:travel|route|commute)\s+time\b|"
+    r"\b(?:travel|route|commute)\s+time\s+(?:to\s+be\s+)?(?:accurate|actual|real)\b|"
+    r"\b(?:make|set)\s+(?:my\s+|the\s+)?(?:travel|route|commute)\s+time\s+(?:accurate|actual|real)\b|"
+    r"\b(?:add|include|consider|use|with|calculate)\s+(?:the\s+)?(?:accurate|actual|real)?\s*(?:travel|route|commute)\s+time\b|"
+    r"\b(?:recalculate|recompute|validate|check|update)\s+(?:the\s+)?(?:travel|route|commute)\s+time\b|"
+    r"\b(?:regenerate|rebuild|refresh)\b.*\b(?:accurate|actual|real)\s+(?:travel|route|commute)\s+time\b",
+    re.IGNORECASE
+)
+
+TRAVEL_INTENT_PATTERN = re.compile(
+    r"\bwith\s+(?:the\s+)?(?:accurate\s+|actual\s+|real\s+)?(?:travel|route|commute)\b|"
+    r"\brealistic\s+with\s+(?:the\s+)?(?:accurate\s+|actual\s+|real\s+)?(?:travel|route|commute)\b|"
+    r"\baccount\s+for\s+(?:the\s+)?(?:accurate\s+|actual\s+|real\s+)?(?:travel|route|commute)\b|"
+    r"\binclude\s+(?:the\s+)?(?:accurate\s+|actual\s+|real\s+)?(?:travel|route|commute)\b|"
+    r"\bconsider\s+(?:the\s+)?(?:accurate\s+|actual\s+|real\s+)?(?:travel|route|commute)\b|"
+    r"\bmake\s+it\s+realistic\s+with\s+(?:the\s+)?(?:accurate\s+|actual\s+|real\s+)?(?:travel|route|commute)\b|"
+    r"\bkeep\s+enough\s+(?:travel|route|commute)(?:\s+and\s+buffer)?\s+time\b|"
+    r"\bleave\s+(?:enough\s+)?(?:travel|route|commute|buffer)(?:\s+and\s+(?:travel|route|commute|buffer))*\s+time\b|"
+    r"\bmake\s+room\s+for\s+(?:travel|route|commute|buffer)\s+time\b",
+    re.IGNORECASE
+)
+
+def detect_travel_intent(text: str) -> bool:
+    if not text:
+        return False
+    return bool(ACCURATE_TRAVEL_REQUEST_PATTERN.search(text) or TRAVEL_INTENT_PATTERN.search(text))
+
+def format_clock_ampm(minutes: int) -> str:
+    normalized = minutes % (24 * 60)
+    hour = normalized // 60
+    minute = normalized % 60
+    suffix = "AM" if hour < 12 else "PM"
+    hour12 = hour % 12 or 12
+    return f"{hour12:02d}:{minute:02d} {suffix}"
+
 
 PARSER_PROMPT = """
 You are Module A, the JSON parser for JPlan. Convert the latest user request into structured scheduling operations.

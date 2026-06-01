@@ -1,16 +1,8 @@
-import json
-import re
-import time
-from copy import deepcopy
-from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
-from zoneinfo import ZoneInfo
 
-from jplan_logging import jjson, jlog, jsection
-from travel_service import MissingORSApiKey, TravelService, TravelServiceError, coordinate_from_saved_location
+from jplan_logging import jlog
 from .types_utils import *
-from .types_utils import _normalize_location
 
 class ModuleBValidationMixin:
     def _find_overlaps(self, item: Dict[str, Any], timeline: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

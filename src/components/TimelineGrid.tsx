@@ -13,6 +13,14 @@ const PIXELS_PER_MINUTE = 1.8;
 const MIN_BLOCK_HEIGHT = 65;   
 const MIN_CELL_WIDTH = 120;   // Minimum width for each event card in a clash grid
 
+type RouteWarningGroup = {
+  activities: ActivityBlock[];
+  conflicts: ActivityBlock[];
+  start: number;
+  activityKeys: Set<string>;
+  conflictKeys: Set<string>;
+};
+
 type TimelineGridProps = {
   activities: ActivityBlock[];
   /** If true, clicking an activity fires onActivityClick */
@@ -41,22 +49,47 @@ export function TimelineGrid({
     () => visibleActivities.filter(isDisplayOnlyStartRouteBlock),
     [visibleActivities],
   );
-  const collisionActivities = useMemo(
-    () => visibleActivities.filter((activity) => !isDisplayOnlyStartRouteBlock(activity)),
+  const routeConflictRows = useMemo(
+    () => visibleActivities.filter(isDisplayOnlyRouteConflictBlock),
     [visibleActivities],
+  );
+  const scheduledActivities = useMemo(
+    () => visibleActivities.filter((activity) => !isDisplayOnlyStartRouteBlock(activity) && !isDisplayOnlyRouteConflictBlock(activity)),
+    [visibleActivities],
+  );
+  const routeWarningMeta = useMemo(
+    () => buildRouteWarningGroups(scheduledActivities, routeConflictRows),
+    [scheduledActivities, routeConflictRows],
+  );
+  const collisionActivities = useMemo(
+    () => scheduledActivities.filter((activity) => !routeWarningMeta.activityKeys.has(activityIdentity(activity))),
+    [scheduledActivities, routeWarningMeta],
+  );
+  const standaloneRouteConflictRows = useMemo(
+    () => routeConflictRows.filter((activity) => (
+      !routeWarningMeta.conflictKeys.has(activityIdentity(activity))
+      && !routeWarningMeta.conflictKeys.has(routeConflictPairKey(activity))
+    )),
+    [routeConflictRows, routeWarningMeta],
   );
   const groups = useMemo(() => buildCollisionGroups(collisionActivities), [collisionActivities]);
   const collidingIds = useMemo(() => getCollidingIds(collisionActivities), [collisionActivities]);
   const timelineRows = useMemo(
     () => [
       ...groups.map((group) => ({ kind: "group" as const, start: group.groupStart, group })),
+      ...routeWarningMeta.groups.map((group) => ({ kind: "route_warning" as const, start: group.start, group })),
       ...startRouteRows.map((activity) => ({
         kind: "start_route" as const,
         start: timeToMinutes(activity.startTime || activity.start || "00:00"),
         activity,
       })),
+      ...standaloneRouteConflictRows.map((activity) => ({
+        kind: "route_conflict" as const,
+        start: timeToMinutes(activity.startTime || activity.start || "00:00"),
+        activity,
+      })),
     ].sort((a, b) => a.start - b.start),
-    [groups, startRouteRows],
+    [groups, routeWarningMeta.groups, startRouteRows, standaloneRouteConflictRows],
   );
 
   if (visibleActivities.length === 0) return null;
@@ -64,8 +97,17 @@ export function TimelineGrid({
   return (
     <div className="space-y-2">
       {timelineRows.map((row, index) => (
-        row.kind === "start_route" ? (
-          <SupportTimelineBlock key={row.activity.id || `start-route-${index}`} activity={row.activity} kind="start_route" />
+        row.kind === "route_warning" ? (
+          <RouteWarningGroupRow
+            key={`route-warning-${index}`}
+            group={row.group}
+            interactive={interactive}
+            onActivityClick={onActivityClick}
+            showEditIcon={showEditIcon}
+            compact={compact}
+          />
+        ) : row.kind === "start_route" || row.kind === "route_conflict" ? (
+          <SupportTimelineBlock key={row.activity.id || `${row.kind}-${index}`} activity={row.activity} kind={row.kind} />
         ) : (
           <CollisionGroupRow
             key={index}
@@ -212,6 +254,55 @@ function CollisionGroupRow({
   );
 }
 
+function RouteWarningGroupRow({
+  group,
+  interactive,
+  onActivityClick,
+  showEditIcon,
+  compact,
+}: {
+  group: RouteWarningGroup;
+  interactive: boolean;
+  onActivityClick?: (activity: ActivityBlock) => void;
+  showEditIcon: boolean;
+  compact: boolean;
+}) {
+  return (
+    <div className="rounded-2xl border border-red-200 bg-red-50/55 p-2 shadow-sm">
+      <div className="mb-2 flex flex-col gap-1 rounded-xl border border-red-200 bg-white/75 px-3 py-2 text-xs font-semibold text-red-800">
+        <span className="flex items-center gap-2">
+          <MapPin className="h-3.5 w-3.5 text-red-500" />
+          Route warning
+        </span>
+        {group.conflicts.map((conflict) => (
+          <span key={activityIdentity(conflict)} className="font-medium">
+            {routeConflictLabel(conflict)}
+          </span>
+        ))}
+      </div>
+      <div
+        className="grid gap-3"
+        style={{
+          gridTemplateColumns: `repeat(${group.activities.length}, minmax(${MIN_CELL_WIDTH}px, 1fr))`,
+        }}
+      >
+        {group.activities.map((activity) => (
+          <ActivityCard
+            key={activityIdentity(activity)}
+            activity={activity}
+            isClashing={false}
+            interactive={interactive}
+            onActivityClick={onActivityClick}
+            showEditIcon={showEditIcon}
+            compact={compact}
+            heightPx={undefined}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function ActivityCard({
   activity,
   isClashing,
@@ -350,13 +441,124 @@ function ActivityCard({
   );
 }
 
-type TimelineBlockKind = "activity" | "travel" | "buffer" | "free_time" | "start_route";
+type TimelineBlockKind = "activity" | "travel" | "buffer" | "free_time" | "start_route" | "route_conflict";
 
 function normalizedBlockText(value: unknown): string {
   return String(value || "").trim().toLowerCase();
 }
 
+function activityIdentity(activity: ActivityBlock): string {
+  return String(activity.stable_activity_id || activity.id || activity.title || "").trim().toLowerCase();
+}
+
+function routeConflictEndpoint(conflict: ActivityBlock, side: "from" | "to"): string {
+  const raw = conflict as ActivityBlock & {
+    from_activity?: string;
+    to_activity?: string;
+    from?: string;
+    to?: string;
+  };
+  const direct = side === "from"
+    ? raw.from_activity || raw.from
+    : raw.to_activity || raw.to;
+  if (direct) return String(direct);
+
+  const text = String(conflict.title || conflict.display_label || "").replace(/^route conflict:\s*/i, "");
+  const [fromPart, toPart] = text.split("->").map((part) => part.trim());
+  if (side === "from") return fromPart || "";
+  return (toPart || "").split(":")[0].trim();
+}
+
+function routeConflictLabel(conflict: ActivityBlock): string {
+  const fromTitle = routeConflictEndpoint(conflict, "from") || "Previous fixed event";
+  const toTitle = routeConflictEndpoint(conflict, "to") || "Next fixed event";
+  const required = Number(conflict.route_duration_minutes || conflict.duration_minutes || 0);
+  const available = Number((conflict as ActivityBlock & { available_gap_minutes?: number }).available_gap_minutes || 0);
+  return `${fromTitle} -> ${toTitle}: needs ${required} min, only ${available} min.`;
+}
+
+function routeConflictPairKey(conflict: ActivityBlock): string {
+  return `${normalizedBlockText(routeConflictEndpoint(conflict, "from"))}->${normalizedBlockText(routeConflictEndpoint(conflict, "to"))}`;
+}
+
+function buildRouteWarningGroups(
+  activities: ActivityBlock[],
+  conflicts: ActivityBlock[],
+): { groups: RouteWarningGroup[]; activityKeys: Set<string>; conflictKeys: Set<string> } {
+  type MutableGroup = {
+    activities: Map<string, ActivityBlock>;
+    conflicts: Map<string, ActivityBlock>;
+  };
+
+  const titleToActivity = new Map<string, ActivityBlock>();
+  for (const activity of activities) {
+    titleToActivity.set(normalizedBlockText(activity.title), activity);
+  }
+
+  const mutableGroups: MutableGroup[] = [];
+  for (const conflict of conflicts) {
+    const fromActivity = titleToActivity.get(normalizedBlockText(routeConflictEndpoint(conflict, "from")));
+    const toActivity = titleToActivity.get(normalizedBlockText(routeConflictEndpoint(conflict, "to")));
+    if (!fromActivity || !toActivity) continue;
+
+    const fromKey = activityIdentity(fromActivity);
+    const toKey = activityIdentity(toActivity);
+    const matchedIndexes = mutableGroups
+      .map((group, index) => group.activities.has(fromKey) || group.activities.has(toKey) ? index : -1)
+      .filter((index) => index >= 0);
+    const conflictKey = routeConflictPairKey(conflict) || activityIdentity(conflict);
+
+    if (matchedIndexes.length === 0) {
+      mutableGroups.push({
+        activities: new Map([[fromKey, fromActivity], [toKey, toActivity]]),
+        conflicts: new Map([[conflictKey, conflict]]),
+      });
+      continue;
+    }
+
+    const target = mutableGroups[matchedIndexes[0]];
+    target.activities.set(fromKey, fromActivity);
+    target.activities.set(toKey, toActivity);
+    if (!target.conflicts.has(conflictKey)) {
+      target.conflicts.set(conflictKey, conflict);
+    }
+
+    for (const index of matchedIndexes.slice(1).sort((a, b) => b - a)) {
+      const other = mutableGroups[index];
+      for (const [key, activity] of other.activities) target.activities.set(key, activity);
+      for (const [key, routeConflict] of other.conflicts) target.conflicts.set(key, routeConflict);
+      mutableGroups.splice(index, 1);
+    }
+  }
+
+  const activityKeys = new Set<string>();
+  const conflictKeys = new Set<string>();
+  const groups = mutableGroups.map((group) => {
+    const groupedActivities = [...group.activities.values()]
+      .sort((a, b) => timeToMinutes(a.startTime || a.start || "00:00") - timeToMinutes(b.startTime || b.start || "00:00"));
+    const groupedConflicts = [...group.conflicts.values()]
+      .sort((a, b) => timeToMinutes(a.startTime || a.start || "00:00") - timeToMinutes(b.startTime || b.start || "00:00"));
+    for (const activity of groupedActivities) activityKeys.add(activityIdentity(activity));
+    for (const conflict of groupedConflicts) {
+      conflictKeys.add(activityIdentity(conflict));
+      conflictKeys.add(routeConflictPairKey(conflict));
+    }
+    return {
+      activities: groupedActivities,
+      conflicts: groupedConflicts,
+      start: Math.min(...groupedActivities.map((activity) => timeToMinutes(activity.startTime || activity.start || "00:00"))),
+      activityKeys: new Set(groupedActivities.map(activityIdentity)),
+      conflictKeys: new Set(groupedConflicts.map(activityIdentity)),
+    };
+  });
+
+  return { groups, activityKeys, conflictKeys };
+}
+
 function getTimelineBlockKind(activity: ActivityBlock): TimelineBlockKind {
+  if (isDisplayOnlyRouteConflictBlock(activity)) {
+    return "route_conflict";
+  }
   if (isDisplayOnlyStartRouteBlock(activity)) {
     return "start_route";
   }
@@ -430,6 +632,9 @@ function getSupportDedupeKey(activity: ActivityBlock, kind: TimelineBlockKind): 
   if (kind === "start_route") {
     return `start_route:${activity.id || activity.title || activity.startTime || activity.start}`;
   }
+  if (kind === "route_conflict") {
+    return `route_conflict:${activity.id || activity.title || activity.startTime || activity.start}`;
+  }
   if (kind === "travel") {
     const destination = normalizedTravelDestination(activity);
     const end = normalizedBlockText(activity.endTime || activity.end);
@@ -446,7 +651,16 @@ function getSupportDedupeKey(activity: ActivityBlock, kind: TimelineBlockKind): 
 }
 
 function isDisplayOnlyStartRouteBlock(activity: ActivityBlock): boolean {
-  return Boolean(activity.is_start_route || activity.display_only || activity.type === "start_route" || activity.block_type === "start_route");
+  return Boolean(activity.is_start_route || activity.type === "start_route" || activity.block_type === "start_route");
+}
+
+function isDisplayOnlyRouteConflictBlock(activity: ActivityBlock): boolean {
+  return Boolean(
+    activity.is_route_conflict ||
+    activity.reason_code === "fixed_to_fixed_infeasible" ||
+    activity.type === "route_conflict" ||
+    activity.block_type === "route_conflict",
+  );
 }
 
 function normalizedTravelDestination(activity: ActivityBlock): string {
@@ -482,16 +696,26 @@ function SupportTimelineBlock({ activity, kind }: { activity: ActivityBlock; kin
   const destination = activity.title.replace(/^travel to\s+/i, "").trim();
   const label = activity.display_label || (kind === "start_route"
     ? activity.title
+    : kind === "route_conflict"
+    ? activity.title
     : kind === "travel"
     ? `${duration} min travel${destination ? ` to ${destination}` : ""}`
     : `${duration} min buffer`);
 
   const colorClass = kind === "start_route"
     ? "border-amber-200 bg-amber-50/70 text-amber-900"
+    : kind === "route_conflict"
+    ? "border-red-200 bg-red-50/80 text-red-900"
     : kind === "travel"
     ? "border-indigo-200 bg-indigo-50/70 text-indigo-800"
     : "border-emerald-200 bg-emerald-50/60 text-emerald-800";
-  const iconClass = kind === "start_route" ? "text-amber-500" : kind === "travel" ? "text-indigo-500" : "text-emerald-500";
+  const iconClass = kind === "start_route"
+    ? "text-amber-500"
+    : kind === "route_conflict"
+    ? "text-red-500"
+    : kind === "travel"
+    ? "text-indigo-500"
+    : "text-emerald-500";
 
   return (
     <div className={`rounded-xl border px-3 py-2 shadow-sm ${colorClass}`}>

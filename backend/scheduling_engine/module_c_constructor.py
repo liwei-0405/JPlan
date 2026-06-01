@@ -108,6 +108,18 @@ class ModuleCConstructorMixin:
                 for blocker in ordered[:first_index]:
                     blocker_end = blocker.get("scheduled_end")
                     if blocker_end is not None and blocker_end > leave_by:
+                        blocker_movable = (
+                            self._activity_can_auto_move_for_route_repair(blocker)
+                            if hasattr(self, "_activity_can_auto_move_for_route_repair")
+                            else False
+                        )
+                        destination_movable = (
+                            self._activity_can_move_for_route_repair(first)
+                            if hasattr(self, "_activity_can_move_for_route_repair")
+                            else False
+                        )
+                        if not blocker_movable and not destination_movable:
+                            continue
                         violations.append({
                             "reason": "start_route_blocker",
                             "from": blocker.get("title"),
@@ -135,6 +147,18 @@ class ModuleCConstructorMixin:
             right_start = right.get("scheduled_start")
             required_start = route_gap_start + prep + route_minutes
             if right_start is not None and right_start < required_start:
+                left_movable = (
+                    self._activity_can_move_for_route_repair(left)
+                    if hasattr(self, "_activity_can_move_for_route_repair")
+                    else False
+                )
+                right_movable = (
+                    self._activity_can_move_for_route_repair(right)
+                    if hasattr(self, "_activity_can_move_for_route_repair")
+                    else False
+                )
+                if not left_movable and not right_movable:
+                    continue
                 violations.append({
                     "reason": "route_transition",
                     "from": left.get("title"),
@@ -331,6 +355,13 @@ class ModuleCConstructorMixin:
                 "preferred_window_end": act.get("preferred_window_end"),
                 "preferred_order": deepcopy(act.get("preferred_order")) if isinstance(act.get("preferred_order"), dict) else None,
                 "preferred_orders": deepcopy(act.get("preferred_orders")) if isinstance(act.get("preferred_orders"), list) else [],
+                "anchor_relation": deepcopy(act.get("anchor_relation")) if isinstance(act.get("anchor_relation"), dict) else None,
+                "relation_type": (act.get("anchor_relation") or {}).get("kind") if isinstance(act.get("anchor_relation"), dict) else None,
+                "anchor_activity_id": (act.get("anchor_relation") or {}).get("target_activity_id") if isinstance(act.get("anchor_relation"), dict) else None,
+                "anchor_title": (act.get("anchor_relation") or {}).get("target_title") if isinstance(act.get("anchor_relation"), dict) else None,
+                "relative_offset_minutes": act.get("relative_offset_minutes") or act.get("offset_minutes") or 0,
+                "placement_source": "system_derived" if act.get("anchor_relation") and not act.get("is_user_fixed") else act.get("placement_source"),
+                "is_derived_time": bool(act.get("anchor_relation") and not act.get("is_user_fixed")),
                 "implicit_activity": bool(act.get("implicit_activity", False)),
                 "implicit_reason": act.get("implicit_reason"),
                 "is_conflict": act.get("is_conflict", False),
@@ -789,7 +820,9 @@ class ModuleCConstructorMixin:
             jlog("MODULE_C", f"'{item['title']}' before '{target_title}' search={format_clock(search_start)}->{format_clock(search_end)}", "PLACE_RELATIVE")
             inserted, reason = self._insert_best_position(
                 item, timeline, search_start, search_end, min_travel,
-                prefer_latest=True
+                prefer_latest=True,
+                validation_day_start=day_start,
+                validation_day_end=day_end,
             )
         else:
             search_start = anchor_item["scheduled_end"]
@@ -805,7 +838,9 @@ class ModuleCConstructorMixin:
             jlog("MODULE_C", f"'{item['title']}' after '{target_title}' search={format_clock(search_start)}->{format_clock(search_end)}", "PLACE_RELATIVE")
             inserted, reason = self._insert_best_position(
                 item, timeline, search_start, search_end, min_travel,
-                prefer_earliest=True
+                prefer_earliest=True,
+                validation_day_start=day_start,
+                validation_day_end=day_end,
             )
 
         if inserted:
@@ -822,14 +857,16 @@ class ModuleCConstructorMixin:
                 )
                 placed_item.setdefault("trace", []).append(f"Placed near anchor '{target_title}' to respect sequence.")
         else:
-            tight_inserted = self._insert_tight_relative_position(
-                item,
-                timeline,
-                search_start,
-                search_end,
-                relation_kind,
-                target_title,
-            )
+            tight_inserted = None
+            if not self._active_route_context():
+                tight_inserted = self._insert_tight_relative_position(
+                    item,
+                    timeline,
+                    search_start,
+                    search_end,
+                    relation_kind,
+                    target_title,
+                )
             if tight_inserted:
                 jlog("MODULE_C", f"'{item['title']}' fits activity window but transition is tight", "ACCEPTED_TIGHT_TRANSITION")
                 timeline = tight_inserted
@@ -841,6 +878,7 @@ class ModuleCConstructorMixin:
                         timeline,
                         anchor_item,
                         successors,
+                        day_start,
                         day_end,
                         min_travel,
                         target_title,
@@ -865,6 +903,7 @@ class ModuleCConstructorMixin:
         timeline: List[Dict[str, Any]],
         anchor_item: Dict[str, Any],
         successors: List[Dict[str, Any]],
+        day_start: int,
         day_end: int,
         min_travel: Optional[int],
         target_title: Optional[str],
@@ -896,6 +935,8 @@ class ModuleCConstructorMixin:
             search_end,
             min_travel,
             prefer_earliest=True,
+            validation_day_start=day_start,
+            validation_day_end=day_end,
         )
         if not inserted:
             return None
@@ -1169,10 +1210,13 @@ class ModuleCConstructorMixin:
         min_travel: Optional[int],
         prefer_earliest: bool = False,
         prefer_latest: bool = False,
+        validation_day_start: Optional[int] = None,
+        validation_day_end: Optional[int] = None,
     ) -> Tuple[Optional[List[Dict[str, Any]]], str]:
         """Finds the optimal time slot for an activity within a range, applying narrative-aware scoring."""
         best_timeline = None
         best_score = -999999
+        best_preferred_window_penalty = 0.0
         failure_reason = "No feasible slot was available."
         
         duration = int(item.get("duration_minutes") or 60)
@@ -1240,8 +1284,8 @@ class ModuleCConstructorMixin:
             candidate_timeline = sorted(timeline + [candidate], key=lambda x: x["scheduled_start"])
             route_violations = self._route_aware_timeline_violations(
                 candidate_timeline,
-                day_start,
-                day_end,
+                validation_day_start if validation_day_start is not None else day_start,
+                validation_day_end if validation_day_end is not None else day_end,
                 min_travel,
             )
             if route_violations:
@@ -1276,6 +1320,7 @@ class ModuleCConstructorMixin:
                 total_score += candidate_start
             if preferred_start is not None:
                 total_score -= abs(candidate_start - preferred_start) * 1.5
+            preferred_window_penalty = 0.0
             if preferred_window_start is not None or preferred_window_end is not None:
                 window_start = preferred_window_start if preferred_window_start is not None else day_start
                 window_end = preferred_window_end if preferred_window_end is not None else day_end
@@ -1283,9 +1328,10 @@ class ModuleCConstructorMixin:
                     total_score += 160
                 else:
                     if candidate_start < window_start:
-                        total_score -= (window_start - candidate_start) * 4.0
+                        preferred_window_penalty += (window_start - candidate_start) * 4.0
                     if candidate_end > window_end:
-                        total_score -= (candidate_end - window_end) * 4.0
+                        preferred_window_penalty += (candidate_end - window_end) * 4.0
+                    total_score -= preferred_window_penalty
             order_delta, order_violations = self._preferred_order_score_adjustment(
                 item,
                 timeline,
@@ -1296,12 +1342,26 @@ class ModuleCConstructorMixin:
             
             if total_score > best_score:
                 best_score = total_score
+                best_preferred_window_penalty = preferred_window_penalty
                 
                 if prefer_earliest and delay_minutes > 0:
                     candidate.setdefault("trace", []).append(f"Placed with {delay_minutes}m delay from earliest possible start.")
                 if preferred_window_start is not None or preferred_window_end is not None:
                     window_label = item.get("preferred_time_window") or "preferred window"
                     candidate.setdefault("trace", []).append(f"Placed with awareness of the {window_label} preference.")
+                    if preferred_window_penalty > 0:
+                        candidate["preferred_window_penalty"] = round(float(preferred_window_penalty), 2)
+                        candidate.setdefault("trace", []).append(
+                            f"Preferred window fallback penalty={round(float(preferred_window_penalty), 2)}."
+                        )
+                        jlog(
+                            "MODULE_C",
+                            (
+                                f"title={item.get('title')} window={window_label} "
+                                f"penalty={round(float(preferred_window_penalty), 2)}"
+                            ),
+                            "PREFERRED_WINDOW_PENALTY",
+                        )
                 if order_violations:
                     candidate["accepted_with_warning"] = True
                     candidate["warning_code"] = "SOFT_PREFERENCE_UNMET"
@@ -1325,8 +1385,24 @@ class ModuleCConstructorMixin:
                 best_timeline = candidate_timeline
 
         if best_timeline:
+            if self._optional_preferred_item_should_skip(item, best_preferred_window_penalty):
+                return None, "preferred_window_unavailable"
             return best_timeline, ""
         return None, failure_reason
+
+    def _optional_preferred_item_should_skip(
+        self,
+        item: Dict[str, Any],
+        preferred_window_penalty: float,
+    ) -> bool:
+        if preferred_window_penalty <= 0:
+            return False
+        if item.get("is_mandatory", item.get("isMandatory", True)):
+            return False
+        title = clean_title(item.get("title") or "")
+        if "coffee" in title:
+            return True
+        return bool(item.get("optional_reason"))
 
     def _nearest_travel_required_before(
         self,

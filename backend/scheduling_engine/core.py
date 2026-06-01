@@ -127,6 +127,7 @@ class SchedulingEngine(
         base_version = int((current_schedule or {}).get("version") or 0)
         source_turn = base_version + 1
         preferences = deepcopy(parsed.get("preferences") or (current_schedule or {}).get("preferences") or {})
+        preferences["travel_intent"] = bool(preferences.get("travel_intent") or detect_travel_intent(latest_request or ""))
         allow_clash = self._resolve_allow_clash(preferences, current_schedule)
         planning_mode = self._planning_mode(allow_clash)
         preferences["allow_clash"] = allow_clash
@@ -239,6 +240,264 @@ class SchedulingEngine(
         latest_request: str,
     ) -> str:
         return self._resolve_schedule_date(parsed, current_schedule, latest_request)
+
+    def run_manual_scheduler(
+        self,
+        envelope: Dict[str, Any],
+        saved_locations: Optional[List[Dict[str, Any]]] = None,
+        base_version: Optional[int] = None,
+        source: str = "manual_button",
+    ) -> Dict[str, Any]:
+        current_version = int((envelope or {}).get("version") or 1)
+        if base_version is not None and int(base_version) != current_version:
+            raise VersionMismatchError(f"Version mismatch: schedule_version {base_version} != currentVersion {current_version}")
+
+        working = deepcopy(envelope or {})
+        if hasattr(self, "_clear_route_preview_metadata"):
+            self._clear_route_preview_metadata(working)
+        for key in (
+            "route_repair_actions",
+            "route_conflicts",
+            "pending_repair_suggestions",
+            "blocked_activities",
+            "start_route_summary",
+            "failed_repair_attempt",
+        ):
+            if key.endswith("_summary") or key.endswith("_attempt"):
+                working[key] = None
+            else:
+                working[key] = []
+
+        preferences = deepcopy(working.get("preferences") or {})
+        if hasattr(self, "_normalize_day_boundary_preferences"):
+            self._normalize_day_boundary_preferences(preferences)
+        allow_clash = self._resolve_allow_clash(preferences, working)
+        planning_mode = self._planning_mode(allow_clash)
+        accurate_travel_time = self._resolve_accurate_travel_time(preferences, working)
+        preferences["allow_clash"] = allow_clash
+        preferences["planning_mode"] = planning_mode
+        preferences["accurate_travel_time"] = accurate_travel_time
+        preferences["refinement_reason"] = "explicit_optimize"
+        preferences["module_0_route"] = "manual_scheduler"
+        preferences["source"] = source
+
+        jlog("RUN_SCHEDULER", f"source={source} accurate_travel_time={str(accurate_travel_time).lower()}", None)
+
+        input_activities = [
+            item for item in (working.get("activities") or [])
+            if self._is_replan_input_user_activity(item)
+        ]
+        input_titles = [str(item.get("title") or "Untitled") for item in input_activities]
+        jlog("REPLAN", f"count={len(input_activities)} titles={input_titles}", "INPUT_ACTIVITIES")
+
+        loaded_canonical = self._load_canonical_activities(working)
+        loaded_titles = [str(item.get("title") or "Untitled") for item in loaded_canonical if item.get("status") == "active"]
+        jlog("REPLAN", f"count={len(loaded_titles)} titles={loaded_titles}", "LOADED_ACTIVITIES")
+        integrity_failure = self._replan_activity_integrity_failure(working, input_activities, loaded_canonical)
+        if integrity_failure:
+            return integrity_failure
+
+        active_set = [
+            self._prepare_activity_for_manual_scheduler(item)
+            for item in loaded_canonical
+            if item.get("status") == "active"
+        ]
+        schedule_date = working.get("date") or self._local_today_iso()
+        planned_result = self._plan_schedule(schedule_date, active_set, preferences)
+        conflicts = self._build_conflicts(planned_result.get("activities", []), set())
+        warnings = self._collect_schedule_warnings(
+            planned_result.get("activities", []),
+            planned_result.get("schedule_blocks", []),
+        )
+        formatted_activities = [self._format_activity(item) for item in planned_result.get("activities", [])]
+        formatted_unscheduled = [self._format_activity(item) for item in planned_result.get("unscheduled_activities", [])]
+        status = "partial" if (conflicts or formatted_unscheduled) else ("warning" if warnings else "ok")
+
+        updated = {
+            **working,
+            "schema_version": 4,
+            "date": schedule_date,
+            "status": status,
+            "schedule_status": status,
+            "planning_mode": planning_mode,
+            "allow_clash": allow_clash,
+            "accurate_travel_time": accurate_travel_time,
+            "preferences": preferences,
+            "activities": formatted_activities,
+            "schedule_blocks": planned_result.get("schedule_blocks", []),
+            "unscheduled_activities": formatted_unscheduled,
+            "version": current_version + 1,
+            "explanations": planned_result.get("explanations", []),
+            "conflicts": conflicts,
+            "warnings": warnings,
+            "conflict": conflicts[0] if conflicts else None,
+            "unmet_items": formatted_unscheduled,
+            "validation_issues": [],
+            "travel_validation_status": "not_requested",
+            "location_resolution_requests": [],
+            "needs_reschedule": False,
+            "reschedule_reason": None,
+            "needs_travel_validation": False,
+            "last_rescheduled_at": self._now_iso(),
+        }
+        for key in REFINEMENT_META_KEYS:
+            updated[key] = planned_result.get(key)
+
+        updated = self._apply_accurate_travel_if_requested(updated, saved_locations or [])
+        travel_status = updated.get("travel_validation_status")
+        if travel_status == "pending_locations" or updated.get("schedule_status") == "location_pending":
+            updated["needs_travel_validation"] = True
+            updated["needs_reschedule"] = False
+        else:
+            updated["needs_travel_validation"] = False
+            updated["needs_reschedule"] = False
+            updated["reschedule_reason"] = None
+            updated["last_rescheduled_at"] = updated.get("last_rescheduled_at") or self._now_iso()
+
+        jlog("RUN_SCHEDULER", f"status={updated.get('travel_validation_status') or updated.get('schedule_status')}", "DONE")
+        return updated
+
+    def _is_replan_input_user_activity(self, item: Any) -> bool:
+        return (
+            self._is_activity_entry(item)
+            and not self._is_generic_system_activity_payload(item)
+            and str((item or {}).get("status") or "active") == "active"
+        )
+
+    def _replan_activity_key(self, item: Dict[str, Any]) -> str:
+        return str(
+            item.get("stable_activity_id")
+            or item.get("activity_id")
+            or item.get("id")
+            or clean_title(item.get("title") or "")
+        )
+
+    def _replan_activity_integrity_failure(
+        self,
+        working: Dict[str, Any],
+        input_activities: List[Dict[str, Any]],
+        loaded_canonical: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        input_by_key = {
+            self._replan_activity_key(item): item
+            for item in input_activities
+            if self._replan_activity_key(item)
+        }
+        loaded_keys = {
+            self._replan_activity_key(item)
+            for item in loaded_canonical
+            if item.get("status") == "active" and self._replan_activity_key(item)
+        }
+        missing_keys = [key for key in input_by_key if key not in loaded_keys]
+        if not missing_keys and len(input_by_key) == len(loaded_keys):
+            return None
+
+        missing_labels = []
+        for key in missing_keys:
+            item = input_by_key[key]
+            label = f"{item.get('title') or 'Untitled'} ({key})"
+            missing_labels.append(label)
+            jlog(
+                "REPLAN",
+                f"title={item.get('title') or 'Untitled'} id={key}",
+                "MISSING_ACTIVITY_BEFORE_MODULE_C",
+            )
+        if not missing_labels and len(input_by_key) != len(loaded_keys):
+            missing_labels.append(
+                f"input_count={len(input_by_key)} loaded_count={len(loaded_keys)}"
+            )
+
+        updated = deepcopy(working)
+        updated["schedule_status"] = "replan_input_invalid"
+        updated["status"] = "replan_input_invalid"
+        updated["travel_validation_status"] = "replan_input_invalid"
+        updated["needs_reschedule"] = True
+        updated["needs_travel_validation"] = bool(updated.get("needs_travel_validation"))
+        updated.setdefault("validation_issues", [])
+        updated["validation_issues"] = list(dict.fromkeys(
+            list(updated.get("validation_issues") or [])
+            + [f"Run scheduler stopped because activities disappeared before Module C: {', '.join(missing_labels)}."]
+        ))
+        updated.setdefault("warnings", [])
+        updated["warnings"] = list(updated.get("warnings") or []) + [{
+            "type": "replan_input_invalid",
+            "severity": "high",
+            "message": updated["validation_issues"][-1],
+        }]
+        jlog("RUN_SCHEDULER", "status=replan_input_invalid", "DONE")
+        return updated
+
+    def _prepare_activity_for_manual_scheduler(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        prepared = deepcopy(item)
+        protection = str(prepared.get("repair_protection") or "").lower()
+        timing_mode = str(prepared.get("timing_mode") or "").lower()
+        original_mode = str(prepared.get("original_timing_mode") or "").lower()
+        is_fixed_anchor = (
+            bool(prepared.get("is_user_fixed"))
+            or prepared.get("user_fixed_start") is not None
+            or protection in {"fixed", "protected", "protected_social", "critical"}
+            or timing_mode == TimingMode.FIXED
+            or original_mode == TimingMode.FIXED and prepared.get("fixed_start") is not None
+        )
+
+        if is_fixed_anchor:
+            fixed_start = prepared.get("fixed_start")
+            fixed_end = prepared.get("fixed_end")
+            if fixed_start is None:
+                fixed_start = prepared.get("scheduled_start")
+            if fixed_end is None:
+                fixed_end = prepared.get("scheduled_end")
+            if fixed_start is not None and fixed_end is None:
+                fixed_end = fixed_start + int(prepared.get("duration_minutes") or 60)
+            prepared.update({
+                "timing_mode": TimingMode.FIXED,
+                "is_user_fixed": True,
+                "user_fixed_start": fixed_start,
+                "fixed_start": fixed_start,
+                "fixed_end": fixed_end,
+                "scheduled_start": fixed_start,
+                "scheduled_end": fixed_end,
+                "locked_fixed": True,
+                "preserve_scheduled_time": True,
+                "can_move_for_repair": False,
+                "repair_protection": prepared.get("repair_protection") or "fixed",
+            })
+            return prepared
+
+        if prepared.get("anchor_relation") or prepared.get("is_derived_time") or protection == "derived":
+            prepared.update({
+                "timing_mode": TimingMode.RELATIVE,
+                "is_user_fixed": False,
+                "user_fixed_start": None,
+                "fixed_start": None,
+                "fixed_end": None,
+                "scheduled_start": None,
+                "scheduled_end": None,
+                "locked_fixed": False,
+                "preserve_scheduled_time": False,
+                "can_move_for_repair": True,
+                "repair_protection": "derived",
+                "placement_source": "system_derived",
+                "is_derived_time": True,
+            })
+            return prepared
+
+        preferred_start = prepared.get("preferred_start")
+        prepared.update({
+            "timing_mode": TimingMode.UNSPECIFIED if timing_mode == TimingMode.FIXED else prepared.get("timing_mode", TimingMode.UNSPECIFIED),
+            "is_user_fixed": False,
+            "user_fixed_start": None,
+            "fixed_start": None,
+            "fixed_end": None,
+            "scheduled_start": None,
+            "scheduled_end": None,
+            "preferred_start": preferred_start,
+            "locked_fixed": False,
+            "preserve_scheduled_time": False,
+            "can_move_for_repair": True,
+            "repair_protection": "flexible" if protection in {"fixed", "protected", "protected_social", "critical"} else (prepared.get("repair_protection") or "flexible"),
+        })
+        return prepared
 
     def plan_from_text(
         self,

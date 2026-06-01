@@ -453,12 +453,12 @@ class Module8ReplyMixin:
                 titles = f"{', '.join(request_titles[:4])}, and {len(request_titles) - 4} more"
             return {
                 "reply": (
-                    "I drafted the schedule, but accurate travel time is not complete yet. "
-                    f"Please confirm the location for {titles or 'the pending activities'}, then complete travel validation."
+                    "I drafted the schedule, but travel-aware validation still needs locations. "
+                    f"Please confirm {titles or 'the pending activities'}, then complete travel validation."
                 ),
                 "reply_status": "location_pending",
                 "recommend_allow_clash": False,
-                "reply_reason": "Accurate travel time needs confirmed coordinates before final validation.",
+                "reply_reason": "Travel-aware validation needs confirmed coordinates before final validation.",
             }
 
         if status == "route_conflict":

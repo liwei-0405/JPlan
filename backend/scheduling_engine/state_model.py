@@ -22,10 +22,28 @@ class StateModelMixin:
     def _is_activity_entry(self, item: Any) -> bool:
         if not isinstance(item, dict):
             return False
-        if item.get("block_type"):
+        block_type = clean_title(str(item.get("block_type") or ""))
+        item_type = clean_title(str(item.get("type") or ""))
+        support_types = {
+            "buffer",
+            "travel",
+            "transition",
+            "idle",
+            "free_time",
+            "start_route",
+            "route_conflict",
+            "prep",
+        }
+        if item.get("display_only") and block_type != BlockType.ACTIVITY and item_type != BlockType.ACTIVITY:
             return False
-        item_type = str(item.get("type") or "").strip().lower()
-        return item_type not in {"buffer", "travel", "transition", "idle"}
+        if block_type and block_type != BlockType.ACTIVITY:
+            return block_type not in support_types
+        if item_type in support_types:
+            return False
+        title = clean_title(str(item.get("title") or ""))
+        if title in {"free_time", "free time", "prep_buffer", "prep buffer"}:
+            return False
+        return True
 
     def _infer_repair_protection(
         self,
@@ -37,7 +55,7 @@ class StateModelMixin:
         is_mandatory: bool,
     ) -> str:
         explicit = clean_title(raw.get("repair_protection") or raw.get("repairProtection") or "")
-        if explicit in {"fixed", "protected_social", "flexible", "optional"}:
+        if explicit in {"fixed", "protected_social", "flexible", "optional", "derived"}:
             return explicit
         if is_user_fixed or timing_mode == TimingMode.FIXED or fixed_start is not None:
             return "fixed"
@@ -242,6 +260,10 @@ class StateModelMixin:
             or raw.get("duration")
         )
         raw_timing_mode = clean_title(raw.get("timing_mode") or raw.get("timingMode") or "")
+        anchor_relation = deepcopy(raw.get("anchor_relation"))
+        is_derived_time = bool(raw.get("is_derived_time") or raw.get("placement_source") == "system_derived")
+        if anchor_relation and is_derived_time and raw_timing_mode == TimingMode.FIXED:
+            raw_timing_mode = TimingMode.RELATIVE
         raw_has_fixed_fields = any(
             raw.get(key) is not None
             for key in ("fixed_start", "fixedStart", "fixed_end", "fixedEnd")
@@ -257,8 +279,14 @@ class StateModelMixin:
             if raw_is_user_fixed is not None
             else bool(raw_has_fixed_fields or user_fixed_start is not None or raw_timing_mode == TimingMode.FIXED)
         )
+        if anchor_relation and is_derived_time and raw_is_user_fixed is None:
+            is_user_fixed = False
         fixed_start = self._coerce_minutes(raw.get("fixed_start"), raw.get("fixedStart"), user_fixed_start)
         fixed_end = self._coerce_minutes(raw.get("fixed_end"), raw.get("fixedEnd"))
+        if anchor_relation and is_derived_time and not is_user_fixed:
+            fixed_start = None
+            fixed_end = None
+            user_fixed_start = None
         if is_user_fixed and fixed_start is None:
             fixed_start = self._coerce_minutes(raw.get("scheduled_start"), raw.get("startTime"))
         if is_user_fixed and fixed_end is None:
@@ -273,8 +301,6 @@ class StateModelMixin:
         earliest_start = self._coerce_minutes(raw.get("earliest_start"), raw.get("earliestStart"))
         latest_end = self._coerce_minutes(raw.get("latest_end"), raw.get("latestEnd"))
         preferred_start = self._coerce_minutes(raw.get("preferred_start"), raw.get("preferredStart"))
-        anchor_relation = deepcopy(raw.get("anchor_relation"))
-
         timing_mode = self._infer_timing_mode(
             raw,
             fixed_start,
@@ -378,6 +404,9 @@ class StateModelMixin:
         )
         if repair_protection == "fixed":
             can_move_for_repair = False
+        if anchor_relation and is_derived_time and not is_user_fixed:
+            repair_protection = "derived"
+            can_move_for_repair = True
 
         preferred_time_window = raw.get("preferred_time_window") or raw.get("preferredTimeWindow")
         title_clean_for_window = clean_title(title)
@@ -385,6 +414,12 @@ class StateModelMixin:
             preferred_time_window = "evening"
             preferred_window_start = preferred_window_start if preferred_window_start is not None else 1080
             preferred_window_end = preferred_window_end if preferred_window_end is not None else 1260
+        if (preferred_time_window and clean_title(preferred_time_window) == "business_hours") or re.search(r"\bbank(?:ing)?\b", title_clean_for_window):
+            preferred_time_window = preferred_time_window or "business_hours"
+            preferred_window_start = preferred_window_start if preferred_window_start is not None else 9 * 60
+            preferred_window_end = preferred_window_end if preferred_window_end is not None else 16 * 60
+            earliest_start = earliest_start if earliest_start is not None else 9 * 60
+            latest_end = latest_end if latest_end is not None else 16 * 60
 
         trace = list(raw.get("trace") or [])
         if raw.get("notes") and raw.get("notes") not in trace:
@@ -419,6 +454,12 @@ class StateModelMixin:
             "preferred_order": deepcopy(raw.get("preferred_order")) if isinstance(raw.get("preferred_order"), dict) else None,
             "preferred_orders": deepcopy(raw.get("preferred_orders")) if isinstance(raw.get("preferred_orders"), list) else [],
             "soft_dependency": bool(raw.get("soft_dependency", False)),
+            "relation_type": raw.get("relation_type") or (anchor_relation or {}).get("kind"),
+            "anchor_activity_id": raw.get("anchor_activity_id") or (anchor_relation or {}).get("target_activity_id"),
+            "anchor_title": raw.get("anchor_title") or (anchor_relation or {}).get("target_title"),
+            "relative_offset_minutes": raw.get("relative_offset_minutes") or raw.get("offset_minutes") or 0,
+            "placement_source": raw.get("placement_source") or ("system_derived" if anchor_relation and not is_user_fixed else None),
+            "is_derived_time": bool(is_derived_time or (anchor_relation and not is_user_fixed)),
             "requested_fixed_start": raw.get("requested_fixed_start"),
             "preferred_adjustment": raw.get("preferred_adjustment"),
             "move_direction": raw.get("move_direction"),
@@ -487,6 +528,8 @@ class StateModelMixin:
         inactive_count = len(canonical) - active_count
         self._debug(f"[STATE] Loaded active activities: {active_count}")
         if inactive_count:
+
+
             self._debug(f"[STATE] Excluded superseded/deleted activities from construction: {inactive_count}")
         if excluded:
             self._debug(f"[STATE] Ignored derived schedule blocks during reload: {excluded}")
@@ -512,4 +555,3 @@ class StateModelMixin:
 
     def _planning_mode(self, allow_clash: bool) -> str:
         return PLANNING_MODE_CLASH if allow_clash else PLANNING_MODE_FEASIBILITY
-

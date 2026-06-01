@@ -132,6 +132,20 @@ export function ScheduleViewPage({
           <p className="text-muted-foreground">{schedule.date}</p>
         </div>
 
+        {schedule.needs_reschedule && (
+          <div className="mb-6 rounded-2xl border border-amber-200 bg-amber-50 p-4 text-amber-950 shadow-sm">
+            <div className="flex items-start gap-3">
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
+              <div>
+                <p className="text-sm font-medium">Saved, but not re-optimized.</p>
+                <p className="mt-1 text-xs text-amber-800">
+                  Open Modify to run the scheduler after your manual changes.
+                </p>
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* Action Buttons */}
         <div className="flex gap-3 mb-6 flex-wrap">
           {!isPastDate && (

@@ -115,7 +115,7 @@ class ScheduleItem(BaseModel):
 
 class UnscheduledActivity(BaseModel):
     title: str
-    reason: str
+    reason: str = "Could not fit in the schedule."
     priority: Optional[str] = "medium"
     isMandatory: Optional[bool] = True
 
@@ -133,6 +133,7 @@ class ScheduleEnvelope(BaseModel):
     preferences: Optional[Dict[str, Any]] = {}
     activities: List[ScheduleItem]
     schedule_blocks: Optional[List[ScheduleItem]] = [] # Explicit timeline
+    committed_schedule_blocks: Optional[List[Dict[str, Any]]] = []
     explanations: List[str] = []
     unscheduled_activities: List[UnscheduledActivity] = []
     conflict: Optional[Dict[str, Any]] = None
@@ -142,6 +143,8 @@ class ScheduleEnvelope(BaseModel):
     route_conflicts: Optional[List[Dict[str, Any]]] = []
     pending_repair_suggestions: Optional[List[Dict[str, Any]]] = []
     unfit_activities: Optional[List[Dict[str, Any]]] = []
+    optional_skipped: Optional[List[Dict[str, Any]]] = []
+    blocked_activities: Optional[List[Dict[str, Any]]] = []
     route_repair_actions: Optional[List[Dict[str, Any]]] = []
     route_efficiency: Optional[Dict[str, Any]] = {}
     route_total_before: Optional[int] = None
@@ -153,6 +156,16 @@ class ScheduleEnvelope(BaseModel):
     revisit_penalty_before: Optional[int] = None
     revisit_penalty_after: Optional[int] = None
     start_route_summary: Optional[Dict[str, Any]] = None
+    preview_id: Optional[str] = None
+    preview_base_version: Optional[int] = None
+    preview_status: Optional[str] = None
+    preview_reason: Optional[str] = None
+    preview_schedule: Optional[Dict[str, Any]] = None
+    failed_repair_attempt: Optional[Dict[str, Any]] = None
+    needs_reschedule: Optional[bool] = False
+    reschedule_reason: Optional[str] = None
+    needs_travel_validation: Optional[bool] = False
+    last_rescheduled_at: Optional[str] = None
     unmet_items: Optional[List[Dict[str, Any]]] = []
     validation_issues: Optional[List[str]] = []
 
@@ -205,6 +218,7 @@ class PlanRequest(BaseModel):
     date: str
     activities: List[ScheduleItem]
     schedule_blocks: Optional[List[ScheduleItem]] = []
+    committed_schedule_blocks: Optional[List[Dict[str, Any]]] = []
     explanations: List[str] = []
     unscheduled_activities: List[UnscheduledActivity] = []
     user_id: str
@@ -224,6 +238,8 @@ class PlanRequest(BaseModel):
     route_conflicts: Optional[List[Dict[str, Any]]] = []
     pending_repair_suggestions: Optional[List[Dict[str, Any]]] = []
     unfit_activities: Optional[List[Dict[str, Any]]] = []
+    optional_skipped: Optional[List[Dict[str, Any]]] = []
+    blocked_activities: Optional[List[Dict[str, Any]]] = []
     route_repair_actions: Optional[List[Dict[str, Any]]] = []
     route_efficiency: Optional[Dict[str, Any]] = {}
     route_total_before: Optional[int] = None
@@ -235,6 +251,16 @@ class PlanRequest(BaseModel):
     revisit_penalty_before: Optional[int] = None
     revisit_penalty_after: Optional[int] = None
     start_route_summary: Optional[Dict[str, Any]] = None
+    preview_id: Optional[str] = None
+    preview_base_version: Optional[int] = None
+    preview_status: Optional[str] = None
+    preview_reason: Optional[str] = None
+    preview_schedule: Optional[Dict[str, Any]] = None
+    failed_repair_attempt: Optional[Dict[str, Any]] = None
+    needs_reschedule: Optional[bool] = False
+    reschedule_reason: Optional[str] = None
+    needs_travel_validation: Optional[bool] = False
+    last_rescheduled_at: Optional[str] = None
     unmet_items: Optional[List[Dict[str, Any]]] = []
     validation_issues: Optional[List[str]] = []
 
@@ -258,6 +284,12 @@ class TravelCompleteRequest(BaseModel):
     schedule: ScheduleEnvelope
     source: Optional[str] = "manual"
 
+class RunSchedulerRequest(BaseModel):
+    user_id: str
+    schedule: ScheduleEnvelope
+    schedule_version: int
+    source: Optional[str] = "manual_button"
+
 class UserPreferencesRequest(BaseModel):
     user_id: str
     day_start_time: Optional[str] = "08:00"
@@ -268,6 +300,16 @@ class UserPreferencesRequest(BaseModel):
 class RecentLocationRequest(BaseModel):
     user_id: str
     location: Dict[str, Any]
+
+
+MANUAL_RESCHEDULE_REASONS = {
+    "manual_edit",
+    "location_changed",
+    "time_changed",
+    "event_added",
+    "event_deleted",
+    "preferences_changed",
+}
 
 
 def debug_log(message: str) -> None:
@@ -283,6 +325,43 @@ def _location_has_coordinates(location: Optional[Dict[str, Any]]) -> bool:
         return -90 <= lat <= 90 and -180 <= lng <= 180
     except (TypeError, ValueError):
         return False
+
+
+def _activity_key_for_accounting(item: Dict[str, Any]) -> str:
+    return str(
+        item.get("stable_activity_id")
+        or item.get("activity_id")
+        or item.get("id")
+        or ""
+    ).strip()
+
+
+def _real_activity_keys_for_accounting(envelope: Dict[str, Any]) -> set[str]:
+    keys: set[str] = set()
+    for item in envelope.get("activities") or []:
+        if not scheduling_engine._is_activity_entry(item):
+            continue
+        if scheduling_engine._is_generic_system_activity_payload(item):
+            continue
+        if str(item.get("status") or "active") != "active":
+            continue
+        key = _activity_key_for_accounting(item)
+        if key:
+            keys.add(key)
+    return keys
+
+
+def _travel_validation_accounted_for_all(original: Dict[str, Any], validated: Dict[str, Any]) -> bool:
+    original_keys = _real_activity_keys_for_accounting(original)
+    if not original_keys:
+        return True
+    accounted: set[str] = set()
+    for collection_name in ("activities", "unfit_activities", "optional_skipped", "unscheduled_activities"):
+        for item in validated.get(collection_name) or []:
+            key = _activity_key_for_accounting(item)
+            if key:
+                accounted.add(key)
+    return original_keys.issubset(accounted)
 
 
 def _merge_user_preferences_into_envelope(
@@ -346,6 +425,7 @@ def log_total_token_usage(parsed: Dict[str, Any], reply_meta: Optional[Dict[str,
 
 def travel_validation_reply_meta(envelope: Dict[str, Any]) -> Dict[str, Any]:
     status = envelope.get("travel_validation_status") or "not_requested"
+    preview_status = envelope.get("preview_status")
     requests = envelope.get("location_resolution_requests") or []
     route_conflicts = envelope.get("route_conflicts") or []
     repair_suggestions = envelope.get("pending_repair_suggestions") or []
@@ -357,13 +437,46 @@ def travel_validation_reply_meta(envelope: Dict[str, Any]) -> Dict[str, Any]:
             "reply_reason": "accurate_travel_location_pending",
         }
 
+    if preview_status == "partial_feasible_with_unfit":
+        unfit = (envelope.get("unfit_activities") or [{}])[0]
+        title = unfit.get("title") or "one activity"
+        return {
+            "reply": f"Suggested route-aware plan is ready, but {title} could not fit. Review the preview before applying it.",
+            "reply_status": "warning",
+            "reply_reason": "route_preview_partial_feasible_with_unfit",
+        }
+
+    if preview_status == "repaired_validated":
+        return {
+            "reply": "Suggested route-aware plan is ready. Apply changes to commit it, or keep the current plan.",
+            "reply_status": "warning",
+            "reply_reason": "route_preview_repaired_validated",
+        }
+
     if repair_suggestions:
         suggestion = repair_suggestions[0]
         title = suggestion.get("title") or "that activity"
         to_time = suggestion.get("to") or "a later time"
         reason = suggestion.get("reason") or "accurate travel time needs more room"
+        if suggestion.get("advisory_only") or suggestion.get("requires_explicit_fixed_move_approval"):
+            return {
+                "reply": (
+                    f"Accurate travel time found a fixed-route conflict. Advisory only: to make this physically feasible, "
+                    f"{title} would need to move from {suggestion.get('from')}–{suggestion.get('from_end')} "
+                    f"to {suggestion.get('to')}–{suggestion.get('to_end')}. "
+                    "I will not move that fixed event unless you explicitly allow moving the fixed event."
+                ),
+                "reply_status": "warning",
+                "reply_reason": "fixed_repair_advisory_only",
+            }
+
+        if suggestion.get("cascade_suggestions"):
+            reply = f"{reason} Apply this change?"
+        else:
+            reply = f"Accurate travel time found a conflict. {title} needs to start around {to_time} because {reason}. Apply this change?"
+
         return {
-            "reply": f"Accurate travel time found a conflict. {title} needs to start around {to_time} because {reason}. Apply this change?",
+            "reply": reply,
             "reply_status": "warning",
             "reply_reason": "pending_repair_confirmation",
         }
@@ -371,6 +484,14 @@ def travel_validation_reply_meta(envelope: Dict[str, Any]) -> Dict[str, Any]:
     if status == "route_conflict" or route_conflicts:
         conflict = route_conflicts[0] if route_conflicts else {}
         reason = conflict.get("reason") or "Accurate travel time creates a timing conflict in the current plan."
+
+        if conflict.get("reason_code") == "fixed_to_fixed_infeasible":
+            return {
+                "reply": f"Accurate travel time found an impossible sequence: {reason} You will need to manually move or remove one of these fixed events.",
+                "reply_status": "conflict",
+                "reply_reason": "fixed_to_fixed_infeasible",
+            }
+
         return {
             "reply": f"I checked accurate travel time, but it creates a travel conflict: {reason}",
             "reply_status": "warning",
@@ -613,16 +734,17 @@ async def chat_with_llm(request: ChatRequest):
             or route.get("travel_intent")
         )
         parsed["preferences"]["travel_intent"] = travel_intent
-        parsed["preferences"]["accurate_travel_time"] = bool(request.accurate_travel_time or travel_intent)
+        parsed["preferences"]["accurate_travel_time"] = bool(request.accurate_travel_time)
         parsed["preferences"]["module_0_route"] = route.get("route")
         parsed["preferences"]["module_0_reason"] = route.get("reason")
         parsed["preferences"]["latest_request"] = request.message
         if current_envelope is not None:
             current_envelope.setdefault("preferences", {})
-            current_envelope["preferences"]["travel_intent"] = bool(
+            has_travel_intent = bool(
                 current_envelope["preferences"].get("travel_intent")
                 or parsed["preferences"].get("travel_intent")
             )
+            current_envelope["preferences"]["travel_intent"] = has_travel_intent
         
         intent = parsed.get("intent", "chat")
         reply = parsed.get("reply", "I've processed your request.")
@@ -799,6 +921,7 @@ async def apply_operations_endpoint(scheduleId: str, request: SchedulePatchReque
             date=updated_envelope["date"],
             activities=updated_envelope["activities"],
             schedule_blocks=updated_envelope.get("schedule_blocks"),
+            committed_schedule_blocks=updated_envelope.get("committed_schedule_blocks"),
             user_id=request.user_id,
             explanations=updated_envelope["explanations"],
             unscheduled_activities=updated_envelope["unscheduled_activities"],
@@ -818,6 +941,8 @@ async def apply_operations_endpoint(scheduleId: str, request: SchedulePatchReque
             route_conflicts=updated_envelope.get("route_conflicts"),
             pending_repair_suggestions=updated_envelope.get("pending_repair_suggestions"),
             unfit_activities=updated_envelope.get("unfit_activities"),
+            optional_skipped=updated_envelope.get("optional_skipped"),
+            blocked_activities=updated_envelope.get("blocked_activities"),
             route_repair_actions=updated_envelope.get("route_repair_actions"),
             route_efficiency=updated_envelope.get("route_efficiency"),
             route_total_before=updated_envelope.get("route_total_before"),
@@ -829,6 +954,16 @@ async def apply_operations_endpoint(scheduleId: str, request: SchedulePatchReque
             revisit_penalty_before=updated_envelope.get("revisit_penalty_before"),
             revisit_penalty_after=updated_envelope.get("revisit_penalty_after"),
             start_route_summary=updated_envelope.get("start_route_summary"),
+            preview_id=updated_envelope.get("preview_id"),
+            preview_base_version=updated_envelope.get("preview_base_version"),
+            preview_status=updated_envelope.get("preview_status"),
+            preview_reason=updated_envelope.get("preview_reason"),
+            preview_schedule=updated_envelope.get("preview_schedule"),
+            failed_repair_attempt=updated_envelope.get("failed_repair_attempt"),
+            needs_reschedule=bool(updated_envelope.get("needs_reschedule", False)),
+            reschedule_reason=updated_envelope.get("reschedule_reason"),
+            needs_travel_validation=bool(updated_envelope.get("needs_travel_validation", False)),
+            last_rescheduled_at=updated_envelope.get("last_rescheduled_at"),
             unmet_items=updated_envelope.get("unmet_items"),
             validation_issues=updated_envelope.get("validation_issues"),
         )
@@ -890,6 +1025,7 @@ async def save_plan_endpoint(plan: PlanRequest):
             date=plan.date,
             activities=[act.model_dump() for act in plan.activities],
             schedule_blocks=[act.model_dump() for act in (plan.schedule_blocks or [])],
+            committed_schedule_blocks=plan.committed_schedule_blocks,
             user_id=plan.user_id,
             explanations=plan.explanations,
             unscheduled_activities=[act.model_dump() for act in plan.unscheduled_activities],
@@ -914,6 +1050,8 @@ async def save_plan_endpoint(plan: PlanRequest):
             route_conflicts=plan.route_conflicts,
             pending_repair_suggestions=plan.pending_repair_suggestions,
             unfit_activities=plan.unfit_activities,
+            optional_skipped=plan.optional_skipped,
+            blocked_activities=plan.blocked_activities,
             route_repair_actions=plan.route_repair_actions,
             route_efficiency=plan.route_efficiency,
             route_total_before=plan.route_total_before,
@@ -925,6 +1063,16 @@ async def save_plan_endpoint(plan: PlanRequest):
             revisit_penalty_before=plan.revisit_penalty_before,
             revisit_penalty_after=plan.revisit_penalty_after,
             start_route_summary=plan.start_route_summary,
+            preview_id=plan.preview_id,
+            preview_base_version=plan.preview_base_version,
+            preview_status=plan.preview_status,
+            preview_reason=plan.preview_reason,
+            preview_schedule=plan.preview_schedule,
+            failed_repair_attempt=plan.failed_repair_attempt,
+            needs_reschedule=bool(plan.needs_reschedule),
+            reschedule_reason=plan.reschedule_reason,
+            needs_travel_validation=bool(plan.needs_travel_validation),
+            last_rescheduled_at=plan.last_rescheduled_at,
             unmet_items=plan.unmet_items,
             validation_issues=plan.validation_issues,
         )
@@ -1174,6 +1322,28 @@ async def complete_travel_validation(request: TravelCompleteRequest):
     )
     saved_locations = database.get_user_locations(request.user_id)
     validated = scheduling_engine._apply_accurate_travel_if_requested(envelope, saved_locations)
+    travel_status = validated.get("travel_validation_status")
+    validation_only_dirty = (
+        not envelope.get("needs_reschedule")
+        or str(envelope.get("reschedule_reason") or "") not in MANUAL_RESCHEDULE_REASONS
+    )
+    if (
+        travel_status in {"validated", "repaired_validated"}
+        and validation_only_dirty
+        and _travel_validation_accounted_for_all(envelope, validated)
+    ):
+        validated["needs_reschedule"] = False
+        validated["reschedule_reason"] = None
+        validated["needs_travel_validation"] = False
+        validated["last_rescheduled_at"] = scheduling_engine._now_iso()
+    elif travel_status == "pending_locations":
+        validated["needs_travel_validation"] = True
+        validated["needs_reschedule"] = bool(envelope.get("needs_reschedule"))
+        validated["reschedule_reason"] = envelope.get("reschedule_reason")
+    else:
+        validated["needs_reschedule"] = bool(envelope.get("needs_reschedule"))
+        validated["reschedule_reason"] = envelope.get("reschedule_reason")
+        validated["needs_travel_validation"] = bool(validated.get("needs_travel_validation", envelope.get("needs_travel_validation")))
     jlog(
         "TRAVEL_SERVICE",
         f"travel_validation_status={validated.get('travel_validation_status')}",
@@ -1185,6 +1355,24 @@ async def complete_travel_validation(request: TravelCompleteRequest):
         "COMPLETE",
     )
     return ScheduleEnvelope(**validated)
+
+@app.post("/api/schedules/replan", response_model=ScheduleEnvelope)
+async def run_scheduler_endpoint(request: RunSchedulerRequest):
+    envelope = _merge_user_preferences_into_envelope(request.schedule.model_dump(), request.user_id) or request.schedule.model_dump()
+    saved_locations = database.get_user_locations(request.user_id)
+    try:
+        updated = scheduling_engine.run_manual_scheduler(
+            envelope=envelope,
+            saved_locations=saved_locations,
+            base_version=request.schedule_version,
+            source=request.source or "manual_button",
+        )
+        return ScheduleEnvelope(**updated)
+    except VersionMismatchError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except Exception as exc:
+        jlog("RUN_SCHEDULER", str(exc), "ERROR")
+        raise HTTPException(status_code=500, detail=str(exc))
 
 @app.delete("/api/locations")
 async def delete_location(user_id: str, label: str):

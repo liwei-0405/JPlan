@@ -123,6 +123,7 @@ export async function savePlan(schedule: DailySchedule, userId: string): Promise
                 version: schedule.version,
                 activities: schedule.activities,
                 schedule_blocks: schedule.schedule_blocks || [],
+                committed_schedule_blocks: schedule.committed_schedule_blocks || [],
                 explanations: schedule.explanations || [],
                 unscheduled_activities: schedule.unscheduled_activities || [],
                 user_id: userId,
@@ -138,6 +139,8 @@ export async function savePlan(schedule: DailySchedule, userId: string): Promise
                 route_conflicts: schedule.route_conflicts || [],
                 pending_repair_suggestions: schedule.pending_repair_suggestions || [],
                 unfit_activities: schedule.unfit_activities || [],
+                optional_skipped: schedule.optional_skipped || [],
+                blocked_activities: schedule.blocked_activities || [],
                 route_repair_actions: schedule.route_repair_actions || [],
                 route_efficiency: schedule.route_efficiency || {},
                 route_total_before: schedule.route_total_before ?? null,
@@ -148,6 +151,17 @@ export async function savePlan(schedule: DailySchedule, userId: string): Promise
                 same_location_split_penalty_after: schedule.same_location_split_penalty_after ?? null,
                 revisit_penalty_before: schedule.revisit_penalty_before ?? null,
                 revisit_penalty_after: schedule.revisit_penalty_after ?? null,
+                start_route_summary: schedule.start_route_summary || null,
+                preview_id: schedule.preview_id || null,
+                preview_base_version: schedule.preview_base_version ?? null,
+                preview_status: schedule.preview_status || null,
+                preview_reason: schedule.preview_reason || null,
+                preview_schedule: schedule.preview_schedule || null,
+                failed_repair_attempt: schedule.failed_repair_attempt || null,
+                needs_reschedule: Boolean(schedule.needs_reschedule),
+                reschedule_reason: schedule.reschedule_reason || null,
+                needs_travel_validation: Boolean(schedule.needs_travel_validation),
+                last_rescheduled_at: schedule.last_rescheduled_at || null,
                 conflicts: schedule.conflicts || [],
                 conflict: schedule.conflict || null,
                 unmet_items: schedule.unmet_items || [],
@@ -324,6 +338,28 @@ export async function completeTravelValidation(
     if (!response.ok) {
         const error = await response.json().catch(() => ({ detail: 'Travel validation failed' }));
         throw new Error(error.detail || 'Travel validation failed');
+    }
+    return await response.json();
+}
+
+export async function runScheduler(
+    schedule: DailySchedule,
+    userId: string,
+    source: 'manual_button' = 'manual_button',
+): Promise<DailySchedule> {
+    const response = await fetch(`${API_BASE_URL}/api/schedules/replan`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            user_id: userId,
+            schedule,
+            schedule_version: schedule.version || 1,
+            source,
+        }),
+    });
+    if (!response.ok) {
+        const error = await response.json().catch(() => ({ detail: 'Run scheduler failed' }));
+        throw new Error(error.detail || 'Run scheduler failed');
     }
     return await response.json();
 }

@@ -161,6 +161,8 @@ class LocationNormalizerMixin:
             "store": "supermarket",
             "fitness": "fitness_center",
             "gym": "fitness_center",
+            "bank": "bank",
+            "banking": "bank",
             "home_or_online": "home_or_online",
             "online": "home_or_online",
             "none": "no_location",
@@ -192,7 +194,7 @@ class LocationNormalizerMixin:
         travel_required = bool(raw_value) if raw_value is not None else True
         if kind in {"no_location_required", "online"} or category in {"home_or_online", "no_location", "none"}:
             return False
-        if category in {"medical", "meal_place", "supermarket", "pharmacy", "fitness_center", "home", "institution", "campus_area", "office", "library"}:
+        if category in {"medical", "meal_place", "supermarket", "pharmacy", "fitness_center", "bank", "home", "institution", "campus_area", "office", "library"}:
             return True
         return travel_required
 
@@ -289,9 +291,36 @@ class LocationNormalizerMixin:
         category = self._normalize_semantic_category(updated.get("location_category"))
         status = self._clean_location_resolution_status(updated.get("location_resolution_status") or updated.get("location_status"))
         explicit_user_location = bool(updated.get("explicit_user_location"))
+        title_text = clean_title(title)
+        no_location_work_default = False
+
+        if re.search(r"\bbank(?:ing)?\b", title_text):
+            category = "bank"
+            if kind in {"", "unknown", "no_location_required"}:
+                kind = "category_only"
+            if status in {"", "not_required"}:
+                status = "needs_coordinates"
+
+        if self._is_no_location_work_task(title, scoped_evidence or source_text or "", raw_location_text):
+            no_location_work_default = True
+            updated["can_be_done_at_current_location"] = True
+            if self._work_task_needs_quiet_place(title, scoped_evidence or source_text or ""):
+                updated["quiet_place_required"] = True
+            kind = "no_location_required"
+            category = "home_or_online"
+            status = "not_required"
+            raw_location_text = None
+            explicit_user_location = False
+
+        if re.search(r"\b(?:anywhere\s+quiet|quiet\s+(?:place|space|spot))\b", clean_title(f"{title} {scoped_evidence or source_text or ''}")):
+            updated["can_be_done_at_current_location"] = True
+            updated["quiet_place_required"] = True
+            kind = "no_location_required"
+            category = "home_or_online"
+            status = "not_required"
 
         generic_explicit = self._generic_explicit_location_from_text(scoped_evidence or source_text or "", title)
-        if generic_explicit and (
+        if generic_explicit and not no_location_work_default and (
             not raw_location_text
             or (
                 clean_title(raw_location_text) in {"home", "store", "gym", "meal_place", "supermarket", "fitness center"}
@@ -335,7 +364,7 @@ class LocationNormalizerMixin:
         if not travel_required:
             kind = kind or "no_location_required"
             status = "not_required"
-            category = "home_or_online" if kind == "online" else "no_location"
+            category = "home_or_online" if kind in {"online", "no_location_required"} else "no_location"
 
         label: Optional[str]
         if not travel_required:
@@ -424,6 +453,8 @@ class LocationNormalizerMixin:
                 location_scopes.get(index),
                 saved_locations,
             )
+            operation = self._validate_clause_location_ownership(operation, location_scopes.get(index))
+
             if operation.get("location_status") and "raw_llm_location" in operation:
                 self._enrich_existing_location_payload(
                     operation,
@@ -441,8 +472,60 @@ class LocationNormalizerMixin:
                 all_operations=operations,
             )
             operation.update(location_payload)
+            operation = self._validate_clause_location_ownership(operation, location_scopes.get(index))
             normalized.append(operation)
         return normalized
+
+    def _validate_clause_location_ownership(
+        self,
+        operation: Dict[str, Any],
+        scoped_evidence: Optional[str],
+    ) -> Dict[str, Any]:
+        resolved = operation.get("resolved_location")
+        has_resolved_coordinates = (
+            clean_title(operation.get("location_status") or "") == "resolved"
+            and isinstance(resolved, dict)
+            and (
+                (resolved.get("latitude") is not None and resolved.get("longitude") is not None)
+                or (resolved.get("lat") is not None and resolved.get("lng") is not None)
+            )
+        )
+        if has_resolved_coordinates:
+            return operation
+        if not operation.get("explicit_user_location") and operation.get("location_source") != "explicit_user":
+            return operation
+
+        raw_location = str(operation.get("raw_location_text") or operation.get("location_normalized") or operation.get("location") or "")
+        if not raw_location:
+            return operation
+
+        clause_text = f"{scoped_evidence or ''} {operation.get('title') or ''} {operation.get('notes') or ''}".lower()
+        loc_clean = clean_title(raw_location)
+        is_home = loc_clean in {"home", "house", "my place", "my house"}
+
+        has_evidence = False
+        if is_home:
+            has_evidence = any(word in clause_text for word in ["home", "house", "my place"])
+        else:
+            # For non-home locations, the LLM might have used synonyms (campus -> school) or resolved shared clauses.
+            # We trust the parser unless it's the notorious "home" bleed.
+            has_evidence = True
+
+        if has_evidence:
+            return operation
+
+        jlog("LOCATION_NORMALIZE", f"Rejecting location bleed '{raw_location}' for '{operation.get('title')}' due to lack of clause evidence", "CLAUSE_VALIDATION")
+        operation["location_kind"] = "category_only"
+        operation["location_category"] = self._infer_location_category(str(operation.get("title") or ""), scoped_evidence or "")
+        operation["location_resolution_status"] = "needs_coordinates"
+        operation["explicit_user_location"] = False
+        operation["location_source"] = "inferred_category"
+        operation["travel_required"] = True
+
+        for field in ["location", "location_label", "location_normalized", "raw_location_text", "location_status", "location_confidence"]:
+            operation.pop(field, None)
+
+        return operation
 
     def _enrich_existing_location_payload(
         self,
@@ -821,11 +904,36 @@ class LocationNormalizerMixin:
             if not self._contains_any_keyword(title_text, {"assignment", "review", "fyp", "implementation", "call", "parents", "plan tomorrow", "planning"}):
                 return False
 
-        if self._contains_any_keyword(title_text, {"assignment", "review", "fyp", "implementation", "coding", "work"}):
+        if self._contains_any_keyword(title_text, {"assignment", "review", "fyp", "implementation", "coding", "work", "proposal", "writing", "admin", "laptop", "document", "documents", "paperwork"}):
             return not re.search(r"\b(?:at|in|near)\s+(?:the\s+)?(?:library|campus|office|school|cafe|restaurant|gym|store|supermarket)\b", scoped_text)
         if self._contains_any_keyword(title_text, {"study"}) and not self._contains_any_keyword(combined, {"library", "campus", "school", "office", "cafe"}):
             return True
         return False
+
+    def _is_no_location_work_task(
+        self,
+        title: str,
+        evidence: str,
+        raw_location: Optional[str],
+    ) -> bool:
+        title_text = clean_title(title or "")
+        evidence_text = clean_title(evidence or "")
+        raw_clean = clean_title(raw_location or "")
+        if raw_clean and raw_clean not in NULL_TEXT_VALUES:
+            return False
+        if not self._contains_any_keyword(
+            title_text,
+            {"proposal", "writing", "admin", "laptop", "document", "documents", "paperwork", "focused work", "deep work"},
+        ):
+            return False
+        return not re.search(
+            r"\b(?:at|in|near)\s+(?:the\s+)?(?:library|campus|office|school|cafe|restaurant|gym|store|supermarket|bank)\b",
+            evidence_text,
+        )
+
+    def _work_task_needs_quiet_place(self, title: str, evidence: str) -> bool:
+        text = clean_title(f"{title or ''} {evidence or ''}")
+        return bool(re.search(r"\b(?:proposal|focused|focus|deep work|writing|quiet)\b", text))
 
     def _infer_area_preference(
         self,
@@ -849,6 +957,8 @@ class LocationNormalizerMixin:
             return "supermarket"
         if self._contains_any_keyword(title_text, {"gym", "workout", "exercise"}):
             return "fitness_center"
+        if self._contains_any_keyword(title_text, {"bank", "banking"}):
+            return "bank"
         if self._contains_any_keyword(title_text, {"lunch", "dinner", "meal", "breakfast", "restaurant", "cafe", "coffee"}):
             return "meal_place"
         if self._contains_any_keyword(title_text, {"meeting", "seminar", "class", "lecture", "office", "library", "campus"}):
@@ -861,6 +971,8 @@ class LocationNormalizerMixin:
             return "supermarket"
         if self._contains_any_keyword(text, {"gym", "workout", "exercise"}):
             return "fitness_center"
+        if self._contains_any_keyword(text, {"bank", "banking"}):
+            return "bank"
         if self._contains_any_keyword(text, {"lunch", "dinner", "meal", "breakfast", "restaurant", "cafe", "coffee"}):
             return "meal_place"
         if self._contains_any_keyword(text, {"meeting", "seminar", "class", "lecture", "office", "library", "campus"}):
@@ -889,14 +1001,31 @@ class LocationNormalizerMixin:
             updated.get(key) is not None and updated.get(key) != ""
             for key in ("fixed_start", "fixedStart", "startTime")
         )
+        if not window and not exact_time_requested:
+            window = self._default_preferred_window_for_title(title)
         if not window and not exact_time_requested and self._title_defaults_to_evening(title):
             start, end = PREFERRED_TIME_WINDOWS["evening"]
             window = ("evening", start, end)
+        if re.search(r"\bif\s+possible\b", full) and re.search(r"\bcoffee\b", title):
+            updated["is_mandatory"] = False
+            updated["isMandatory"] = False
+            updated["priority"] = "low"
+            updated["optional_reason"] = "if_possible"
+        if re.search(r"\b(?:anywhere\s+quiet|quiet\s+(?:place|space|spot))\b", f"{title} {context}"):
+            updated["can_be_done_at_current_location"] = True
+            updated["quiet_place_required"] = True
         if window and not updated.get("preferred_time_window"):
             label, start, end = window
             updated["preferred_time_window"] = label
             updated["preferred_window_start"] = start
             updated["preferred_window_end"] = end
+            if label == "lunch" and updated.get("earliest_start") is None:
+                updated["earliest_start"] = 11 * 60
+            if label == "business_hours":
+                if updated.get("earliest_start") is None:
+                    updated["earliest_start"] = start
+                if updated.get("latest_end") is None:
+                    updated["latest_end"] = end
             jlog_verbose("MODULE_C", f"{updated.get('title')} preferred_window={label}", "SOFT_PREF")
             jlog_verbose("SOFT_PREF", f"{updated.get('title')} preferred_window={label}", None)
         elif updated.get("preferred_time_window") and (
@@ -907,6 +1036,11 @@ class LocationNormalizerMixin:
                 start, end = PREFERRED_TIME_WINDOWS[existing_label]
                 updated["preferred_window_start"] = start
                 updated["preferred_window_end"] = end
+                if existing_label == "business_hours":
+                    if updated.get("earliest_start") is None:
+                        updated["earliest_start"] = start
+                    if updated.get("latest_end") is None:
+                        updated["latest_end"] = end
 
         anchor = updated.get("anchor_relation")
         if anchor and self._anchor_relation_is_soft(context, full):
@@ -925,6 +1059,19 @@ class LocationNormalizerMixin:
     def _title_defaults_to_evening(self, title: str) -> bool:
         normalized = clean_title(title or "")
         return bool(re.search(r"\b(?:dinner|supper)\b", normalized))
+
+    def _default_preferred_window_for_title(self, title: str) -> Optional[Tuple[str, int, int]]:
+        normalized = clean_title(title or "")
+        if re.search(r"\blunch\b", normalized):
+            start, end = PREFERRED_TIME_WINDOWS["lunch"]
+            return "lunch", start, end
+        if re.search(r"\bcoffee\b", normalized):
+            start, end = PREFERRED_TIME_WINDOWS["coffee_break"]
+            return "coffee_break", start, end
+        if re.search(r"\bbank(?:ing)?\b", normalized):
+            start, end = PREFERRED_TIME_WINDOWS["business_hours"]
+            return "business_hours", start, end
+        return None
 
     def _time_scope_clause_for_title(self, source_text: str, title: str) -> str:
         if not source_text or not title:
@@ -1241,6 +1388,7 @@ class LocationNormalizerMixin:
             "campus_area": {"campus", "school", "university", "mmu"},
             "office": {"office", "work"},
             "library": {"library"},
+            "bank": {"bank", "banking"},
             "home": {"home", "house"},
             "home_or_online": {"home", "online", "remote"},
         }
@@ -1268,6 +1416,8 @@ class LocationNormalizerMixin:
             label = raw_location if raw_clean in {"gym", "fitness center"} else "gym"
             return label, "resolved_default", "deterministic_default", 0.75
         if category == "meal_place":
+            return None, "needs_resolution", "unresolved", 0.35
+        if category == "bank":
             return None, "needs_resolution", "unresolved", 0.35
         if category == "institution" and raw_location:
             return raw_location, "fallback_used", "llm_inferred", 0.55

@@ -308,6 +308,21 @@ class ModuleDRefinementMixin:
             or (parsed or {}).get("module_0_route")
             or next((op.get("_router_route") for op in ops if op.get("_router_route")), None)
         )
+        if (
+            preferences.get("refinement_reason") == "explicit_route_repair"
+            or router_route in {"repair_confirmation", "explicit_route_repair"}
+        ):
+            preferences["refinement_reason"] = "explicit_route_repair"
+            preferences["module_0_route"] = "repair_confirmation"
+            jlog(
+                "MODULE_D",
+                (
+                    f"route=repair_confirmation add_ops={len(add_ops)} active_before={active_before} "
+                    f"is_apply_operations={str(is_apply_operations).lower()} reason=explicit_route_repair"
+                ),
+                "POLICY",
+            )
+            return preferences
         router_reason = (
             preferences.get("module_0_reason")
             or (parsed or {}).get("module_0_reason")
@@ -526,7 +541,7 @@ class ModuleDRefinementMixin:
         if self._module_d_disabled_by_preference(preferences):
             preferences["refinement_reason"] = "disabled_by_preference"
             return False, None, "disabled_by_preference"
-        if reason in {"initial_generation", "explicit_optimize"}:
+        if reason in {"initial_generation", "explicit_optimize", "explicit_route_repair"}:
             return True, reason, None
         preferences["refinement_reason"] = "skipped_simple_edit"
         return False, None, "skipped_simple_edit"
@@ -681,6 +696,10 @@ class ModuleDRefinementMixin:
                         end = start + duration
                         if start < day_start or end > day_end:
                             continue
+                        if target.get("earliest_start") is not None and start < int(target.get("earliest_start") or 0):
+                            continue
+                        if target.get("latest_end") is not None and end > int(target.get("latest_end") or 0):
+                            continue
                         candidate_item = deepcopy(target)
                         candidate_item["scheduled_start"] = start
                         candidate_item["scheduled_end"] = end
@@ -762,6 +781,8 @@ class ModuleDRefinementMixin:
             "route_transition",
             "start_route_blocker",
             "start_route_before_day_start",
+            "fixed_to_fixed_infeasible",
+            "time_window",
         }
         if reasons and reasons.issubset(infeasible_reasons):
             return "all_candidates_infeasible"
@@ -806,6 +827,10 @@ class ModuleDRefinementMixin:
                 return False, "missing_schedule_time"
             if start < day_start or end > day_end or end <= start:
                 return False, "day_boundary"
+            if item.get("earliest_start") is not None and start < int(item.get("earliest_start") or 0):
+                return False, "time_window"
+            if item.get("latest_end") is not None and end > int(item.get("latest_end") or 0):
+                return False, "time_window"
             if index == 0:
                 continue
             previous = ordered[index - 1]
