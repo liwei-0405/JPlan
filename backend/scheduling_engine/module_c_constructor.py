@@ -172,6 +172,8 @@ class ModuleCConstructorMixin:
     def _activity_requires_travel(self, activity: Optional[Dict[str, Any]]) -> bool:
         if not activity:
             return False
+        if self._location_flexible_selected_endpoint_requires_route(activity):
+            return True
         status = clean_title(activity.get("location_status") or "")
         category = clean_title(activity.get("location_category") or "")
         raw_travel_required = activity.get("travel_required")
@@ -184,6 +186,40 @@ class ModuleCConstructorMixin:
         if category in {"home_or_online", "none"}:
             return False
         return True
+
+    def _location_flexible_selected_endpoint_requires_route(self, activity: Dict[str, Any]) -> bool:
+        if not bool(activity.get("location_flexible") and activity.get("travel_context_required")):
+            return False
+        if not isinstance(activity.get("resolved_location"), dict):
+            return False
+        if not self._coordinate_from_activity_payload(activity.get("resolved_location") or {}):
+            return False
+        label_text = clean_title(
+            " ".join(
+                str(value or "")
+                for value in (
+                    activity.get("location_label"),
+                    activity.get("location"),
+                    (activity.get("resolved_location") or {}).get("label"),
+                    (activity.get("resolved_location") or {}).get("display_name"),
+                    (activity.get("resolved_location") or {}).get("category"),
+                    activity.get("location_category"),
+                )
+            )
+        )
+        if re.search(r"\b(home|current location|current place|starting point|start location|default start)\b", label_text):
+            return False
+        return True
+
+    def _coordinate_from_activity_payload(self, payload: Dict[str, Any]) -> Optional[Tuple[float, float]]:
+        try:
+            lat = float(payload.get("latitude") if payload.get("latitude") is not None else payload.get("lat"))
+            lng = float(payload.get("longitude") if payload.get("longitude") is not None else payload.get("lng"))
+        except (TypeError, ValueError):
+            return None
+        if -90 <= lat <= 90 and -180 <= lng <= 180:
+            return (lat, lng)
+        return None
 
     def _materialize_blocks(
         self, 
@@ -202,9 +238,11 @@ class ModuleCConstructorMixin:
         for act in ordered:
             start_min = act.get("scheduled_start") or 0
             end_min = act.get("scheduled_end") or (start_min + act.get("duration_minutes", 60))
+            display_loc = act.get("location_label") or act.get("location")
             travel_required = self._activity_requires_travel(act)
-            current_loc = act.get("location") if travel_required else None
-            if not current_loc: current_loc = None # Normalize
+            current_loc = (act.get("location") or act.get("location_label")) if travel_required else None
+            if not current_loc:
+                current_loc = None # Normalize
 
             # A. Gap Handling (between last_end and start_min)
             if start_min > last_end:
@@ -327,13 +365,21 @@ class ModuleCConstructorMixin:
                 "startTime": format_clock(start_min),
                 "endTime": format_clock(end_min),
                 "duration_minutes": end_min - start_min,
-                "location": current_loc,
-                "location_label": act.get("location_label") or current_loc,
+                "location": display_loc,
+                "location_label": act.get("location_label") or display_loc,
                 "location_category": act.get("location_category"),
                 "location_status": act.get("location_status"),
                 "location_source": act.get("location_source"),
                 "location_confidence": act.get("location_confidence"),
                 "location_warning": act.get("location_warning"),
+                "location_flexible": bool(act.get("location_flexible", False)),
+                "can_be_done_at_current_location": bool(act.get("can_be_done_at_current_location", False)),
+                "quiet_place_required": bool(act.get("quiet_place_required", False)),
+                "activity_role": act.get("activity_role"),
+                "travel_context_required": bool(act.get("travel_context_required", False)),
+                "semantic_constraint_type": act.get("semantic_constraint_type"),
+                "service_kind": act.get("service_kind"),
+                "arrive_by": act.get("arrive_by"),
                 "area_preference": act.get("area_preference"),
                 "travel_required": travel_required,
                 "timing_mode": act.get("timing_mode"),
@@ -502,6 +548,7 @@ class ModuleCConstructorMixin:
         min_travel = preferences.get("min_travel_buffer_minutes") or 0
         route_context = preferences.get("_route_context") if preferences.get("route_aware_repair") else None
         self._current_route_context = route_context if isinstance(route_context, dict) else None
+        self._current_low_fatigue_preference = bool(preferences.get("low_fatigue_preference"))
         if self._active_route_context():
             jlog("MODULE_C", "enabled=true", "ROUTE_AWARE")
             for pair in (self._active_route_context().get("pairs") or {}).values():
@@ -516,6 +563,7 @@ class ModuleCConstructorMixin:
 
         # Pass 1: Categorize
         fixed: List[Dict[str, Any]] = []
+        deadline: List[Dict[str, Any]] = []
         preserved: List[Dict[str, Any]] = []
         relative: List[Dict[str, Any]] = []
         flexible: List[Dict[str, Any]] = []
@@ -525,6 +573,39 @@ class ModuleCConstructorMixin:
         for item in deepcopy(activities):
             # Support both snake_case and camelCase
             mode = item.get("timing_mode") or item.get("timingMode") or TimingMode.UNSPECIFIED
+            semantic_type = clean_title(item.get("semantic_constraint_type") or "")
+            service_kind = clean_title(item.get("service_kind") or "")
+            item.setdefault("trace", [])
+            if semantic_type in {"pickup", "exact_anchor"} or service_kind == "pickup":
+                fixed_start = item.get("fixed_start")
+                if fixed_start is None:
+                    fixed_start = item.get("fixedStart")
+                parsed_fixed_start = parse_clock(fixed_start)
+                if parsed_fixed_start is not None:
+                    duration = int(item.get("duration_minutes") or item.get("durationMinutes") or 60)
+                    item["timing_mode"] = TimingMode.FIXED
+                    item["fixed_start"] = parsed_fixed_start
+                    item["fixed_end"] = parsed_fixed_start + duration
+                    item["is_user_fixed"] = True
+                    item["can_move_for_repair"] = False
+                    item["repair_protection"] = item.get("repair_protection") or "fixed"
+                    mode = TimingMode.FIXED
+            if semantic_type in {"arrive_by", "dropoff", "deadline"} or service_kind == "dropoff":
+                latest_end = parse_clock(item.get("latest_end") if item.get("latest_end") is not None else item.get("arrive_by"))
+                if latest_end is not None:
+                    item["timing_mode"] = TimingMode.WINDOW
+                    item["latest_end"] = latest_end
+                    item["preferred_end"] = parse_clock(item.get("preferred_end")) or latest_end
+                    item["is_user_fixed"] = False
+                    item["can_move_for_repair"] = True
+                    item["repair_protection"] = item.get("repair_protection") or "flexible"
+                    deadline.append(item)
+                    jlog(
+                        "MODULE_C",
+                        f"'{item['title']}' -> DEADLINE ({format_clock(latest_end)})",
+                        "CLASSIFY",
+                    )
+                    continue
             
             has_preserved_time = (
                 item.get("preserve_scheduled_time")
@@ -536,6 +617,7 @@ class ModuleCConstructorMixin:
                 fs = item.get("fixed_start")
                 if fs is None:
                     fs = item.get("fixedStart")
+                fs = parse_clock(fs)
                 if fs is not None:
                     dur = int(item.get("duration_minutes") or item.get("durationMinutes") or 60)
                     item["scheduled_start"] = fs
@@ -576,6 +658,31 @@ class ModuleCConstructorMixin:
                 jlog("MODULE_C", f"'{item['title']}' reason={reason}", "CLASH")
                 timeline.append(self._create_conflict_item(item, timeline, reason))
                 timeline.sort(key=lambda x: x["scheduled_start"])
+
+        # 1b. Place deadline-style anchors close to their requested completion
+        # time before ordinary flexible work competes for the remaining gaps.
+        deadline.sort(key=lambda x: x.get("latest_end") or x.get("arrive_by") or day_end)
+        for item in deadline:
+            inserted, reason = self._insert_best_position(
+                item,
+                timeline,
+                day_start,
+                day_end,
+                min_travel,
+                prefer_latest=True,
+            )
+            if inserted:
+                timeline = inserted
+                jlog(
+                    "MODULE_C",
+                    f"'{item['title']}' -> before {format_clock(int(item.get('latest_end') or day_end))}",
+                    "PLACE_DEADLINE",
+                )
+            else:
+                if item.get("is_mandatory", item.get("isMandatory", True)):
+                    timeline = self._insert_as_conflict(item, timeline, day_start, reason) or timeline
+                else:
+                    unscheduled.append(item)
 
         # 2. Preserve existing scheduled flexible/preferred activities before
         # inserting new relative requests. This prevents a small edit from
@@ -1109,8 +1216,59 @@ class ModuleCConstructorMixin:
 
         if activity.get("_soft_anchor_boost"):
             score += 90
+
+        if getattr(self, "_current_low_fatigue_preference", False):
+            if self._activity_role(activity) == "recovery":
+                score += 45
+            if activity.get("travel_required"):
+                score += 10
             
         return score
+
+    def _activity_role(self, activity: Optional[Dict[str, Any]]) -> str:
+        if not activity:
+            return ""
+        return clean_title(activity.get("activity_role") or "")
+
+    def _activity_is_demanding_for_recovery(self, activity: Optional[Dict[str, Any]]) -> bool:
+        if not activity:
+            return False
+        if activity.get("travel_required"):
+            return True
+        if activity.get("timing_mode") == TimingMode.FIXED or activity.get("fixed_start") is not None:
+            return True
+        return int(activity.get("duration_minutes") or 0) >= 45
+
+    def _semantic_candidate_score_adjustment(
+        self,
+        item: Dict[str, Any],
+        timeline: List[Dict[str, Any]],
+        insertion_index: int,
+        candidate_start: int,
+        candidate_end: int,
+    ) -> float:
+        if self._activity_role(item) != "recovery":
+            return 0.0
+        before = timeline[:insertion_index]
+        after = timeline[insertion_index:]
+        demanding_before = [entry for entry in before if self._activity_is_demanding_for_recovery(entry)]
+        demanding_after = [entry for entry in after if self._activity_is_demanding_for_recovery(entry)]
+        adjustment = 0.0
+        if not before:
+            adjustment -= 500.0
+        if demanding_before:
+            adjustment += min(220.0, len(demanding_before) * 55.0)
+            previous = before[-1]
+            if self._activity_is_demanding_for_recovery(previous):
+                adjustment += 70.0
+        if demanding_after:
+            next_demanding = demanding_after[0]
+            gap_to_next = (next_demanding.get("scheduled_start") or candidate_end) - candidate_end
+            if 0 <= gap_to_next <= 120:
+                adjustment += 35.0
+        if getattr(self, "_current_low_fatigue_preference", False) and demanding_before:
+            adjustment += 60.0
+        return adjustment
 
     def _mark_soft_anchor_boosts(self, flexible: List[Dict[str, Any]]) -> None:
         referenced_titles = set()
@@ -1250,6 +1408,24 @@ class ModuleCConstructorMixin:
                 and preferred_start + duration <= (item.get("latest_end") or day_end)
             ):
                 candidate_start = preferred_start
+            preferred_end = item.get("preferred_end")
+            if preferred_end is None and clean_title(item.get("semantic_constraint_type") or "") in {"arrive_by", "dropoff", "deadline"}:
+                preferred_end = item.get("latest_end") or item.get("arrive_by")
+            preferred_end = parse_clock(preferred_end)
+            latest_end_limit = parse_clock(item.get("latest_end")) or day_end
+            if preferred_end is not None:
+                latest_start_for_deadline = min(
+                    preferred_end - duration,
+                    latest_end_limit - duration,
+                    gap_end - after_transition - duration,
+                )
+                earliest_candidate = max(
+                    gap_start + before_transition,
+                    item.get("earliest_start") or day_start,
+                    day_start,
+                )
+                if latest_start_for_deadline >= earliest_candidate and candidate_start < latest_start_for_deadline:
+                    candidate_start = latest_start_for_deadline
             preferred_window_start = item.get("preferred_window_start")
             preferred_window_end = item.get("preferred_window_end")
             if (
@@ -1275,7 +1451,7 @@ class ModuleCConstructorMixin:
             if candidate_end + after_transition > gap_end:
                 continue 
             
-            if candidate_end > (item.get("latest_end") or day_end):
+            if candidate_end > latest_end_limit:
                 continue 
 
             candidate = deepcopy(item)
@@ -1324,13 +1500,34 @@ class ModuleCConstructorMixin:
             if preferred_window_start is not None or preferred_window_end is not None:
                 window_start = preferred_window_start if preferred_window_start is not None else day_start
                 window_end = preferred_window_end if preferred_window_end is not None else day_end
+                window_label = clean_title(item.get("preferred_time_window") or "")
                 if candidate_start >= window_start and candidate_end <= window_end:
                     total_score += 160
+                    if window_label in {"evening", "lunch"}:
+                        jlog(
+                            "PREFERRED_WINDOW",
+                            f"title={item.get('title')} window={window_label} start={format_clock(candidate_start)} status=within_window penalty=0",
+                            None,
+                        )
                 else:
+                    penalty_multiplier = 4.0
+                    if window_label == "lunch" and candidate_end > window_end:
+                        penalty_multiplier = 12.0
+                        if candidate_start >= 14 * 60:
+                            penalty_multiplier = 24.0
+                        if candidate_start >= 15 * 60:
+                            penalty_multiplier = 40.0
                     if candidate_start < window_start:
-                        preferred_window_penalty += (window_start - candidate_start) * 4.0
+                        preferred_window_penalty += (window_start - candidate_start) * penalty_multiplier
                     if candidate_end > window_end:
-                        preferred_window_penalty += (candidate_end - window_end) * 4.0
+                        preferred_window_penalty += (candidate_end - window_end) * penalty_multiplier
+                        if window_label == "lunch":
+                            severity = "very_strong" if candidate_start >= 15 * 60 else ("strong" if candidate_start >= 14 * 60 else "moderate")
+                            jlog(
+                                "MEAL_WINDOW",
+                                f"title={item.get('title')} start={format_clock(candidate_start)} severity={severity}",
+                                "PENALTY",
+                            )
                     total_score -= preferred_window_penalty
             order_delta, order_violations = self._preferred_order_score_adjustment(
                 item,
@@ -1339,6 +1536,13 @@ class ModuleCConstructorMixin:
                 candidate_end,
             )
             total_score += order_delta
+            total_score += self._semantic_candidate_score_adjustment(
+                item,
+                timeline,
+                index,
+                candidate_start,
+                candidate_end,
+            )
             
             if total_score > best_score:
                 best_score = total_score
@@ -1354,14 +1558,15 @@ class ModuleCConstructorMixin:
                         candidate.setdefault("trace", []).append(
                             f"Preferred window fallback penalty={round(float(preferred_window_penalty), 2)}."
                         )
-                        jlog(
-                            "MODULE_C",
-                            (
-                                f"title={item.get('title')} window={window_label} "
-                                f"penalty={round(float(preferred_window_penalty), 2)}"
-                            ),
-                            "PREFERRED_WINDOW_PENALTY",
-                        )
+                        if clean_title(window_label) != "evening":
+                            jlog(
+                                "MODULE_C",
+                                (
+                                    f"title={item.get('title')} window={window_label} "
+                                    f"penalty={round(float(preferred_window_penalty), 2)}"
+                                ),
+                                "PREFERRED_WINDOW_PENALTY",
+                            )
                 if order_violations:
                     candidate["accepted_with_warning"] = True
                     candidate["warning_code"] = "SOFT_PREFERENCE_UNMET"

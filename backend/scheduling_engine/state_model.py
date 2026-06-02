@@ -287,6 +287,19 @@ class StateModelMixin:
             fixed_start = None
             fixed_end = None
             user_fixed_start = None
+        semantic_constraint_type = clean_title(raw.get("semantic_constraint_type") or "")
+        service_kind = clean_title(raw.get("service_kind") or "")
+        if semantic_constraint_type in {"pickup", "exact_anchor"} or service_kind == "pickup":
+            is_user_fixed = True
+            if fixed_start is None:
+                fixed_start = self._coerce_minutes(raw.get("scheduled_start"), raw.get("startTime"))
+            if fixed_start is not None and fixed_end is None:
+                fixed_end = fixed_start + duration_minutes
+        elif semantic_constraint_type in {"arrive_by", "dropoff", "deadline"} or service_kind == "dropoff":
+            is_user_fixed = False
+            fixed_start = None
+            fixed_end = None
+            user_fixed_start = None
         if is_user_fixed and fixed_start is None:
             fixed_start = self._coerce_minutes(raw.get("scheduled_start"), raw.get("startTime"))
         if is_user_fixed and fixed_end is None:
@@ -301,6 +314,7 @@ class StateModelMixin:
         earliest_start = self._coerce_minutes(raw.get("earliest_start"), raw.get("earliestStart"))
         latest_end = self._coerce_minutes(raw.get("latest_end"), raw.get("latestEnd"))
         preferred_start = self._coerce_minutes(raw.get("preferred_start"), raw.get("preferredStart"))
+        preferred_end = self._coerce_minutes(raw.get("preferred_end"), raw.get("preferredEnd"))
         timing_mode = self._infer_timing_mode(
             raw,
             fixed_start,
@@ -310,7 +324,13 @@ class StateModelMixin:
             preferred_start,
             anchor_relation,
         )
+        if semantic_constraint_type in {"pickup", "exact_anchor"} or service_kind == "pickup":
+            timing_mode = TimingMode.FIXED
+        elif semantic_constraint_type in {"arrive_by", "dropoff", "deadline"} or service_kind == "dropoff":
+            timing_mode = TimingMode.WINDOW
 
+        semantic_fixed_start = fixed_start
+        semantic_fixed_end = fixed_end
         timing_mode, fixed_start, fixed_end, preferred_start, timing_trace = self._classify_timing_with_domain_rules(
             raw,
             title,
@@ -341,6 +361,18 @@ class StateModelMixin:
             or timing_mode
             or TimingMode.UNSPECIFIED
         )
+        if semantic_constraint_type in {"pickup", "exact_anchor"} or service_kind == "pickup":
+            timing_mode = TimingMode.FIXED
+            fixed_start = fixed_start if fixed_start is not None else semantic_fixed_start
+            fixed_end = fixed_end if fixed_end is not None else semantic_fixed_end
+            if fixed_start is not None and fixed_end is None:
+                fixed_end = fixed_start + duration_minutes
+            timing_trace = "Semantic timing: fixed because this is an exact anchor."
+        elif semantic_constraint_type in {"arrive_by", "dropoff", "deadline"} or service_kind == "dropoff":
+            timing_mode = TimingMode.WINDOW
+            fixed_start = None
+            fixed_end = None
+            timing_trace = "Semantic timing: deadline because this service must finish by the requested time."
         raw_system_scheduled = raw.get("is_system_scheduled")
         is_system_scheduled = (
             bool(raw_system_scheduled)
@@ -448,6 +480,7 @@ class StateModelMixin:
             "earliest_start": earliest_start,
             "latest_end": latest_end,
             "preferred_start": preferred_start,
+            "preferred_end": preferred_end,
             "preferred_time_window": preferred_time_window,
             "preferred_window_start": preferred_window_start,
             "preferred_window_end": preferred_window_end,
@@ -477,6 +510,7 @@ class StateModelMixin:
             "raw_location_text": raw.get("raw_location_text"),
             "location_kind": location_kind,
             "location_resolution_status": location_resolution_status,
+            "location_policy": raw.get("location_policy") or raw.get("locationPolicy"),
             "no_location_reason": raw.get("no_location_reason"),
             "semantic_confidence": raw.get("semantic_confidence"),
             "needs_clarification": bool(raw.get("needs_clarification", False)),
@@ -486,6 +520,14 @@ class StateModelMixin:
             "raw_llm_location": raw.get("raw_llm_location"),
             "explicit_user_location": bool(raw.get("explicit_user_location", False)),
             "location_warning": raw.get("location_warning"),
+            "location_flexible": bool(raw.get("location_flexible", False)),
+            "can_be_done_at_current_location": bool(raw.get("can_be_done_at_current_location", False)),
+            "quiet_place_required": bool(raw.get("quiet_place_required", False)),
+            "activity_role": raw.get("activity_role"),
+            "travel_context_required": bool(raw.get("travel_context_required", False)),
+            "semantic_constraint_type": raw.get("semantic_constraint_type"),
+            "service_kind": raw.get("service_kind"),
+            "arrive_by": self._coerce_minutes(raw.get("arrive_by"), raw.get("arriveBy")),
             "area_preference": raw.get("area_preference"),
             "same_location_as": raw.get("same_location_as"),
             "inherited_from_activity_id": raw.get("inherited_from_activity_id"),

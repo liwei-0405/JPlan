@@ -59,6 +59,7 @@ class ScheduleItem(BaseModel):
     raw_location_text: Optional[str] = None
     location_kind: Optional[str] = None
     location_resolution_status: Optional[str] = None
+    location_policy: Optional[str] = None
     no_location_reason: Optional[str] = None
     semantic_confidence: Optional[float] = None
     raw_llm_location: Optional[str] = None
@@ -66,6 +67,14 @@ class ScheduleItem(BaseModel):
     needs_clarification: Optional[bool] = False
     parse_notes: Optional[str] = None
     location_warning: Optional[str] = None
+    location_flexible: Optional[bool] = False
+    can_be_done_at_current_location: Optional[bool] = False
+    quiet_place_required: Optional[bool] = False
+    activity_role: Optional[str] = None
+    travel_context_required: Optional[bool] = False
+    semantic_constraint_type: Optional[str] = None
+    service_kind: Optional[str] = None
+    arrive_by: Optional[int] = None
     saved_location_label: Optional[str] = None
     resolved_location: Optional[Dict[str, Any]] = None
     travel_estimate_source: Optional[str] = None
@@ -130,7 +139,9 @@ class ScheduleEnvelope(BaseModel):
     planning_mode: Optional[str] = "feasibility_first"
     allow_clash: Optional[bool] = False
     accurate_travel_time: Optional[bool] = False
+    travel_intent: Optional[bool] = False
     preferences: Optional[Dict[str, Any]] = {}
+    schedule_constraints: Optional[Dict[str, Any]] = {}
     activities: List[ScheduleItem]
     schedule_blocks: Optional[List[ScheduleItem]] = [] # Explicit timeline
     committed_schedule_blocks: Optional[List[Dict[str, Any]]] = []
@@ -229,7 +240,9 @@ class PlanRequest(BaseModel):
     planning_mode: Optional[str] = "feasibility_first"
     allow_clash: bool = False
     accurate_travel_time: bool = False
+    travel_intent: bool = False
     preferences: Optional[Dict[str, Any]] = {}
+    schedule_constraints: Optional[Dict[str, Any]] = {}
     schedule_status: Optional[str] = None
     travel_validation_status: Optional[str] = None
     conflicts: Optional[List[Dict[str, Any]]] = []
@@ -328,26 +341,51 @@ def _location_has_coordinates(location: Optional[Dict[str, Any]]) -> bool:
 
 
 def _activity_key_for_accounting(item: Dict[str, Any]) -> str:
-    return str(
+    key = (
         item.get("stable_activity_id")
         or item.get("activity_id")
+        or item.get("original_operation_id")
         or item.get("id")
+    )
+    if key:
+        return str(key).strip()
+    title = str(item.get("title") or "").strip().lower()
+    duration = item.get("duration_minutes") or item.get("duration") or ""
+    index = item.get("original_request_index") or item.get("operation_index") or item.get("sequence_index") or ""
+    return f"title:{title}|duration:{duration}|index:{index}" if title else ""
+
+
+def _is_schedule_constraint_for_accounting(item: Dict[str, Any]) -> bool:
+    constraint_type = str(
+        item.get("semantic_constraint_type")
+        or item.get("constraint_type")
+        or item.get("schedule_constraint_type")
         or ""
-    ).strip()
+    ).strip().lower()
+    return bool(item.get("is_schedule_constraint")) or constraint_type in {
+        "return_home_deadline",
+        "must_arrive_home_by",
+        "home_deadline",
+    }
 
 
 def _real_activity_keys_for_accounting(envelope: Dict[str, Any]) -> set[str]:
     keys: set[str] = set()
-    for item in envelope.get("activities") or []:
-        if not scheduling_engine._is_activity_entry(item):
-            continue
-        if scheduling_engine._is_generic_system_activity_payload(item):
-            continue
-        if str(item.get("status") or "active") != "active":
-            continue
-        key = _activity_key_for_accounting(item)
-        if key:
-            keys.add(key)
+    for collection_name in ("activities", "unfit_activities", "unscheduled_activities"):
+        for item in envelope.get(collection_name) or []:
+            if not isinstance(item, dict):
+                continue
+            if _is_schedule_constraint_for_accounting(item):
+                continue
+            if not scheduling_engine._is_activity_entry(item):
+                continue
+            if scheduling_engine._is_generic_system_activity_payload(item):
+                continue
+            if str(item.get("status") or "active") != "active":
+                continue
+            key = _activity_key_for_accounting(item)
+            if key:
+                keys.add(key)
     return keys
 
 
@@ -1036,6 +1074,8 @@ async def save_plan_endpoint(plan: PlanRequest):
                 "allow_clash": bool(plan.allow_clash),
                 "planning_mode": plan.planning_mode,
                 "accurate_travel_time": bool(plan.accurate_travel_time),
+                "travel_intent": bool(plan.travel_intent),
+                "schedule_constraints": plan.schedule_constraints or (plan.preferences or {}).get("schedule_constraints") or {},
             },
             status=plan.status or "ok",
             schedule_status=plan.schedule_status or plan.status or "ok",
@@ -1044,6 +1084,8 @@ async def save_plan_endpoint(plan: PlanRequest):
             planning_mode=plan.planning_mode,
             allow_clash=bool(plan.allow_clash),
             accurate_travel_time=bool(plan.accurate_travel_time),
+            travel_intent=bool(plan.travel_intent),
+            schedule_constraints=plan.schedule_constraints,
             conflicts=plan.conflicts,
             warnings=plan.warnings,
             location_resolution_requests=plan.location_resolution_requests,

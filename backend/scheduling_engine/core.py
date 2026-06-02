@@ -127,6 +127,15 @@ class SchedulingEngine(
         base_version = int((current_schedule or {}).get("version") or 0)
         source_turn = base_version + 1
         preferences = deepcopy(parsed.get("preferences") or (current_schedule or {}).get("preferences") or {})
+        schedule_constraints = deepcopy(
+            parsed.get("schedule_constraints")
+            or preferences.get("schedule_constraints")
+            or (current_schedule or {}).get("schedule_constraints")
+            or ((current_schedule or {}).get("preferences") or {}).get("schedule_constraints")
+            or {}
+        )
+        if schedule_constraints:
+            preferences["schedule_constraints"] = schedule_constraints
         preferences["travel_intent"] = bool(preferences.get("travel_intent") or detect_travel_intent(latest_request or ""))
         allow_clash = self._resolve_allow_clash(preferences, current_schedule)
         planning_mode = self._planning_mode(allow_clash)
@@ -208,6 +217,7 @@ class SchedulingEngine(
             "planning_mode": planning_mode,
             "allow_clash": allow_clash,
             "accurate_travel_time": accurate_travel_time,
+            "schedule_constraints": schedule_constraints,
             "version": max(1, source_turn),
             "preferences": preferences,
             "activities": formatted_activities,

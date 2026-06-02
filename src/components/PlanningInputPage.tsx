@@ -109,7 +109,12 @@ type RepairSuggestion = {
 };
 
 function isAccurateTravelEnabled(schedule?: DailySchedule | null): boolean {
-  return Boolean(schedule?.accurate_travel_time || schedule?.preferences?.accurate_travel_time);
+  return Boolean(
+    schedule?.accurate_travel_time
+    || schedule?.preferences?.accurate_travel_time
+    || schedule?.travel_intent
+    || schedule?.preferences?.travel_intent
+  );
 }
 
 function hasRouteRepairPreview(schedule?: DailySchedule | null): boolean {
@@ -409,6 +414,7 @@ export function PlanningInputPage({
   };
 
   const chatEndRef = useRef<HTMLDivElement>(null);
+  const locationConfirmationTitlesRef = useRef<string[]>([]);
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [conversationHistory]);
@@ -749,11 +755,22 @@ export function PlanningInputPage({
   const routeBlockedActivities = (activeDisplaySchedule?.blocked_activities || previewSchedule?.blocked_activities || []) as Array<Record<string, unknown>>;
   const fixedRouteConflicts = ((activeDisplaySchedule?.route_conflicts || previewSchedule?.route_conflicts || []) as Array<Record<string, unknown>>)
     .filter(conflict => String(conflict.reason_code || "") === "fixed_to_fixed_infeasible");
+  const travelValidationStatus = String(previewSchedule?.travel_validation_status || previewSchedule?.preview_status || "");
+  const isPartialFixedRouteConflict = travelValidationStatus === "partial_feasible_with_fixed_route_conflicts";
   const isLocationPending = Boolean(
-    previewSchedule?.schedule_status === "location_pending"
-    || previewSchedule?.status === "location_pending"
-    || previewSchedule?.needs_travel_validation
+    !isPartialFixedRouteConflict
+    && (
+      previewSchedule?.schedule_status === "location_pending"
+      || previewSchedule?.status === "location_pending"
+      || travelValidationStatus === "pending_locations"
+      || previewSchedule?.needs_travel_validation
+    )
   );
+  useEffect(() => {
+    if (isPartialFixedRouteConflict) {
+      console.log("[JPLAN][UI_STATE] status=partial_feasible_with_fixed_route_conflicts action=save_partial_plan");
+    }
+  }, [isPartialFixedRouteConflict]);
   const repairSuggestionHasChange = (suggestion: RepairSuggestion) => {
     if (suggestion.would_change === false) return false;
     const sameStart = String(suggestion.from || "") === String(suggestion.to || "");
@@ -788,6 +805,57 @@ export function PlanningInputPage({
       return false;
     }
     return normalizeLocationTarget(item.title) === normalizeLocationTarget(request.title);
+  };
+
+  const remainingLocationRequestsAfterConfirm = (
+    requests: LocationResolutionRequest[],
+    request: LocationResolutionRequest,
+    candidate: GeocodeCandidate,
+  ) => requests.filter(item => {
+    if (item.activity_id === request.activity_id) return false;
+    if ((request.related_activity_ids || []).map(String).includes(String(item.activity_id))) return false;
+    if (
+      candidate.source === "same_label_reuse" &&
+      request.current_guess &&
+      item.current_guess &&
+      normalizeLocationTarget(item.current_guess) === normalizeLocationTarget(request.current_guess)
+    ) return false;
+    return true;
+  });
+
+  const shortTitleList = (titles: string[], maxVisible = 3) => {
+    const cleanTitles = titles.map(title => title.trim()).filter(Boolean);
+    if (cleanTitles.length <= maxVisible) return cleanTitles.join(", ");
+    return `${cleanTitles.slice(0, maxVisible).join(", ")}, and ${cleanTitles.length - maxVisible} more`;
+  };
+
+  const upsertLocationConfirmationMessage = (
+    message: string,
+    status: "success" | "location_pending" = "location_pending",
+  ) => {
+    setConversationHistory(prev => {
+      const next = [...prev];
+      let existingIndex = -1;
+      for (let index = next.length - 1; index >= 0; index -= 1) {
+        const item = next[index];
+        if (
+          item.role === "assistant" &&
+          (
+            item.message.startsWith("Locations confirmed:") ||
+            item.message.startsWith("All locations confirmed.")
+          )
+        ) {
+          existingIndex = index;
+          break;
+        }
+      }
+      const entry = { role: "assistant" as const, message, status };
+      if (existingIndex >= 0) {
+        next[existingIndex] = entry;
+        return next;
+      }
+      return [...next, entry];
+    });
   };
 
   const travelValidationMessage = (schedule: DailySchedule) => {
@@ -1028,66 +1096,6 @@ export function PlanningInputPage({
     });
   };
 
-  const reusableLocationOptions = (request: LocationResolutionRequest) => {
-    if (!previewSchedule || request.request_type === "start_location") return [];
-    const candidates = [
-      ...(previewSchedule.activities || []),
-      ...(previewSchedule.schedule_blocks || []),
-    ]
-      .filter(item => !matchesLocationRequest(item, request))
-      .map(item => {
-        const resolved = item.resolved_location;
-        if (!hasLocationCoordinates(resolved)) return null;
-        const candidate: GeocodeCandidate = {
-          label: resolved?.saved_location_label || resolved?.label || item.location_label || item.location,
-          display_name: resolved?.display_name || item.location_label || item.location || item.title,
-          address: resolved?.address || resolved?.display_name || item.location_label || item.location || item.title,
-          latitude: Number(resolved?.latitude),
-          longitude: Number(resolved?.longitude),
-          source: "same_as_activity",
-          confirmed_by_user: true,
-        };
-        const title = item.title || "another event";
-        const sameAsAnchor = request.same_location_as && normalizeLocationTarget(title) === normalizeLocationTarget(request.same_location_as);
-        const sameLabel = request.current_guess && (
-          normalizeLocationTarget(item.location_label) === normalizeLocationTarget(request.current_guess) ||
-          normalizeLocationTarget(item.location) === normalizeLocationTarget(request.current_guess) ||
-          normalizeLocationTarget(resolved?.label) === normalizeLocationTarget(request.current_guess)
-        );
-        if (sameAsAnchor) {
-          return {
-            key: `anchor:${title}`,
-            label: `Use same location as ${title}`,
-            source: "inferred_from_anchor",
-            candidate,
-          };
-        }
-        if (sameLabel) {
-          return {
-            key: `label:${request.current_guess}:${title}`,
-            label: `Apply this ${request.current_guess} location to all matching events`,
-            source: "same_label_reuse",
-            candidate,
-          };
-        }
-        return {
-          key: `same:${title}`,
-          label: `Same as ${title}`,
-          source: "same_as_activity",
-          candidate,
-        };
-      })
-      .filter(Boolean) as Array<{ key: string; label: string; source: string; candidate: GeocodeCandidate }>;
-
-    const seen = new Set<string>();
-    return candidates.filter(option => {
-      const coordKey = `${option.source}:${option.candidate.latitude.toFixed(6)}:${option.candidate.longitude.toFixed(6)}:${option.label}`;
-      if (seen.has(coordKey)) return false;
-      seen.add(coordKey);
-      return true;
-    }).slice(0, 4);
-  };
-
   const openLocationMapPicker = (request: LocationResolutionRequest, candidate?: GeocodeCandidate) => {
     setMapPickerRequest(request);
     setMapPickerCandidate(candidate || null);
@@ -1125,12 +1133,25 @@ export function PlanningInputPage({
   const handleConfirmLocation = async (request: LocationResolutionRequest, candidate: GeocodeCandidate) => {
     setResolvingLocationId(request.activity_id);
     try {
+      const requestsBeforeConfirm = ((previewSchedule?.location_resolution_requests || []) as LocationResolutionRequest[]);
+      const remainingRequests = remainingLocationRequestsAfterConfirm(requestsBeforeConfirm, request, candidate);
       applyResolvedLocationToDraft(request, candidate);
-      setConversationHistory(prev => [...prev, {
-        role: "assistant",
-        message: `Confirmed ${request.title} at ${candidate.display_name || candidate.address || request.current_guess || request.title}. This map point is attached to the current draft.`,
-        status: "success",
-      }]);
+      locationConfirmationTitlesRef.current = Array.from(new Set([
+        ...locationConfirmationTitlesRef.current,
+        request.title,
+      ].filter(Boolean)));
+      if (remainingRequests.length > 0) {
+        upsertLocationConfirmationMessage(
+          `Locations confirmed: ${shortTitleList(locationConfirmationTitlesRef.current)}. ${remainingRequests.length} left.`,
+          "location_pending",
+        );
+      } else {
+        upsertLocationConfirmationMessage(
+          "All locations confirmed. Complete travel validation when ready.",
+          "success",
+        );
+        locationConfirmationTitlesRef.current = [];
+      }
     } catch (error) {
       setConversationHistory(prev => [...prev, {
         role: "assistant",
@@ -1381,6 +1402,7 @@ export function PlanningInputPage({
 
   const handleSaveCurrentPlan = () => {
     const baseSchedule = materializeAutoRoutePreview(withPlanningPreferences(previewSchedule || { date: isoDateStr, activities: [] }));
+    const savingPartialFixedRouteConflict = String(baseSchedule.travel_validation_status || "") === "partial_feasible_with_fixed_route_conflicts";
     const finalSchedule = {
       ...baseSchedule,
       allow_clash: allowClash,
@@ -1392,6 +1414,14 @@ export function PlanningInputPage({
       },
       planning_mode: allowClash ? "clash_allowed" : "feasibility_first",
     };
+    if (savingPartialFixedRouteConflict) {
+      console.log("[JPLAN][SAVE_PARTIAL] status=partial_feasible_with_fixed_route_conflicts warnings_preserved=true");
+      setConversationHistory(prev => [...prev, {
+        role: "assistant",
+        message: "This plan was saved with fixed route conflicts. Fixed event times were kept, but some routes are not physically feasible.",
+        status: "warning",
+      }]);
+    }
     if (finalSchedule.needs_reschedule) {
       setSaveWithoutRerunNotice(true);
     }
@@ -1932,7 +1962,6 @@ export function PlanningInputPage({
                     {pendingLocationRequests.length > 0 && (
                       <div className="space-y-3">
                         {pendingLocationRequests.map((request) => {
-                          const primaryReuseOption = reusableLocationOptions(request)[0];
                           return (
                             <div key={request.activity_id} className="rounded-2xl border border-yellow-200 bg-yellow-50 p-3 text-sm text-yellow-950">
                               <div className="flex items-start gap-2">
@@ -1944,27 +1973,6 @@ export function PlanningInputPage({
                               </div>
 
                               <div className="mt-3 flex flex-wrap gap-2">
-                                {primaryReuseOption && (
-                                  <Button
-                                    variant="outline"
-                                    size="sm"
-                                    className="rounded-xl bg-white"
-                                    disabled={resolvingLocationId === request.activity_id}
-                                    onClick={() => {
-                                      const applied = [
-                                        request.title,
-                                        ...(request.related_titles || []),
-                                      ].filter(Boolean);
-                                      console.debug("[JPLAN][LOCATION_REUSE]", { source: primaryReuseOption.source, applied_to: applied });
-                                      handleConfirmLocation(request, {
-                                        ...primaryReuseOption.candidate,
-                                        source: primaryReuseOption.source,
-                                      });
-                                    }}
-                                  >
-                                    {primaryReuseOption.label}
-                                  </Button>
-                                )}
                                 <Button
                                   size="sm"
                                   className="rounded-xl"
@@ -2219,7 +2227,7 @@ export function PlanningInputPage({
               ) : (
                 <>
                   <CheckCircle className="mr-2 h-5 w-5" />
-                  {isDirtySchedule ? "Save without rerun" : "Save & Implement Plan"}
+                  {isPartialFixedRouteConflict ? "Save Partial Plan" : (isDirtySchedule ? "Save without rerun" : "Save & Implement Plan")}
                 </>
               )}
             </Button>

@@ -3029,8 +3029,8 @@ def test_travel_intent_with_accurate_off_returns_physical_location_requests():
     )["schedule_data"]
 
     requested = {request["title"] for request in envelope["location_resolution_requests"]}
-    assert envelope["accurate_travel_time"] is False
-    assert envelope["preferences"]["accurate_travel_time"] is False
+    assert envelope["accurate_travel_time"] is True
+    assert envelope["preferences"]["accurate_travel_time"] is True
     assert envelope["travel_intent"] is True
     assert envelope["travel_validation_status"] == "pending_locations"
     assert requested == {
@@ -3192,6 +3192,550 @@ def test_proposal_writing_at_physical_place_requests_location():
     assert proposal["location"] == "library"
 
 
+def test_semantic_constraint_normalizer_deadline_pickup_lunch_and_return_home(monkeypatch):
+    monkeypatch.setenv("SEMANTIC_NORMALIZER_MODE", "overwrite")
+    engine = SchedulingEngine(DummyClient(), travel_service=FakeTravelService())
+    request_text = (
+        "Plan my Saturday. I need to drop my younger brother at tuition by 9:00 AM, "
+        "pick him up at 11:00 AM, attend a birthday lunch at 1:00 PM, and be back home by 8:00 PM. "
+        "I also want to fit in 1 hour of study, grocery shopping, buying a gift, and a 30-minute rest. "
+        "Please make the plan practical and not too tiring."
+    )
+    parsed = {
+        "intent": "add",
+        "reply": "Draft created.",
+        "transcription": request_text,
+        "date": "2026-06-06",
+        "preferences": {},
+        "operations": [
+            {"op": "add", "title": "Drop brother at tuition", "timing_mode": TimingMode.PREFERRED, "fixed_start": "09:00", "duration_minutes": 30, "location_kind": "category_only", "location_category": "study", "travel_required": True, "location_resolution_status": "needs_coordinates"},
+            {"op": "add", "title": "Pick up brother from tuition", "timing_mode": TimingMode.PREFERRED, "fixed_start": "11:00", "duration_minutes": 30, "location_kind": "category_only", "location_category": "study", "travel_required": True, "location_resolution_status": "needs_coordinates"},
+            {"op": "add", "title": "Birthday lunch", "timing_mode": TimingMode.PREFERRED, "fixed_start": "13:00", "duration_minutes": 60, "location_kind": "category_only", "location_category": "meal_place", "travel_required": True, "location_resolution_status": "needs_coordinates"},
+            {"op": "add", "title": "Study", "timing_mode": TimingMode.WINDOW, "earliest_start": "09:15", "latest_end": "11:00", "duration_minutes": 60, "location_kind": "no_location_required", "location_category": "no_location", "travel_required": False, "location_resolution_status": "not_required"},
+            {"op": "add", "title": "Grocery shopping", "timing_mode": TimingMode.UNSPECIFIED, "duration_minutes": 45, "location_kind": "category_only", "location_category": "supermarket", "travel_required": True, "location_resolution_status": "needs_coordinates"},
+            {"op": "add", "title": "Buy gift", "timing_mode": TimingMode.UNSPECIFIED, "duration_minutes": 30, "location_kind": "category_only", "location_category": "unknown", "travel_required": True, "location_resolution_status": "needs_coordinates"},
+            {"op": "add", "title": "Rest", "timing_mode": TimingMode.UNSPECIFIED, "duration_minutes": 30, "location_kind": "home", "location_category": "home", "travel_required": True, "location_resolution_status": "needs_coordinates"},
+            {"op": "add", "title": "Return home", "timing_mode": TimingMode.PREFERRED, "fixed_start": "20:00", "location_kind": "home", "location_category": "home", "travel_required": True, "location_resolution_status": "needs_coordinates"},
+        ],
+    }
+
+    normalized = engine._normalize_parsed_locations(parsed, request_text)
+    operations = normalized["operations"]
+    dropoff = next(item for item in operations if item["title"] == "Drop brother at tuition")
+    pickup = next(item for item in operations if item["title"] == "Pick up brother from tuition")
+    lunch = next(item for item in operations if item["title"] == "Birthday lunch")
+    study = next(item for item in operations if item["title"] == "Study")
+    rest = next(item for item in operations if item["title"] == "Rest")
+
+    assert "Return home" not in {item["title"] for item in operations}
+    assert normalized["schedule_constraints"]["return_home_deadline"] == parse_clock("08:00 PM")
+    assert normalized["preferences"]["low_fatigue_preference"] is True
+    assert normalized["preferences"]["travel_intent"] is True
+    assert dropoff["service_kind"] == "dropoff"
+    assert dropoff["duration_minutes"] == 15
+    assert dropoff["latest_end"] == parse_clock("09:00 AM")
+    assert dropoff["timing_mode"] == TimingMode.WINDOW
+    assert pickup["service_kind"] == "pickup"
+    assert pickup["duration_minutes"] == 15
+    assert pickup["timing_mode"] == TimingMode.FIXED
+    assert parse_clock(pickup["fixed_start"]) == parse_clock("11:00 AM")
+    assert pickup["fixed_end"] == parse_clock("11:15 AM")
+    assert lunch["timing_mode"] == TimingMode.FIXED
+    assert lunch["fixed_start"] == parse_clock("01:00 PM")
+    assert study["location_flexible"] is True
+    assert study["activity_role"] == "study"
+    assert study["travel_context_required"] is True
+    assert study["travel_required"] is False
+    assert rest["location_flexible"] is True
+    assert rest["activity_role"] == "recovery"
+    assert not rest.get("travel_context_required")
+    assert rest["travel_required"] is False
+
+    envelope = engine.build_schedule_response(normalized, None, request_text, saved_locations=[])["schedule_data"]
+    titles = {item["title"] for item in envelope["activities"]}
+    dropoff_block = _activity_by_title(envelope, "Drop brother at tuition")
+    pickup_block = _activity_by_title(envelope, "Pick up brother from tuition")
+    lunch_block = _activity_by_title(envelope, "Birthday lunch")
+    rest_block = _activity_by_title(envelope, "Rest")
+    assert "Return home" not in titles
+    assert envelope["schedule_constraints"]["return_home_deadline"] == parse_clock("08:00 PM")
+    assert dropoff_block["timing_mode"] == TimingMode.WINDOW
+    assert dropoff_block["startTime"] == "08:45 AM"
+    assert dropoff_block["endTime"] == "09:00 AM"
+    assert pickup_block["timing_mode"] == TimingMode.FIXED
+    assert pickup_block["startTime"] == "11:00 AM"
+    assert pickup_block["endTime"] == "11:15 AM"
+    assert lunch_block["timing_mode"] == TimingMode.FIXED
+    assert lunch_block["startTime"] == "01:00 PM"
+    first_activity = next(block for block in envelope["schedule_blocks"] if block.get("block_type") == "activity")
+    assert first_activity["title"] != "Rest"
+    assert parse_clock(rest_block["startTime"]) > parse_clock(dropoff_block["endTime"])
+    assert len([item for item in envelope["activities"] if item.get("title") != "Return home"]) == 7
+    assert len(envelope.get("unfit_activities") or []) != 5
+
+
+def test_semantic_validate_only_keeps_module_a_owner_but_consumes_dropoff_deadline(monkeypatch):
+    monkeypatch.delenv("SEMANTIC_NORMALIZER_MODE", raising=False)
+    monkeypatch.delenv("USE_SEMANTIC_NORMALIZER", raising=False)
+    engine = SchedulingEngine(DummyClient(), travel_service=FakeTravelService())
+    request_text = "Drop my brother at tuition by 9:00 AM, then pick him up at 11:00 AM."
+    parsed = {
+        "intent": "add",
+        "reply": "Draft created.",
+        "transcription": request_text,
+        "date": "2026-06-06",
+        "preferences": {},
+        "operations": [
+            {
+                "op": "add",
+                "title": "Drop brother at tuition",
+                "source_clause": "Drop my brother at tuition by 9:00 AM",
+                "timing_mode": TimingMode.PREFERRED,
+                "fixed_start": "09:00",
+                "duration_minutes": 30,
+                "location_kind": "category_only",
+                "location_category": "study",
+                "travel_required": True,
+                "location_resolution_status": "needs_coordinates",
+            },
+            {
+                "op": "add",
+                "title": "Pick up brother",
+                "source_clause": "pick him up at 11:00 AM",
+                "timing_mode": TimingMode.FIXED,
+                "fixed_start": "11:00",
+                "duration_minutes": 15,
+                "location_kind": "category_only",
+                "location_category": "study",
+                "travel_required": True,
+                "location_resolution_status": "needs_coordinates",
+            },
+        ],
+    }
+
+    normalized = engine._normalize_parsed_locations(parsed, request_text)
+    dropoff = next(item for item in normalized["operations"] if item["title"] == "Drop brother at tuition")
+    pickup = next(item for item in normalized["operations"] if item["title"] == "Pick up brother")
+    envelope = engine.build_schedule_response(normalized, None, request_text)["schedule_data"]
+    dropoff_block = _activity_by_title(envelope, "Drop brother at tuition")
+
+    assert dropoff["semantic_constraint_type"] == "dropoff"
+    assert dropoff["service_kind"] == "dropoff"
+    assert dropoff["latest_end"] == parse_clock("09:00 AM")
+    assert dropoff["duration_minutes"] == 15
+    assert parse_clock(pickup["fixed_start"]) == parse_clock("11:00 AM")
+    assert dropoff_block["startTime"] == "08:45 AM"
+    assert dropoff_block["endTime"] == "09:00 AM"
+
+
+def test_semantic_normalizer_validate_only_keeps_module_a_lunch_time(monkeypatch, capsys):
+    monkeypatch.delenv("SEMANTIC_NORMALIZER_MODE", raising=False)
+    monkeypatch.delenv("USE_SEMANTIC_NORMALIZER", raising=False)
+    engine = SchedulingEngine(DummyClient(), travel_service=FakeTravelService())
+    request_text = (
+        "Plan my day for next Tuesday. I have a doctor appointment from 9:00 AM to 10:00 AM "
+        "at Sunway Medical, a lunch meeting at 12:30 PM in SS15, and a dinner with family "
+        "at 7:30 PM at home."
+    )
+    parsed = {
+        "intent": "add",
+        "transcription": request_text,
+        "date": "2026-06-09",
+        "operations": [
+            {"op": "add", "title": "Doctor appointment", "timing_mode": TimingMode.FIXED, "fixed_start": "09:00", "fixed_end": "10:00", "duration_minutes": 60, "source_clause": request_text, "location": "Sunway Medical", "location_kind": "exact_named_place", "location_category": "medical", "travel_required": True, "location_resolution_status": "needs_coordinates"},
+            {"op": "add", "title": "Lunch meeting", "timing_mode": TimingMode.FIXED, "fixed_start": "12:30", "duration_minutes": 60, "source_clause": request_text, "location": "SS15", "location_kind": "area_only", "location_category": "meal_place", "travel_required": True, "location_resolution_status": "needs_coordinates"},
+            {"op": "add", "title": "Dinner with family", "timing_mode": TimingMode.FIXED, "fixed_start": "19:30", "duration_minutes": 60, "source_clause": request_text, "location_kind": "home", "location_category": "home", "travel_required": True, "location_resolution_status": "needs_coordinates"},
+        ],
+    }
+
+    normalized = engine._normalize_parsed_locations(parsed, request_text)
+    lunch = next(item for item in normalized["operations"] if item["title"] == "Lunch meeting")
+    captured = capsys.readouterr().out
+
+    assert lunch["timing_mode"] == TimingMode.FIXED
+    assert parse_clock(lunch["fixed_start"]) == parse_clock("12:30 PM")
+    assert parse_clock(lunch.get("fixed_end")) in {None, parse_clock("01:30 PM")}
+    assert lunch.get("semantic_constraint_type") != "exact_anchor"
+    assert any("Lunch meeting" in issue and "ambiguous" in issue for issue in normalized.get("validation_issues", []))
+    assert "[JPLAN][SEMANTIC_CONSTRAINT][VALIDATE_ONLY]" in captured
+
+
+def test_semantic_normalizer_overwrite_mode_reproduces_legacy_exact_anchor(monkeypatch):
+    monkeypatch.setenv("SEMANTIC_NORMALIZER_MODE", "overwrite")
+    engine = SchedulingEngine(DummyClient(), travel_service=FakeTravelService())
+    request_text = (
+        "Plan my day. I have a doctor appointment from 9:00 AM to 10:00 AM, "
+        "a lunch meeting at 12:30 PM, and dinner at 7:30 PM."
+    )
+    parsed = {
+        "intent": "add",
+        "transcription": request_text,
+        "date": "2026-06-09",
+        "operations": [
+            {"op": "add", "title": "Lunch meeting", "timing_mode": TimingMode.FIXED, "fixed_start": "12:30", "duration_minutes": 60, "source_clause": "a lunch meeting at 12:30 PM"},
+        ],
+    }
+
+    normalized = engine._normalize_parsed_locations(parsed, request_text)
+    lunch = normalized["operations"][0]
+
+    assert lunch["semantic_constraint_type"] == "exact_anchor"
+    assert lunch["timing_mode"] == TimingMode.FIXED
+    assert lunch["fixed_start"] == parse_clock("12:30 PM")
+
+
+def test_use_semantic_normalizer_false_forces_validate_only(monkeypatch):
+    monkeypatch.setenv("SEMANTIC_NORMALIZER_MODE", "overwrite")
+    monkeypatch.setenv("USE_SEMANTIC_NORMALIZER", "false")
+    engine = SchedulingEngine(DummyClient(), travel_service=FakeTravelService())
+    parsed = {
+        "intent": "add",
+        "transcription": "Lunch meeting at 12:30 PM.",
+        "date": "2026-06-09",
+        "operations": [
+            {"op": "add", "title": "Lunch meeting", "timing_mode": TimingMode.UNSPECIFIED, "duration_minutes": 60, "source_clause": "Lunch meeting at 12:30 PM."},
+        ],
+    }
+
+    normalized = engine._normalize_parsed_locations(parsed, parsed["transcription"])
+    lunch = normalized["operations"][0]
+
+    assert lunch["timing_mode"] == TimingMode.UNSPECIFIED
+    assert lunch.get("fixed_start") is None
+    assert lunch.get("semantic_constraint_type") is None
+
+
+def test_semantic_constraint_normalizer_requires_evidence_before_rewrite():
+    engine = SchedulingEngine(DummyClient(), travel_service=FakeTravelService())
+    request_text = "Plan time for lunch and pickup research sometime this weekend."
+    parsed = {
+        "intent": "add",
+        "transcription": request_text,
+        "date": "2026-06-06",
+        "operations": [
+            {"op": "add", "title": "Pickup research", "timing_mode": TimingMode.UNSPECIFIED, "duration_minutes": 60},
+            {"op": "add", "title": "Lunch", "timing_mode": TimingMode.UNSPECIFIED, "duration_minutes": 60},
+        ],
+    }
+
+    normalized = engine._normalize_parsed_locations(parsed, request_text)
+    pickup = next(item for item in normalized["operations"] if item["title"] == "Pickup research")
+    lunch = next(item for item in normalized["operations"] if item["title"] == "Lunch")
+
+    assert pickup.get("service_kind") is None
+    assert pickup["timing_mode"] != TimingMode.FIXED
+    assert lunch["timing_mode"] != TimingMode.FIXED
+
+
+def test_location_flexible_tasks_request_exact_location_when_travel_context_matters():
+    engine = SchedulingEngine(DummyClient(), travel_service=FakeTravelService())
+    request_text = (
+        "Plan my Saturday. Drop my brother at tuition by 9:00 AM, pick him up at 11:00 AM, "
+        "and fit in one hour of study between them."
+    )
+    parsed = {
+        "intent": "add",
+        "transcription": request_text,
+        "date": "2026-06-06",
+        "preferences": {"accurate_travel_time": True, "travel_intent": True},
+        "operations": [
+            {"op": "add", "title": "Drop brother at tuition", "timing_mode": TimingMode.PREFERRED, "fixed_start": "09:00", "duration_minutes": 30, "location": "Tuition centre", "location_label": "Tuition centre", "location_kind": "exact_named_place", "location_category": "study", "location_status": "resolved", "location_resolution_status": "resolved_coordinates", "explicit_user_location": True, "travel_required": True, "resolved_location": {"latitude": 3.0, "longitude": 101.0}},
+            {"op": "add", "title": "Study", "timing_mode": TimingMode.UNSPECIFIED, "duration_minutes": 60, "location_kind": "no_location_required", "location_category": "no_location", "travel_required": False, "location_resolution_status": "not_required"},
+            {"op": "add", "title": "Pick up brother from tuition", "timing_mode": TimingMode.PREFERRED, "fixed_start": "11:00", "duration_minutes": 30, "location": "Tuition centre", "location_label": "Tuition centre", "location_kind": "exact_named_place", "location_category": "study", "location_status": "resolved", "location_resolution_status": "resolved_coordinates", "explicit_user_location": True, "travel_required": True, "resolved_location": {"latitude": 3.0, "longitude": 101.0}},
+        ],
+    }
+
+    envelope = engine.build_schedule_response(parsed, None, request_text, saved_locations=[])["schedule_data"]
+    requests = envelope["location_resolution_requests"]
+    requested_titles = {request["title"] for request in requests}
+
+    assert "Study" in requested_titles
+    study = _activity_by_title(envelope, "Study")
+    assert study["location_flexible"] is True
+    assert study["can_be_done_at_current_location"] is True
+    assert study["travel_context_required"] is True
+
+
+def test_location_flexible_tasks_do_not_request_exact_location_without_travel_context():
+    engine = SchedulingEngine(DummyClient(), travel_service=FakeTravelService())
+    request_text = "Plan one hour of study sometime Saturday."
+    parsed = {
+        "intent": "add",
+        "transcription": request_text,
+        "date": "2026-06-06",
+        "preferences": {"accurate_travel_time": False, "travel_intent": False},
+        "operations": [
+            {"op": "add", "title": "Study", "timing_mode": TimingMode.UNSPECIFIED, "duration_minutes": 60, "location_kind": "no_location_required", "location_category": "no_location", "travel_required": False, "location_resolution_status": "not_required"},
+        ],
+    }
+
+    envelope = engine.build_schedule_response(parsed, None, request_text, saved_locations=[])["schedule_data"]
+    requests = envelope["location_resolution_requests"]
+    requested_titles = {request["title"] for request in requests}
+
+    assert "Study" not in requested_titles
+
+
+def test_location_flexible_selected_home_location_displays_without_route_endpoint():
+    engine = SchedulingEngine(DummyClient(), travel_service=FakeTravelService())
+    activities = [
+        {
+            "id": "study",
+            "stable_activity_id": "study",
+            "title": "Study",
+            "scheduled_start": parse_clock("09:00 AM"),
+            "scheduled_end": parse_clock("10:00 AM"),
+            "duration_minutes": 60,
+            "location": "Home",
+            "location_label": "Home",
+            "location_category": "unknown",
+            "location_status": "resolved",
+            "location_flexible": True,
+            "travel_context_required": True,
+            "travel_required": False,
+            "resolved_location": {
+                "display_name": "Home",
+                "category": "home",
+                "latitude": 2.9,
+                "longitude": 101.6,
+            },
+        }
+    ]
+
+    blocks = engine._materialize_blocks(activities, parse_clock("08:00 AM"), None)
+    study = next(block for block in blocks if block.get("title") == "Study")
+
+    assert study["location"] == "Home"
+    assert study["location_label"] == "Home"
+    assert study["travel_required"] is False
+    assert not any(block.get("block_type") == "transition" for block in blocks)
+
+
+def test_location_flexible_selected_physical_location_participates_in_routing():
+    engine = SchedulingEngine(DummyClient(), travel_service=FakeTravelService(route_minutes=9))
+    study = {
+        "id": "study",
+        "stable_activity_id": "study",
+        "title": "Study",
+        "scheduled_start": parse_clock("09:00 AM"),
+        "scheduled_end": parse_clock("10:00 AM"),
+        "duration_minutes": 60,
+        "location": "Quiet Library",
+        "location_label": "Quiet Library",
+        "location_category": "unknown",
+        "location_status": "resolved",
+        "location_flexible": True,
+        "travel_context_required": True,
+        "travel_required": False,
+        "resolved_location": {
+            "display_name": "Quiet Library",
+            "category": "library",
+            "latitude": 3.0,
+            "longitude": 101.7,
+        },
+    }
+
+    assert engine._activity_requires_travel(study) is True
+    context = engine._build_route_context(
+        {"date": "2026-06-06", "preferences": _accurate_preferences()},
+        [study],
+        saved_locations=[],
+    )
+
+    assert "id:study" in context["nodes"]
+    assert context["nodes"]["id:study"]["location"] == "Quiet Library"
+
+
+def test_post_repair_backfill_moves_late_errand_into_morning_free_slot():
+    engine = SchedulingEngine(DummyClient(), travel_service=FakeTravelService(route_minutes=5))
+    locations = [
+        _default_start_location(),
+        {"label": "Campus", "display_name": "Campus", "address": "Campus", "latitude": 3.00, "longitude": 101.60},
+        {"label": "Laundry", "display_name": "Laundry", "address": "Laundry", "latitude": 3.01, "longitude": 101.61},
+    ]
+    repaired = {
+        "date": "2026-05-02",
+        "preferences": _accurate_preferences(day_start="07:00", day_end="22:00"),
+        "activities": [
+            {
+                "id": "class",
+                "stable_activity_id": "class",
+                "title": "Morning class",
+                "scheduled_start": parse_clock("10:00"),
+                "scheduled_end": parse_clock("12:00"),
+                "duration_minutes": 120,
+                "timing_mode": TimingMode.FIXED,
+                "fixed_start": parse_clock("10:00"),
+                "fixed_end": parse_clock("12:00"),
+                "is_user_fixed": True,
+                "can_move_for_repair": False,
+                "repair_protection": "fixed",
+                "location": "Campus",
+                "location_label": "Campus",
+                "location_category": "school",
+                "location_status": "resolved",
+                "resolved_location": locations[1],
+                "travel_required": True,
+                "status": "active",
+            },
+            {
+                "id": "fyp",
+                "stable_activity_id": "fyp",
+                "title": "FYP Work",
+                "scheduled_start": parse_clock("12:30"),
+                "scheduled_end": parse_clock("15:30"),
+                "duration_minutes": 180,
+                "timing_mode": TimingMode.UNSPECIFIED,
+                "can_move_for_repair": True,
+                "repair_protection": "flexible",
+                "location_status": "not_required",
+                "location_category": "home_or_online",
+                "travel_required": False,
+                "status": "active",
+            },
+            {
+                "id": "laundry",
+                "stable_activity_id": "laundry",
+                "title": "Laundry",
+                "scheduled_start": parse_clock("20:00"),
+                "scheduled_end": parse_clock("21:00"),
+                "duration_minutes": 60,
+                "timing_mode": TimingMode.UNSPECIFIED,
+                "can_move_for_repair": True,
+                "repair_protection": "flexible",
+                "location": "Laundry",
+                "location_label": "Laundry",
+                "location_category": "laundry",
+                "location_status": "resolved",
+                "resolved_location": locations[2],
+                "travel_required": True,
+                "status": "active",
+            },
+        ],
+        "schedule_blocks": [
+            {"block_type": "idle", "title": "Free Time", "start": "07:00 AM", "end": "10:00 AM", "duration_minutes": 180},
+            {"block_type": "activity", "id": "class", "stable_activity_id": "class", "title": "Morning class", "start": "10:00 AM", "end": "12:00 PM", "startTime": "10:00 AM", "endTime": "12:00 PM", "location": "Campus", "location_label": "Campus", "location_category": "school", "location_status": "resolved", "resolved_location": locations[1], "travel_required": True, "timing_mode": TimingMode.FIXED, "fixed_start": parse_clock("10:00"), "fixed_end": parse_clock("12:00"), "is_user_fixed": True, "can_move_for_repair": False, "repair_protection": "fixed"},
+            {"block_type": "activity", "id": "fyp", "stable_activity_id": "fyp", "title": "FYP Work", "start": "12:30 PM", "end": "03:30 PM", "startTime": "12:30 PM", "endTime": "03:30 PM", "duration_minutes": 180, "location_status": "not_required", "location_category": "home_or_online", "travel_required": False, "can_move_for_repair": True, "repair_protection": "flexible"},
+            {"block_type": "idle", "title": "Free Time", "start": "03:30 PM", "end": "08:00 PM", "duration_minutes": 270},
+            {"block_type": "activity", "id": "laundry", "stable_activity_id": "laundry", "title": "Laundry", "start": "08:00 PM", "end": "09:00 PM", "startTime": "08:00 PM", "endTime": "09:00 PM", "duration_minutes": 60, "location": "Laundry", "location_label": "Laundry", "location_category": "laundry", "location_status": "resolved", "resolved_location": locations[2], "travel_required": True, "can_move_for_repair": True, "repair_protection": "flexible"},
+        ],
+    }
+    route_context = engine._build_route_context(repaired, repaired["activities"], locations)
+    validation = engine._final_validate_route_aware_repair(
+        original=repaired,
+        repaired=repaired,
+        route_context=route_context,
+    )
+
+    result = engine._post_repair_flexible_backfill(
+        original=repaired,
+        repaired=repaired,
+        validation=validation,
+        route_context=route_context,
+    )
+
+    assert result is not None
+    laundry = _activity_by_title(result["repaired"], "Laundry")
+    assert laundry["scheduled_start"] < parse_clock("10:00")
+    fixed_class = _activity_by_title(result["repaired"], "Morning class")
+    assert fixed_class["scheduled_start"] == parse_clock("10:00")
+    assert result["validation"]["travel_validation_status"] in {"validated", "fallback_used"}
+
+
+def test_post_repair_backfill_rejects_later_move(capsys):
+    engine = SchedulingEngine(DummyClient(), travel_service=FakeTravelService(route_minutes=5))
+    current = {
+        "date": "2026-05-02",
+        "preferences": _accurate_preferences(day_start="07:00", day_end="22:00"),
+        "activities": [
+            {
+                "id": "laundry",
+                "stable_activity_id": "laundry",
+                "title": "Laundry",
+                "scheduled_start": parse_clock("08:00 PM"),
+                "scheduled_end": parse_clock("09:00 PM"),
+                "duration_minutes": 60,
+                "timing_mode": TimingMode.UNSPECIFIED,
+                "can_move_for_repair": True,
+                "repair_protection": "flexible",
+                "location_category": "laundry",
+                "location_status": "not_required",
+                "travel_required": False,
+                "status": "active",
+            },
+        ],
+        "schedule_blocks": [
+            {"block_type": "activity", "id": "laundry", "stable_activity_id": "laundry", "title": "Laundry", "start": "08:00 PM", "end": "09:00 PM", "startTime": "08:00 PM", "endTime": "09:00 PM", "duration_minutes": 60, "location_category": "laundry", "location_status": "not_required", "travel_required": False},
+            {"block_type": "idle", "title": "Free Time", "start": "09:00 PM", "end": "10:00 PM", "duration_minutes": 60},
+        ],
+    }
+    validation = {"schedule_blocks": current["schedule_blocks"], "travel_validation_status": "validated"}
+
+    move = engine._best_post_repair_backfill_move(
+        current=current,
+        original=current,
+        validation=validation,
+        route_context={"nodes": {}, "routes": {}, "start_routes": {}},
+        current_travel_total=0,
+        moved_activity_ids=set(),
+    )
+
+    assert move is None
+    assert "reason=not_earlier_backfill" in capsys.readouterr().out
+
+
+def test_return_home_deadline_conflict_is_enforced_after_travel_validation():
+    engine = SchedulingEngine(DummyClient(), travel_service=FakeTravelService())
+    envelope = {
+        "preferences": {},
+        "schedule_constraints": {"return_home_deadline": parse_clock("08:00 PM")},
+        "schedule_blocks": [
+            {
+                "block_type": "activity",
+                "title": "Buy gift",
+                "start": "07:50 PM",
+                "end": "08:00 PM",
+                "location": "Far Mall",
+                "location_label": "Far Mall",
+                "location_category": "shopping",
+                "travel_required": True,
+            }
+        ],
+    }
+
+    conflict = engine._return_home_deadline_conflict(envelope)
+
+    assert conflict is not None
+    assert conflict["reason_code"] == "return_home_deadline_conflict"
+
+
+def test_return_home_deadline_constraint_is_not_counted_as_missing_activity():
+    engine = SchedulingEngine(DummyClient(), travel_service=FakeTravelService())
+    original = [
+        {"id": "gift", "stable_activity_id": "gift", "title": "Buy gift", "duration_minutes": 30, "status": "active"},
+        {
+            "id": "return-home",
+            "stable_activity_id": "return-home",
+            "title": "Return home",
+            "semantic_constraint_type": "return_home_deadline",
+            "is_schedule_constraint": True,
+            "status": "active",
+        },
+    ]
+    repaired = {
+        "activities": [
+            {"id": "gift", "stable_activity_id": "gift", "title": "Buy gift", "scheduled_start": parse_clock("04:00 PM"), "scheduled_end": parse_clock("04:30 PM")},
+        ],
+        "schedule_blocks": [],
+    }
+
+    accounting = engine._account_for_route_repair_activities(original, repaired, [], [])
+
+    assert accounting["unfit_activities"] == []
+    assert accounting["optional_skipped"] == []
+    assert accounting["missing_after_accounting"] == []
+
+
 def test_route_repair_accounting_marks_missing_lunch_unfit_and_optional_coffee_skipped():
     engine = SchedulingEngine(DummyClient(), travel_service=FakeTravelService())
     lunch = {
@@ -3228,6 +3772,111 @@ def test_route_repair_accounting_marks_missing_lunch_unfit_and_optional_coffee_s
     assert accounting["unfit_activities"][0]["reason_code"] == "missing_after_route_repair"
     assert accounting["optional_skipped"][0]["title"] == "Coffee break"
     assert accounting["missing_after_accounting"] == []
+
+
+def test_route_repair_accounting_dedupes_preserved_unfit_and_counts_unique_originals(capsys):
+    engine = SchedulingEngine(DummyClient(), travel_service=FakeTravelService())
+    scheduled = [
+        {"id": f"act-{index}", "stable_activity_id": f"act-{index}", "title": f"Scheduled {index}", "status": "active"}
+        for index in range(8)
+    ]
+    focused = {
+        "id": "focus",
+        "stable_activity_id": "focus",
+        "activity_id": "focus",
+        "title": "Focused deep work",
+        "duration_minutes": 180,
+        "reason": "Not enough route-safe time.",
+        "reason_code": "not_enough_time_after_travel",
+        "status": "active",
+    }
+    repaired = {
+        "activities": scheduled,
+        "schedule_blocks": [
+            {"block_type": "activity", "id": item["id"], "stable_activity_id": item["stable_activity_id"], "title": item["title"]}
+            for item in scheduled
+        ],
+    }
+
+    accounting = engine._account_for_route_repair_activities(
+        [*scheduled, focused],
+        repaired,
+        [focused, {**focused, "reason": "No feasible slot available."}],
+        [],
+    )
+    logs = capsys.readouterr().out
+
+    assert [item["title"] for item in accounting["unfit_activities"]] == ["Focused deep work"]
+    assert accounting["duplicate_after_accounting"] == ["focus"]
+    assert "original=9 scheduled=8 unfit=1 optional_skipped=0 explicitly_removed=0 missing=[] duplicates=['focus']" in logs
+    assert "[JPLAN][ACCOUNTING][WARNING]" in logs
+
+
+def test_preserve_existing_unfit_merges_duplicate_from_envelope(capsys):
+    engine = SchedulingEngine(DummyClient(), travel_service=FakeTravelService())
+    focused = {
+        "id": "focus",
+        "stable_activity_id": "focus",
+        "activity_id": "focus",
+        "title": "Focused deep work",
+        "duration_minutes": 180,
+        "reason": "Not enough route-safe time.",
+        "reason_code": "not_enough_time_after_travel",
+    }
+    merged = engine._preserve_existing_unfit_activities(
+        {"unfit_activities": [{**focused, "reason": "Existing reason."}]},
+        {"activities": [], "schedule_blocks": []},
+        [focused],
+    )
+    logs = capsys.readouterr().out
+
+    assert len(merged) == 1
+    assert merged[0]["title"] == "Focused deep work"
+    assert "[JPLAN][UNFIT][MERGE] title=Focused deep work reason=duplicate_existing_unfit" in logs
+    assert "[JPLAN][UNFIT][PRESERVE] title=Focused deep work source=envelope deduped=true" in logs
+
+
+def test_home_activity_with_saved_home_does_not_request_location_card():
+    engine = SchedulingEngine(DummyClient(), travel_service=FakeTravelService())
+    saved_home = _default_start_location()
+    envelope = {
+        "preferences": _accurate_preferences(),
+        "activities": [
+            {
+                "id": "dinner",
+                "stable_activity_id": "dinner",
+                "title": "Dinner with family",
+                "location": "home",
+                "location_label": "home",
+                "location_kind": "home",
+                "location_category": "home",
+                "location_status": "resolved",
+                "location_resolution_status": "resolved_coordinates",
+                "travel_required": True,
+            }
+        ],
+        "schedule_blocks": [
+            {
+                "block_type": "activity",
+                "id": "dinner",
+                "stable_activity_id": "dinner",
+                "title": "Dinner with family",
+                "start": "07:30 PM",
+                "end": "08:30 PM",
+                "location": "home",
+                "location_label": "home",
+                "location_kind": "home",
+                "location_category": "home",
+                "location_status": "resolved",
+                "location_resolution_status": "resolved_coordinates",
+                "travel_required": True,
+            }
+        ],
+    }
+
+    requests = engine._location_resolution_requests(envelope, [saved_home], include_start_location=False)
+
+    assert requests == []
 
 
 def test_module_d_rejects_bank_move_before_business_hours():

@@ -25,7 +25,7 @@ class TravelValidationMixin:
         if hasattr(self, "_normalize_day_boundary_preferences"):
             self._normalize_day_boundary_preferences(preferences)
         travel_intent = bool(preferences.get("travel_intent") or updated.get("travel_intent"))
-        accurate = self._resolve_accurate_travel_time(preferences, updated)
+        accurate = bool(self._resolve_accurate_travel_time(preferences, updated) or travel_intent)
         updated["accurate_travel_time"] = accurate
         preferences["accurate_travel_time"] = accurate
         updated["travel_intent"] = travel_intent
@@ -203,8 +203,14 @@ class TravelValidationMixin:
         updated["route_conflicts"] = validation.get("route_conflicts", [])
         updated["route_repair_attempted"] = bool(validation.get("route_repair_attempted", False))
         updated["pending_repair_suggestions"] = validation.get("pending_repair_suggestions", [])
-        updated["unfit_activities"] = validation.get("unfit_activities", [])
-        updated["optional_skipped"] = validation.get("optional_skipped", updated.get("optional_skipped", []))
+        updated["unfit_activities"] = self._dedupe_route_repair_items(
+            validation.get("unfit_activities", []),
+            item_type="unfit",
+        )[0]
+        updated["optional_skipped"] = self._dedupe_route_repair_items(
+            validation.get("optional_skipped", updated.get("optional_skipped", [])),
+            item_type="optional_skipped",
+        )[0]
         updated["blocked_activities"] = validation.get("blocked_activities", [])
         updated["route_repair_actions"] = validation.get("route_repair_actions", [])
         updated["route_efficiency"] = validation.get("route_efficiency", updated.get("route_efficiency", {}))
@@ -228,6 +234,10 @@ class TravelValidationMixin:
                 "unscheduled_activities",
                 updated.get("unscheduled_activities", []),
             )
+            updated["unscheduled_activities"] = self._dedupe_route_repair_items(
+                updated.get("unscheduled_activities", []),
+                item_type="unscheduled",
+            )[0]
         updated["updated_transition_count"] = int(validation.get("updated_transition_count") or 0)
         updated["schedule_blocks"] = validation.get("schedule_blocks", updated.get("schedule_blocks", []))
         if validation.get("preview_schedule"):
@@ -244,6 +254,20 @@ class TravelValidationMixin:
         else:
             self._clear_route_preview_metadata(updated)
         self._sync_resolved_locations_to_activities(updated)
+        return_home_conflict = self._return_home_deadline_conflict(updated)
+        if return_home_conflict:
+            updated["travel_validation_status"] = "return_home_deadline_conflict"
+            updated["schedule_status"] = "route_conflict"
+            updated["status"] = "route_conflict"
+            updated.setdefault("route_conflicts", [])
+            updated["route_conflicts"] = list(updated.get("route_conflicts") or []) + [return_home_conflict]
+            updated.setdefault("validation_issues", [])
+            updated["validation_issues"] = list(dict.fromkeys(
+                list(updated.get("validation_issues") or []) + [return_home_conflict["reason"]]
+            ))
+            self._set_return_home_deadline_status(updated, "violated", return_home_conflict.get("required_arrival"))
+        else:
+            self._set_return_home_deadline_status(updated, "satisfied", None)
         if validation.get("warnings"):
             updated["warnings"] = list(updated.get("warnings") or []) + validation["warnings"]
             if updated.get("status") == "ok":
@@ -251,7 +275,9 @@ class TravelValidationMixin:
             if updated.get("schedule_status") == "ok":
                 updated["schedule_status"] = "warning"
 
-        if updated.get("travel_validation_status") == "repair_suggestion_pending":
+        if updated.get("travel_validation_status") == "return_home_deadline_conflict":
+            pass
+        elif updated.get("travel_validation_status") == "repair_suggestion_pending":
             updated["schedule_status"] = "warning"
             updated["status"] = "warning"
             updated.setdefault("validation_issues", [])
@@ -323,6 +349,26 @@ class TravelValidationMixin:
         jlog("TIMER", f"accurate_travel_validation_seconds={time.perf_counter() - validation_started:.2f}", None)
         return updated
 
+    def _set_return_home_deadline_status(
+        self,
+        envelope: Dict[str, Any],
+        status: str,
+        arrival_time: Optional[Any],
+    ) -> None:
+        constraints = envelope.get("schedule_constraints") or (envelope.get("preferences") or {}).get("schedule_constraints") or {}
+        if parse_clock(constraints.get("return_home_deadline")) is None:
+            return
+        constraints["return_home_deadline_status"] = status
+        if arrival_time:
+            constraints["return_home_arrival_time"] = arrival_time
+        envelope["schedule_constraints"] = constraints
+        envelope.setdefault("preferences", {})["schedule_constraints"] = constraints
+        jlog(
+            "RETURN_HOME_DEADLINE",
+            f"status={status} arrival_time={arrival_time or 'within_deadline'}",
+            None,
+        )
+
     def _clear_route_preview_metadata(self, envelope: Dict[str, Any]) -> None:
         for key in (
             "committed_schedule_blocks",
@@ -333,6 +379,72 @@ class TravelValidationMixin:
             "preview_schedule",
         ):
             envelope.pop(key, None)
+
+    def _return_home_deadline_conflict(self, envelope: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        constraints = (
+            envelope.get("schedule_constraints")
+            or (envelope.get("preferences") or {}).get("schedule_constraints")
+            or {}
+        )
+        deadline = parse_clock(constraints.get("return_home_deadline"))
+        if deadline is None:
+            return None
+        activity_blocks = [
+            block for block in envelope.get("schedule_blocks") or []
+            if (block.get("block_type") or block.get("type")) == "activity"
+            and block.get("end")
+        ]
+        if not activity_blocks:
+            return None
+        last = max(activity_blocks, key=lambda block: parse_clock(block.get("end")) or 0)
+        last_end = parse_clock(last.get("end"))
+        if last_end is None:
+            return None
+        location_text = clean_title(
+            " ".join(
+                str(value or "")
+                for value in (
+                    last.get("location_label"),
+                    last.get("location"),
+                    last.get("location_category"),
+                    last.get("title"),
+                )
+            )
+        )
+        if "home" in location_text:
+            required_arrival = last_end
+            travel_minutes = 0
+        else:
+            preferences = envelope.get("preferences") or {}
+            home = (
+                preferences.get("home_location")
+                or preferences.get("default_home_location")
+                or preferences.get("default_start_location")
+                or {}
+            )
+            home_label = (
+                home.get("label")
+                or home.get("display_name")
+                or home.get("address")
+                if isinstance(home, dict)
+                else None
+            ) or "home"
+            travel_minutes = estimate_travel_minutes(last.get("location") or last.get("location_label") or last.get("title"), home_label)
+            required_arrival = last_end + travel_minutes
+        if required_arrival <= deadline:
+            return None
+        return {
+            "reason_code": "return_home_deadline_conflict",
+            "type": "return_home_deadline_conflict",
+            "from_activity": last.get("title"),
+            "deadline": format_clock(deadline),
+            "required_arrival": format_clock(required_arrival),
+            "required_travel": travel_minutes,
+            "reason": (
+                f"Return-home deadline missed: after {last.get('title')}, arriving home would be "
+                f"about {format_clock(required_arrival)}, later than {format_clock(deadline)}."
+            ),
+        }
 
     def _bind_preview_to_repair_suggestions(
         self,
@@ -778,6 +890,15 @@ class TravelValidationMixin:
             repaired=repaired,
             route_context=route_context,
         )
+        backfill_result = self._post_repair_flexible_backfill(
+            original=envelope,
+            repaired=repaired,
+            validation=validation,
+            route_context=route_context,
+        )
+        if backfill_result:
+            repaired = backfill_result["repaired"]
+            validation = backfill_result["validation"]
         repaired_preferences = deepcopy(repaired.get("preferences") or {})
         repaired_preferences.pop("_route_context", None)
         repaired_preferences.pop("route_aware_repair", None)
@@ -814,8 +935,10 @@ class TravelValidationMixin:
         unfit = self._filter_items_not_scheduled_in_repair(unfit, repaired)
         blocked = self._filter_items_not_scheduled_in_repair(blocked, repaired)
         optional_skipped = self._filter_items_not_scheduled_in_repair(optional_skipped, repaired)
+        unfit = self._preserve_existing_unfit_activities(envelope, repaired, unfit)
+        accounting_source = self._original_repair_accounting_records(envelope, active)
         accounting = self._account_for_route_repair_activities(
-            active,
+            accounting_source,
             repaired,
             unfit,
             optional_skipped,
@@ -871,6 +994,538 @@ class TravelValidationMixin:
             "repaired_validation": validation,
             "start_route_summary": validation.get("start_route_summary"),
         }
+
+    def _preserve_existing_unfit_activities(
+        self,
+        envelope: Dict[str, Any],
+        repaired: Dict[str, Any],
+        unfit: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        preserved, duplicate_keys = self._dedupe_route_repair_items(unfit or [], item_type="unfit")
+        existing_keys = {self._route_repair_activity_key(item) for item in preserved}
+        scheduled_keys = set()
+        for item in (repaired.get("activities") or []) + (repaired.get("schedule_blocks") or []):
+            if isinstance(item, dict):
+                key = self._route_repair_activity_key(item)
+                if key:
+                    scheduled_keys.add(key)
+        for item in (envelope.get("unfit_activities") or []) + (envelope.get("unscheduled_activities") or []):
+            if not isinstance(item, dict):
+                continue
+            key = self._route_repair_activity_key(item)
+            if not key or key in scheduled_keys:
+                continue
+            if key in existing_keys:
+                duplicate_keys.append(key)
+                jlog(
+                    "UNFIT",
+                    f"title={item.get('title')} reason=duplicate_existing_unfit",
+                    "MERGE",
+                )
+                jlog(
+                    "UNFIT",
+                    f"title={item.get('title')} source=envelope deduped=true",
+                    "PRESERVE",
+                )
+                preserved = self._merge_route_repair_item(preserved, item, key)
+                continue
+            preserved.append(deepcopy(item))
+            existing_keys.add(key)
+            jlog("UNFIT", f"title={item.get('title')} source=envelope", "PRESERVE")
+        return self._dedupe_route_repair_items(preserved, item_type="unfit")[0]
+
+    def _original_repair_accounting_records(
+        self,
+        envelope: Dict[str, Any],
+        active: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        records: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for collection in (
+            envelope.get("activities") or [],
+            active or [],
+            envelope.get("unfit_activities") or [],
+            envelope.get("unscheduled_activities") or [],
+        ):
+            for item in collection or []:
+                if not isinstance(item, dict):
+                    continue
+                if self._route_repair_item_is_schedule_constraint(item):
+                    continue
+                if not self._is_activity_entry(item):
+                    continue
+                if self._is_generic_system_activity_payload(item):
+                    continue
+                if str(item.get("status") or "active") != "active":
+                    continue
+                key = self._route_repair_activity_key(item)
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                records.append(item)
+        return records
+
+    def _post_repair_flexible_backfill(
+        self,
+        *,
+        original: Dict[str, Any],
+        repaired: Dict[str, Any],
+        validation: Dict[str, Any],
+        route_context: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        if not repaired.get("activities") or not validation.get("schedule_blocks"):
+            jlog("MODULE_D", "reason=missing_repaired_chronology", "BACKFILL][SKIP")
+            return None
+        if self._blocking_route_conflicts(validation.get("route_conflicts", [])):
+            jlog("MODULE_D", "reason=blocking_route_conflicts", "BACKFILL][SKIP")
+            return None
+
+        current = deepcopy(repaired)
+        current_validation = deepcopy(validation)
+        current_travel_total = self._route_sequence_total_minutes(current, route_context)
+        applied: List[Dict[str, Any]] = []
+        moved_activity_ids: set[str] = set()
+
+        for _ in range(5):
+            move = self._best_post_repair_backfill_move(
+                current=current,
+                original=original,
+                validation=current_validation,
+                route_context=route_context,
+                current_travel_total=current_travel_total,
+                moved_activity_ids=moved_activity_ids,
+            )
+            if not move:
+                break
+
+            candidate = self._apply_backfill_move(current, move, route_context)
+            candidate_validation = self._final_validate_route_aware_repair(
+                original=original,
+                repaired=candidate,
+                route_context=route_context,
+            )
+            blocking = self._blocking_route_conflicts(candidate_validation.get("route_conflicts", []))
+            candidate_travel_total = self._route_sequence_total_minutes(candidate, route_context)
+            if blocking:
+                jlog(
+                    "MODULE_D",
+                    f"candidate={move['title']} reason=validation_failed conflicts={len(blocking)}",
+                    "BACKFILL][SKIP",
+                )
+                self._mark_backfill_rejected(current, move)
+                continue
+            if candidate_travel_total > current_travel_total:
+                jlog(
+                    "MODULE_D",
+                    (
+                        f"candidate={move['title']} reason=travel_worse "
+                        f"before={current_travel_total} after={candidate_travel_total}"
+                    ),
+                    "BACKFILL][SKIP",
+                )
+                self._mark_backfill_rejected(current, move)
+                continue
+
+            jlog(
+                "MODULE_D",
+                (
+                    f"moved={move['title']} from={format_clock(move['from_start'])}-"
+                    f"{format_clock(move['from_end'])} to={format_clock(move['to_start'])}-"
+                    f"{format_clock(move['to_end'])} score_delta={move['score_delta']:.2f}"
+                ),
+                "BACKFILL][APPLY",
+            )
+            applied.append(move)
+            moved_activity_ids.add(str(move.get("activity_id") or ""))
+            current = candidate
+            current_validation = candidate_validation
+            current_travel_total = candidate_travel_total
+
+        if not applied:
+            jlog("MODULE_D", "reason=no_valid_improvement", "BACKFILL][SKIP")
+            return None
+        jlog("MODULE_D", f"moved={len(applied)}", "BACKFILL][STOP")
+        current.setdefault("route_repair_actions", [])
+        for move in applied:
+            current["route_repair_actions"].append({
+                "type": "move_activity",
+                "title": move.get("title"),
+                "activity_id": move.get("activity_id"),
+                "from": format_clock(move["from_start"]),
+                "from_end": format_clock(move["from_end"]),
+                "to": format_clock(move["to_start"]),
+                "to_end": format_clock(move["to_end"]),
+                "reason": "Backfilled into an earlier route-safe free slot after accurate travel repair.",
+            })
+        return {"repaired": current, "validation": current_validation}
+
+    def _best_post_repair_backfill_move(
+        self,
+        *,
+        current: Dict[str, Any],
+        original: Dict[str, Any],
+        validation: Dict[str, Any],
+        route_context: Dict[str, Any],
+        current_travel_total: int,
+        moved_activity_ids: Optional[set[str]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        free_slots = self._post_repair_large_free_slots(validation.get("schedule_blocks", []))
+        if not free_slots:
+            jlog("MODULE_D", "reason=no_large_free_slots", "BACKFILL][SKIP")
+            return None
+        activities = [
+            item for item in current.get("activities") or []
+            if self._activity_can_auto_move_for_route_repair(item)
+            and self._backfill_activity_is_late_or_misplaced(item)
+        ]
+        if not activities:
+            jlog("MODULE_D", "reason=no_late_flexible_candidates", "BACKFILL][SKIP")
+            return None
+
+        best: Optional[Dict[str, Any]] = None
+        for activity in activities:
+            activity_id = str(activity.get("stable_activity_id") or activity.get("id") or "")
+            if activity_id and activity_id in (moved_activity_ids or set()):
+                jlog(
+                    "MODULE_D",
+                    f"candidate={activity.get('title')} reason=already_moved_this_pass",
+                    "BACKFILL][SKIP",
+                )
+                continue
+            for slot in free_slots:
+                move = self._backfill_move_for_slot(current, activity, slot, route_context)
+                if not move:
+                    continue
+                if move["to_start"] >= move["from_start"]:
+                    jlog(
+                        "MODULE_D",
+                        (
+                            f"candidate={move['title']} from={format_clock(move['from_start'])} "
+                            f"to={format_clock(move['to_start'])} reason=not_earlier_backfill"
+                        ),
+                        "BACKFILL][REJECT",
+                    )
+                    continue
+                candidate = self._apply_backfill_move(current, move, route_context)
+                candidate_travel_total = self._route_sequence_total_minutes(candidate, route_context)
+                if candidate_travel_total > current_travel_total:
+                    jlog(
+                        "MODULE_D",
+                        (
+                            f"candidate={move['title']} from={format_clock(move['from_start'])} "
+                            f"to={format_clock(move['to_start'])} score_delta={move['score_delta']:.2f} "
+                            f"reason=travel_worse"
+                        ),
+                        "BACKFILL][SKIP",
+                    )
+                    continue
+                jlog(
+                    "MODULE_D",
+                    (
+                        f"candidate={move['title']} from={format_clock(move['from_start'])} "
+                        f"to={format_clock(move['to_start'])} score_delta={move['score_delta']:.2f}"
+                    ),
+                    "BACKFILL",
+                )
+                if move["score_delta"] <= 0:
+                    continue
+                if best is None or move["score_delta"] > best["score_delta"]:
+                    best = move
+        return best
+
+    def _post_repair_large_free_slots(self, blocks: List[Dict[str, Any]]) -> List[Dict[str, int]]:
+        slots: List[Dict[str, int]] = []
+        for block in blocks or []:
+            if block.get("display_only") or block.get("is_route_conflict"):
+                continue
+            block_type = clean_title(block.get("block_type") or block.get("type") or "")
+            if block_type not in {"idle", "free", "free_time"} and clean_title(block.get("title") or "") != "free time":
+                continue
+            start, end = self._block_time_bounds(block)
+            if start is None or end is None:
+                continue
+            duration = end - start
+            if duration < 45:
+                continue
+            priority = 30 if start < 10 * 60 else (15 if start < 14 * 60 else 0)
+            slots.append({"start": start, "end": end, "duration": duration, "priority": priority})
+        return sorted(slots, key=lambda slot: (0 if slot["start"] < 10 * 60 else 1, slot["start"]))
+
+    def _backfill_activity_is_late_or_misplaced(self, item: Dict[str, Any]) -> bool:
+        start, end = self._activity_time_bounds(item)
+        if start is None or end is None:
+            return False
+        title = clean_title(item.get("title") or "")
+        category = clean_title(item.get("location_category") or "")
+        errand_hint = any(token in title for token in ("laundry", "grocery", "supermarket", "errand", "shopping", "gift"))
+        errand_hint = errand_hint or category in {"supermarket", "laundry", "retail", "shop", "store"}
+        preferred_start = item.get("preferred_window_start")
+        preferred_end = item.get("preferred_window_end")
+        outside_preferred = (
+            preferred_start is not None and start < int(preferred_start)
+        ) or (
+            preferred_end is not None and end > int(preferred_end)
+        )
+        return bool(errand_hint or start >= 19 * 60 or outside_preferred)
+
+    def _backfill_move_for_slot(
+        self,
+        current: Dict[str, Any],
+        activity: Dict[str, Any],
+        slot: Dict[str, int],
+        route_context: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        start, end = self._activity_time_bounds(activity)
+        if start is None or end is None:
+            return None
+        duration = int(activity.get("duration_minutes") or (end - start) or DEFAULT_DURATION)
+        if duration <= 0 or duration > slot["duration"]:
+            return None
+        rejected = set(activity.get("_backfill_rejected_slots") or [])
+        rejected_key = f"{slot['start']}-{slot['end']}"
+        if rejected_key in rejected:
+            return None
+
+        other_activities = [
+            item for item in current.get("activities") or []
+            if self._route_repair_activity_key(item) != self._route_repair_activity_key(activity)
+        ]
+        physical_order = sorted(
+            [
+                item for item in other_activities
+                if self._block_requires_travel_coordinate(item)
+            ],
+            key=lambda item: self._activity_time_bounds(item)[0] or 0,
+        )
+        previous_physical = None
+        next_physical = None
+        for item in physical_order:
+            item_start, item_end = self._activity_time_bounds(item)
+            if item_end is not None and item_end <= slot["start"]:
+                previous_physical = item
+            elif item_start is not None and item_start >= slot["end"] and next_physical is None:
+                next_physical = item
+
+        earliest = slot["start"]
+        latest = slot["end"] - duration
+        if self._block_requires_travel_coordinate(activity):
+            if previous_physical:
+                previous_end = self._activity_time_bounds(previous_physical)[1]
+                travel = self._route_minutes_between(previous_physical, activity, route_context)
+                if previous_end is not None:
+                    earliest = max(earliest, previous_end + DEFAULT_PREP_BUFFER + travel)
+            else:
+                start_route = (route_context.get("start_routes") or {}).get(self._route_context_activity_key(activity))
+                if start_route:
+                    day_start = parse_clock((current.get("preferences") or {}).get("day_start") or (current.get("preferences") or {}).get("day_start_time") or "") or DEFAULT_DAY_START
+                    earliest = max(earliest, day_start + int(start_route.get("duration_minutes") or 0))
+            if next_physical:
+                next_start = self._activity_time_bounds(next_physical)[0]
+                travel = self._route_minutes_between(activity, next_physical, route_context)
+                if next_start is not None:
+                    latest = min(latest, next_start - DEFAULT_PREP_BUFFER - travel - duration)
+
+        target_start = earliest
+        target_end = target_start + duration
+        if target_start >= start:
+            jlog(
+                "MODULE_D",
+                (
+                    f"candidate={activity.get('title')} from={format_clock(start)} "
+                    f"to={format_clock(target_start)} reason=not_earlier_backfill"
+                ),
+                "BACKFILL][REJECT",
+            )
+            return None
+        if target_start > latest or target_end > slot["end"]:
+            return None
+        if not self._backfill_respects_time_constraints(activity, target_start, target_end):
+            return None
+        if self._backfill_overlaps_other_activity(current.get("activities") or [], activity, target_start, target_end):
+            return None
+
+        score_delta = self._backfill_score_delta(activity, slot, start, end, target_start, target_end)
+        return {
+            "activity_id": activity.get("stable_activity_id") or activity.get("id"),
+            "title": activity.get("title") or "Activity",
+            "from_start": start,
+            "from_end": end,
+            "to_start": target_start,
+            "to_end": target_end,
+            "slot_key": rejected_key,
+            "score_delta": score_delta,
+        }
+
+    def _backfill_respects_time_constraints(self, item: Dict[str, Any], start: int, end: int) -> bool:
+        earliest = item.get("earliest_start")
+        latest = item.get("latest_end")
+        if earliest is not None and start < int(earliest):
+            return False
+        if latest is not None and end > int(latest):
+            return False
+        preferred_start = item.get("preferred_window_start")
+        preferred_end = item.get("preferred_window_end")
+        if preferred_start is not None and start < int(preferred_start):
+            return False
+        if preferred_end is not None and end > int(preferred_end):
+            if self._is_lunch_or_meal_activity(item):
+                jlog(
+                    "MEAL_WINDOW",
+                    f"title={item.get('title')} reason=worsens_lunch_window alternative_exists=true",
+                    "REJECT_MOVE",
+                )
+            return False
+        return True
+
+    def _is_lunch_or_meal_activity(self, item: Dict[str, Any]) -> bool:
+        title = clean_title(item.get("title") or "")
+        window = clean_title(item.get("preferred_time_window") or "")
+        category = clean_title(item.get("location_category") or "")
+        return bool(window == "lunch" or "lunch" in title or category in {"meal_place", "restaurant"})
+
+    def _meal_late_threshold(self, item: Dict[str, Any]) -> Optional[int]:
+        if not self._is_lunch_or_meal_activity(item):
+            return None
+        title = clean_title(item.get("title") or "")
+        window = clean_title(item.get("preferred_time_window") or "")
+        if window == "lunch" or "lunch" in title:
+            return 14 * 60
+        return None
+
+    def _backfill_overlaps_other_activity(
+        self,
+        activities: List[Dict[str, Any]],
+        target: Dict[str, Any],
+        start: int,
+        end: int,
+    ) -> bool:
+        target_key = self._route_repair_activity_key(target)
+        for item in activities or []:
+            if self._route_repair_activity_key(item) == target_key:
+                continue
+            other_start, other_end = self._activity_time_bounds(item)
+            if other_start is None or other_end is None:
+                continue
+            if start < other_end and end > other_start:
+                return True
+        return False
+
+    def _backfill_score_delta(
+        self,
+        item: Dict[str, Any],
+        slot: Dict[str, int],
+        old_start: int,
+        old_end: int,
+        new_start: int,
+        new_end: int,
+    ) -> float:
+        title = clean_title(item.get("title") or "")
+        category = clean_title(item.get("location_category") or "")
+        score = float(max(0, old_start - new_start) / 15.0)
+        if old_start >= 19 * 60 and new_start < 18 * 60:
+            score += 35
+        if any(token in title for token in ("laundry", "grocery", "supermarket", "errand", "shopping", "gift")):
+            score += 25
+        if category in {"supermarket", "laundry", "retail", "shop", "store"}:
+            score += 15
+        score += float(slot.get("priority") or 0)
+        preferred_start = item.get("preferred_window_start")
+        preferred_end = item.get("preferred_window_end")
+        if preferred_start is not None and preferred_end is not None:
+            old_outside = old_start < int(preferred_start) or old_end > int(preferred_end)
+            new_inside = new_start >= int(preferred_start) and new_end <= int(preferred_end)
+            if old_outside and new_inside:
+                score += 30
+        return score
+
+    def _apply_backfill_move(
+        self,
+        current: Dict[str, Any],
+        move: Dict[str, Any],
+        route_context: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        candidate = deepcopy(current)
+        moved_key = str(move.get("activity_id") or "")
+        updated_activities: List[Dict[str, Any]] = []
+        for item in candidate.get("activities") or []:
+            key = str(item.get("stable_activity_id") or item.get("id") or "")
+            if key == moved_key:
+                updated = deepcopy(item)
+                updated["scheduled_start"] = move["to_start"]
+                updated["scheduled_end"] = move["to_end"]
+                updated["startTime"] = format_clock(move["to_start"])
+                updated["endTime"] = format_clock(move["to_end"])
+                updated.setdefault("trace", [])
+                updated["trace"].append("Backfilled into an earlier route-safe free slot after accurate travel repair.")
+                updated_activities.append(updated)
+            else:
+                updated_activities.append(item)
+        candidate["activities"] = sorted(updated_activities, key=lambda item: self._activity_time_bounds(item)[0] or 0)
+        preferences = candidate.get("preferences") or {}
+        materialize_preferences = deepcopy(preferences)
+        materialize_preferences["_route_context"] = route_context
+        candidate["preferences"] = materialize_preferences
+        day_start = parse_clock(materialize_preferences.get("day_start") or materialize_preferences.get("day_start_time") or "") or DEFAULT_DAY_START
+        candidate["schedule_blocks"] = self._materialize_blocks(
+            candidate["activities"],
+            day_start,
+            int(materialize_preferences.get("min_travel_buffer_minutes") or 0),
+        )
+        return candidate
+
+    def _mark_backfill_rejected(self, current: Dict[str, Any], move: Dict[str, Any]) -> None:
+        activity_id = str(move.get("activity_id") or "")
+        for item in current.get("activities") or []:
+            if str(item.get("stable_activity_id") or item.get("id") or "") != activity_id:
+                continue
+            rejected = set(item.get("_backfill_rejected_slots") or [])
+            rejected.add(str(move.get("slot_key") or ""))
+            item["_backfill_rejected_slots"] = sorted(value for value in rejected if value)
+
+    def _activity_time_bounds(self, item: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
+        start = item.get("scheduled_start")
+        end = item.get("scheduled_end")
+        if start is None:
+            start = parse_clock(item.get("start") or item.get("startTime") or "")
+        if end is None:
+            end = parse_clock(item.get("end") or item.get("endTime") or "")
+        if start is None:
+            return None, None
+        if end is None:
+            end = int(start) + int(item.get("duration_minutes") or DEFAULT_DURATION)
+        return int(start), int(end)
+
+    def _route_minutes_between(
+        self,
+        left: Dict[str, Any],
+        right: Dict[str, Any],
+        route_context: Dict[str, Any],
+    ) -> int:
+        if not left or not right:
+            return 0
+        entry = (route_context.get("pairs") or {}).get(self._route_context_pair_key(left, right))
+        if entry:
+            return int(entry.get("duration_minutes") or 0)
+        if clean_title(left.get("location") or "") == clean_title(right.get("location") or ""):
+            return 0
+        return int(estimate_travel_minutes(left.get("location"), right.get("location")) or 0)
+
+    def _route_sequence_total_minutes(self, envelope: Dict[str, Any], route_context: Dict[str, Any]) -> int:
+        activities = sorted(
+            [
+                item for item in envelope.get("activities") or []
+                if self._block_requires_travel_coordinate(item)
+            ],
+            key=lambda item: self._activity_time_bounds(item)[0] or 0,
+        )
+        total = 0
+        if activities:
+            first_entry = (route_context.get("start_routes") or {}).get(self._route_context_activity_key(activities[0]))
+            if first_entry:
+                total += int(first_entry.get("duration_minutes") or 0)
+        for left, right in zip(activities, activities[1:]):
+            total += self._route_minutes_between(left, right, route_context)
+        return total
 
     def _log_route_repair_actions(self, actions: List[Dict[str, Any]]) -> None:
         if not actions:
@@ -1585,13 +2240,79 @@ class TravelValidationMixin:
         return unfit
 
     def _route_repair_activity_key(self, item: Dict[str, Any]) -> str:
-        return str(
+        key = (
             item.get("stable_activity_id")
             or item.get("activity_id")
+            or item.get("original_operation_id")
             or item.get("id")
-            or clean_title(item.get("title") or "")
-            or ""
         )
+        if key:
+            return str(key).strip()
+        title = clean_title(item.get("title") or "")
+        duration = item.get("duration_minutes") or item.get("duration")
+        index = item.get("original_request_index") or item.get("operation_index") or item.get("sequence_index")
+        if title:
+            return f"title:{title}|duration:{duration or ''}|index:{index if index is not None else ''}"
+        return ""
+
+    def _dedupe_route_repair_items(
+        self,
+        items: List[Dict[str, Any]],
+        *,
+        item_type: str,
+    ) -> Tuple[List[Dict[str, Any]], List[str]]:
+        deduped: List[Dict[str, Any]] = []
+        index_by_key: Dict[str, int] = {}
+        duplicate_keys: List[str] = []
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            key = self._route_repair_activity_key(item)
+            if not key:
+                deduped.append(deepcopy(item))
+                continue
+            if key in index_by_key:
+                duplicate_keys.append(key)
+                existing = deduped[index_by_key[key]]
+                deduped[index_by_key[key]] = self._merged_route_repair_item(existing, item)
+                jlog(
+                    "UNFIT" if item_type == "unfit" else "ACCOUNTING",
+                    f"title={item.get('title') or existing.get('title')} reason=duplicate_existing_{item_type}",
+                    "MERGE",
+                )
+                continue
+            index_by_key[key] = len(deduped)
+            deduped.append(deepcopy(item))
+        return deduped, duplicate_keys
+
+    def _merge_route_repair_item(
+        self,
+        items: List[Dict[str, Any]],
+        incoming: Dict[str, Any],
+        key: str,
+    ) -> List[Dict[str, Any]]:
+        merged: List[Dict[str, Any]] = []
+        replaced = False
+        for item in items or []:
+            if self._route_repair_activity_key(item) == key:
+                merged.append(self._merged_route_repair_item(item, incoming))
+                replaced = True
+            else:
+                merged.append(item)
+        if not replaced:
+            merged.append(deepcopy(incoming))
+        return merged
+
+    def _merged_route_repair_item(self, existing: Dict[str, Any], incoming: Dict[str, Any]) -> Dict[str, Any]:
+        merged = deepcopy(existing)
+        for key, value in (incoming or {}).items():
+            if value is None or value == "" or value == []:
+                continue
+            if key in {"reason", "reason_code", "blocking_constraint", "suggested_resolution", "duration_minutes", "title"}:
+                merged[key] = deepcopy(value)
+            else:
+                merged.setdefault(key, deepcopy(value))
+        return merged
 
     def _route_repair_item_is_optional(self, item: Dict[str, Any]) -> bool:
         if item.get("optional_reason"):
@@ -1659,6 +2380,7 @@ class TravelValidationMixin:
         unfit_activities: List[Dict[str, Any]],
         optional_skipped: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
+        original_records, original_duplicate_keys = self._unique_route_repair_original_records(original_active)
         scheduled_keys: set[str] = set()
         for item in repaired.get("activities") or []:
             if not isinstance(item, dict):
@@ -1673,15 +2395,13 @@ class TravelValidationMixin:
             if key:
                 scheduled_keys.add(key)
 
-        unfit_keys = {self._route_repair_activity_key(item) for item in unfit_activities or []}
-        optional_keys = {self._route_repair_activity_key(item) for item in optional_skipped or []}
-        updated_unfit = list(unfit_activities or [])
-        updated_optional = list(optional_skipped or [])
+        updated_unfit, unfit_duplicate_keys = self._dedupe_route_repair_items(unfit_activities or [], item_type="unfit")
+        updated_optional, optional_duplicate_keys = self._dedupe_route_repair_items(optional_skipped or [], item_type="optional_skipped")
+        unfit_keys = {self._route_repair_activity_key(item) for item in updated_unfit or []}
+        optional_keys = {self._route_repair_activity_key(item) for item in updated_optional or []}
         missing_after: List[str] = []
 
-        for item in original_active or []:
-            if item.get("status") not in {None, "active"}:
-                continue
+        for item in original_records:
             key = self._route_repair_activity_key(item)
             if not key:
                 continue
@@ -1706,10 +2426,17 @@ class TravelValidationMixin:
                 unfit_keys.add(key)
 
         accounted_keys = scheduled_keys | unfit_keys | optional_keys
-        for item in original_active or []:
+        original_keys = {self._route_repair_activity_key(item) for item in original_records if self._route_repair_activity_key(item)}
+        for item in original_records:
             key = self._route_repair_activity_key(item)
             if key and key not in accounted_keys:
                 missing_after.append(key)
+        duplicate_keys = list(dict.fromkeys(original_duplicate_keys + unfit_duplicate_keys + optional_duplicate_keys))
+        duplicate_titles = self._route_repair_duplicate_titles(
+            duplicate_keys,
+            list(original_records) + list(updated_unfit or []) + list(updated_optional or []),
+        )
+        missing_titles = self._route_repair_duplicate_titles(missing_after, original_records)
 
         jlog(
             "TRAVEL_REPAIR",
@@ -1719,11 +2446,74 @@ class TravelValidationMixin:
             ),
             "ACCOUNTING",
         )
+        invariant_ok = len((scheduled_keys | unfit_keys | optional_keys) & original_keys) == len(original_keys)
+        accounting_section = "WARNING" if missing_after or duplicate_keys or not invariant_ok else "OK"
+        jlog(
+            "ACCOUNTING",
+            (
+                f"original={len(original_keys)} "
+                f"scheduled={len(scheduled_keys & original_keys)} unfit={len(unfit_keys & original_keys)} "
+                f"optional_skipped={len(optional_keys & original_keys)} explicitly_removed=0 "
+                f"missing={missing_after} duplicates={duplicate_keys}"
+            ),
+            accounting_section,
+        )
+        if accounting_section == "WARNING":
+            jlog(
+                "ACCOUNTING",
+                f"missing_titles={missing_titles} duplicate_titles={duplicate_titles}",
+                "DETAIL",
+            )
         return {
             "unfit_activities": updated_unfit,
             "optional_skipped": updated_optional,
             "missing_after_accounting": missing_after,
+            "duplicate_after_accounting": duplicate_keys,
         }
+
+    def _unique_route_repair_original_records(self, original_active: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[str]]:
+        records: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        duplicates: List[str] = []
+        for item in original_active or []:
+            if not isinstance(item, dict):
+                continue
+            if self._route_repair_item_is_schedule_constraint(item):
+                continue
+            if item.get("status") not in {None, "active"}:
+                continue
+            key = self._route_repair_activity_key(item)
+            if not key:
+                continue
+            if key in seen:
+                duplicates.append(key)
+                continue
+            seen.add(key)
+            records.append(item)
+        return records, duplicates
+
+    def _route_repair_duplicate_titles(self, keys: List[str], records: List[Dict[str, Any]]) -> List[str]:
+        if not keys:
+            return []
+        wanted = set(keys)
+        titles: List[str] = []
+        for record in records or []:
+            if self._route_repair_activity_key(record) in wanted:
+                title = record.get("title")
+                if title:
+                    titles.append(str(title))
+        return list(dict.fromkeys(titles))
+
+    def _route_repair_item_is_schedule_constraint(self, item: Dict[str, Any]) -> bool:
+        constraint_type = clean_title(
+            item.get("semantic_constraint_type")
+            or item.get("constraint_type")
+            or item.get("schedule_constraint_type")
+            or ""
+        )
+        if constraint_type in {"return_home_deadline", "must_arrive_home_by", "home_deadline"}:
+            return True
+        return bool(item.get("is_schedule_constraint"))
 
     def _blocked_activities_for_fixed_route_conflict(
         self,
@@ -2168,6 +2958,24 @@ class TravelValidationMixin:
                         f"Accurate travel from {previous_physical.get('title')} "
                         f"requires {int(entry.get('duration_minutes') or 0)} minutes"
                     )
+            late_threshold = self._meal_late_threshold(candidate)
+            if late_threshold is not None:
+                candidate_start = int(candidate.get("_repair_start") or 0)
+                if candidate_start <= late_threshold:
+                    jlog(
+                        "MEAL_WINDOW",
+                        f"title={candidate.get('title')} start={format_clock(candidate_start)} status=within_window",
+                        None,
+                    )
+                else:
+                    jlog(
+                        "MEAL_WINDOW",
+                        (
+                            f"title={candidate.get('title')} start={format_clock(candidate_start)} "
+                            "reason=no_feasible_alternative"
+                        ),
+                        "LATE_ALLOWED",
+                    )
             actions.append({
                 "type": "move_activity",
                 "title": original_record.get("title"),
@@ -2178,6 +2986,14 @@ class TravelValidationMixin:
                 "to_end": format_clock(candidate.get("_repair_end") or 0),
                 "reason": reason,
             })
+            jlog(
+                "TRAVEL_REPAIR",
+                (
+                    f"title={original_record.get('title')} from={format_clock(original_record.get('_repair_start') or 0)} "
+                    f"to={format_clock(candidate.get('_repair_start') or 0)} reason={reason}"
+                ),
+                "MOVE",
+            )
         return actions
 
     def _find_active_activity_for_repair_confirmation(
@@ -2825,6 +3641,30 @@ class TravelValidationMixin:
             block_type = block.get("block_type") or block.get("type")
             if block_type and block_type != "activity":
                 continue
+            needs_flexible_route_context = self._location_flexible_block_needs_route_context(blocks, index, envelope)
+            if needs_flexible_route_context:
+                jlog(
+                    "LOCATION_REQUEST",
+                    f"title={block.get('title')} reason=location_flexible_affects_route",
+                    "ASK",
+                )
+                block = deepcopy(block)
+                block["travel_required"] = True
+                block["location_kind"] = "unknown_physical"
+                block["location_category"] = "unknown"
+                block["location_status"] = "needs_resolution"
+                block["location_resolution_status"] = "needs_coordinates"
+                block["location_policy"] = "location_flexible"
+            elif self._block_has_no_location_policy(block):
+                title = block.get("title")
+                if title:
+                    skipped_not_required.append(str(title))
+                    jlog(
+                        "LOCATION_REQUEST",
+                        f"title={title} reason=no_location_required_no_route_impact",
+                        "SKIP",
+                    )
+                continue
             if not self._block_requires_travel_coordinate(block):
                 title = block.get("title")
                 if title:
@@ -2884,6 +3724,89 @@ class TravelValidationMixin:
             "SUMMARY",
         )
         return requests
+
+    def _block_has_no_location_policy(self, block: Dict[str, Any]) -> bool:
+        policy = clean_title(block.get("location_policy") or "").replace(" ", "_").replace("-", "_")
+        if policy == "no_location_required":
+            return True
+        kind = clean_title(block.get("location_kind") or "").replace(" ", "_").replace("-", "_")
+        category = clean_title(block.get("location_category") or "")
+        status = clean_title(block.get("location_resolution_status") or block.get("location_status") or "")
+        return bool(
+            kind in {"no_location_required", "online"}
+            or category in {"home_or_online", "no_location", "none"}
+            or status in {"not_required", "no_location_required"}
+        )
+
+    def _location_flexible_block_needs_route_context(
+        self,
+        blocks: List[Dict[str, Any]],
+        index: int,
+        envelope: Dict[str, Any],
+    ) -> bool:
+        if index < 0 or index >= len(blocks):
+            return False
+        block = blocks[index]
+        if not bool(block.get("location_flexible")):
+            return False
+        if not bool(block.get("travel_context_required")):
+            return False
+        if block.get("timing_mode") == TimingMode.FIXED or block.get("fixed_start") is not None:
+            return False
+        if self._operation_has_coordinates(block):
+            return False
+        preferences = envelope.get("preferences") or {}
+        if not bool(
+            envelope.get("accurate_travel_time")
+            or preferences.get("accurate_travel_time")
+            or envelope.get("travel_intent")
+            or preferences.get("travel_intent")
+        ):
+            return False
+        return bool(
+            self._nearest_route_context_activity(blocks, index, -1)
+            or self._nearest_route_context_activity(blocks, index, 1)
+        )
+
+    def _nearest_route_context_activity(
+        self,
+        blocks: List[Dict[str, Any]],
+        index: int,
+        direction: int,
+    ) -> Optional[Dict[str, Any]]:
+        pos = index + direction
+        while 0 <= pos < len(blocks):
+            candidate = blocks[pos]
+            block_type = candidate.get("block_type") or candidate.get("type")
+            if not block_type or block_type == "activity":
+                if self._block_is_physical_route_context(candidate):
+                    return candidate
+            pos += direction
+        return None
+
+    def _block_is_physical_route_context(self, block: Dict[str, Any]) -> bool:
+        if self._location_flexible_selected_endpoint_requires_route(block):
+            return True
+        if self._embedded_activity_coordinate(block):
+            return True
+        raw_travel_required = block.get("travel_required")
+        if raw_travel_required is False:
+            return False
+        if isinstance(raw_travel_required, str) and raw_travel_required.strip().lower() in {"0", "false", "no", "off"}:
+            return False
+        category = clean_title(block.get("location_category") or "")
+        status = clean_title(block.get("location_status") or "")
+        kind = clean_title(block.get("location_kind") or "").replace(" ", "_").replace("-", "_")
+        semantic_status = clean_title(block.get("location_resolution_status") or "").replace(" ", "_").replace("-", "_")
+        if category in {"home_or_online", "none", "no_location"}:
+            return False
+        if status in {"not_required", "no_location_required"}:
+            return False
+        if kind in {"no_location_required", "online"}:
+            return False
+        if semantic_status in {"not_required", "no_location_required"}:
+            return False
+        return bool(raw_travel_required is True or block.get("location") or block.get("location_label") or category)
 
     def _start_location_resolution_request(self, preferences: Dict[str, Any]) -> Dict[str, Any]:
         configured = self._configured_start_location(preferences) or {}
@@ -3009,6 +3932,8 @@ class TravelValidationMixin:
         return True
 
     def _block_requires_travel_coordinate(self, block: Dict[str, Any]) -> bool:
+        if self._location_flexible_selected_endpoint_requires_route(block):
+            return True
         status = clean_title(block.get("location_status") or "")
         semantic_status = clean_title(block.get("location_resolution_status") or "").replace(" ", "_").replace("-", "_")
         location_kind = clean_title(block.get("location_kind") or "").replace(" ", "_").replace("-", "_")
@@ -3023,6 +3948,31 @@ class TravelValidationMixin:
         if location_kind in {"no_location_required", "online"}:
             return False
         if category in {"home_or_online", "none", "no_location"}:
+            return False
+        return True
+
+    def _location_flexible_selected_endpoint_requires_route(self, block: Dict[str, Any]) -> bool:
+        if not bool(block.get("location_flexible") and block.get("travel_context_required")):
+            return False
+        resolved = block.get("resolved_location")
+        if not isinstance(resolved, dict):
+            return False
+        if not self._coordinate_from_payload(resolved):
+            return False
+        label_text = clean_title(
+            " ".join(
+                str(value or "")
+                for value in (
+                    block.get("location_label"),
+                    block.get("location"),
+                    resolved.get("label"),
+                    resolved.get("display_name"),
+                    resolved.get("category"),
+                    block.get("location_category"),
+                )
+            )
+        )
+        if re.search(r"\b(home|current location|current place|starting point|start location|default start)\b", label_text):
             return False
         return True
 

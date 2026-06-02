@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import time
 from copy import deepcopy
@@ -34,10 +35,413 @@ class LocationNormalizerMixin:
             transcription,
             saved_locations or [],
         )
+        normalized = self._normalize_semantic_constraints(normalized, request_text)
         self._log_location_and_timing_summary(
             list(normalized.get("operations") or []) + list(normalized.get("activities") or [])
         )
         return normalized
+
+    def _normalize_semantic_constraints(
+        self,
+        parsed: Dict[str, Any],
+        source_text: str,
+    ) -> Dict[str, Any]:
+        updated = deepcopy(parsed)
+        operations = list(updated.get("operations") or [])
+        activities = list(updated.get("activities") or [])
+        scopes = self._build_activity_location_scopes(operations, source_text or "")
+        activity_scopes = self._build_activity_location_scopes(activities, source_text or "")
+        constraints = deepcopy(updated.get("schedule_constraints") or {})
+        preferences = deepcopy(updated.get("preferences") or {})
+        overwrite_timing = self._semantic_normalizer_overwrite_enabled()
+        validation_issues = list(updated.get("validation_issues") or [])
+        normalized_operations: List[Dict[str, Any]] = []
+        normalized_activities: List[Dict[str, Any]] = []
+
+        if self._low_fatigue_preference_detected(source_text):
+            preferences["low_fatigue_preference"] = True
+            preferences["travel_intent"] = True
+
+        for index, operation in enumerate(operations):
+            if not isinstance(operation, dict):
+                continue
+            if clean_title(operation.get("op") or "") in {"remove", "shift_plan_date"}:
+                normalized_operations.append(operation)
+                continue
+
+            scoped = operation.get("source_clause") or scopes.get(index) or operation.get("notes") or ""
+            semantic_operation = self._normalize_operation_semantic_constraints(
+                operation,
+                str(scoped),
+                source_text or "",
+                constraints,
+                overwrite_timing=overwrite_timing,
+                validation_issues=validation_issues,
+            )
+            if semantic_operation is None:
+                continue
+            normalized_operations.append(semantic_operation)
+
+        for index, activity in enumerate(activities):
+            if not isinstance(activity, dict):
+                continue
+            scoped = activity.get("source_clause") or activity_scopes.get(index) or activity.get("notes") or ""
+            semantic_activity = self._normalize_operation_semantic_constraints(
+                activity,
+                str(scoped),
+                source_text or "",
+                constraints,
+                overwrite_timing=overwrite_timing,
+                validation_issues=validation_issues,
+            )
+            if semantic_activity is None:
+                continue
+            normalized_activities.append(semantic_activity)
+
+        updated["operations"] = normalized_operations
+        updated["activities"] = normalized_activities
+        updated["preferences"] = preferences
+        if validation_issues:
+            updated["validation_issues"] = list(dict.fromkeys(validation_issues))
+        if constraints:
+            updated["schedule_constraints"] = constraints
+            preferences["schedule_constraints"] = constraints
+        return updated
+
+    def _semantic_normalizer_overwrite_enabled(self) -> bool:
+        use_flag = os.getenv("USE_SEMANTIC_NORMALIZER", "").strip().lower()
+        if use_flag in {"0", "false", "no", "off"}:
+            return False
+        mode = os.getenv("SEMANTIC_NORMALIZER_MODE", "validate_only").strip().lower()
+        return mode in {"overwrite", "legacy", "full"}
+
+    def _normalize_operation_semantic_constraints(
+        self,
+        operation: Dict[str, Any],
+        scoped_evidence: str,
+        source_text: str,
+        constraints: Dict[str, Any],
+        *,
+        overwrite_timing: bool,
+        validation_issues: Optional[List[str]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        updated = deepcopy(operation)
+        title = str(updated.get("title") or updated.get("target_title") or "").strip()
+        title_clean = clean_title(title)
+        evidence = " ".join(
+            str(value or "")
+            for value in (
+                scoped_evidence,
+                updated.get("source_clause"),
+                updated.get("notes"),
+            )
+        ).strip()
+        operation_evidence = evidence or source_text or ""
+        clean_evidence = clean_title(operation_evidence)
+        dropoff_evidence = clean_title(
+            " ".join(part for part in (operation_evidence, source_text if "drop" in title_clean else "") if part)
+        )
+        pickup_evidence = clean_title(
+            " ".join(part for part in (operation_evidence, source_text if re.search(r"\b(?:pick|pickup)\b", title_clean) else "") if part)
+        )
+        self._semantic_validate_only_diagnostics(
+            title=title,
+            operation=updated,
+            evidence=operation_evidence,
+            overwrite_timing=overwrite_timing,
+            validation_issues=validation_issues,
+        )
+
+        if self._return_home_deadline_supported(title_clean, clean_evidence):
+            deadline = self._semantic_time_from_evidence(
+                operation_evidence,
+                updated,
+                prefer_end=True,
+            )
+            if deadline is not None:
+                constraints["return_home_deadline"] = deadline
+                constraints["return_home_deadline_status"] = "pending"
+                constraints.setdefault("deadline_constraints", []).append({
+                    "constraint_type": "return_home_deadline",
+                    "target": "home",
+                    "deadline": deadline,
+                    "source_title": title,
+                    "source_evidence": self._short_evidence(evidence or source_text),
+                })
+                jlog(
+                    "SCHEDULE_CONSTRAINT",
+                    f"return_home_deadline={format_clock(deadline)} source=\"{self._short_evidence(operation_evidence)}\"",
+                    None,
+                )
+                jlog(
+                    "SEMANTIC_CONSTRAINT",
+                    f"title={title} type=return_home_deadline deadline={format_clock(deadline)} evidence=\"{self._short_evidence(operation_evidence)}\"",
+                    None,
+                )
+                return None
+
+        if self._dropoff_deadline_supported(title_clean, dropoff_evidence):
+            deadline = self._semantic_time_from_evidence(
+                operation_evidence if re.search(r"\b(?:by|before|be\s+there\s+by)\s+\d{1,2}", clean_evidence) else source_text,
+                updated,
+                prefer_end=True,
+            )
+            if deadline is not None:
+                self._apply_default_service_duration(updated, operation_evidence)
+                updated["service_kind"] = "dropoff"
+                updated["semantic_constraint_type"] = "dropoff"
+                updated["arrive_by"] = deadline
+                updated["latest_end"] = deadline
+                updated["preferred_end"] = deadline
+                updated["timing_mode"] = TimingMode.WINDOW
+                updated.pop("fixed_start", None)
+                updated.pop("fixed_end", None)
+                updated["is_user_fixed"] = False
+                updated["can_move_for_repair"] = True
+                updated["repair_protection"] = "flexible"
+                updated.setdefault("trace", []).append("Semantic deadline: drop-off service must finish by the requested time.")
+                jlog(
+                    "SEMANTIC_DEADLINE",
+                    f"title={title} type=arrive_by deadline={format_clock(deadline)}",
+                    None,
+                )
+                jlog(
+                    "SEMANTIC_CONSTRAINT",
+                    f"title={title} type=dropoff arrive_by={format_clock(deadline)} duration={updated.get('duration_minutes')} evidence=\"{self._short_evidence(operation_evidence)}\"",
+                    None,
+                )
+                return updated
+
+        if overwrite_timing and self._pickup_fixed_supported(title_clean, pickup_evidence):
+            fixed_start = self._semantic_time_from_evidence(
+                operation_evidence if re.search(r"\b(?:at|from)\s+\d{1,2}", clean_evidence) else source_text,
+                updated,
+                prefer_start=True,
+            )
+            if fixed_start is not None:
+                self._apply_default_service_duration(updated, operation_evidence)
+                duration = int(updated.get("duration_minutes") or 15)
+                updated["service_kind"] = "pickup"
+                updated["semantic_constraint_type"] = "exact_anchor"
+                updated["timing_mode"] = TimingMode.FIXED
+                updated["fixed_start"] = fixed_start
+                updated["fixed_end"] = fixed_start + duration
+                updated["is_user_fixed"] = True
+                updated["can_move_for_repair"] = False
+                updated["repair_protection"] = "fixed"
+                updated.setdefault("trace", []).append("Semantic anchor: pickup time is fixed by the request.")
+                jlog(
+                    "SEMANTIC_CONSTRAINT",
+                    f"title={title} type=pickup fixed_start={format_clock(fixed_start)} duration={duration} evidence=\"{self._short_evidence(operation_evidence)}\"",
+                    None,
+                )
+
+        if overwrite_timing and self._exact_anchor_supported(title_clean, clean_evidence, updated):
+            fixed_start = self._semantic_time_from_evidence(
+                operation_evidence,
+                updated,
+                prefer_start=True,
+            )
+            if fixed_start is not None:
+                duration = int(updated.get("duration_minutes") or parse_duration_minutes(updated.get("duration")))
+                updated["semantic_constraint_type"] = updated.get("semantic_constraint_type") or "exact_anchor"
+                updated["timing_mode"] = TimingMode.FIXED
+                updated["fixed_start"] = fixed_start
+                updated["fixed_end"] = fixed_start + duration
+                updated["is_user_fixed"] = True
+                updated["can_move_for_repair"] = False
+                updated["repair_protection"] = "fixed"
+                updated.setdefault("trace", []).append("Semantic anchor: exact time is fixed by the request.")
+                jlog(
+                    "SEMANTIC_CONSTRAINT",
+                    f"title={title} type=exact_anchor fixed_start={format_clock(fixed_start)} evidence=\"{self._short_evidence(operation_evidence)}\"",
+                    None,
+                )
+
+        if self._location_flexible_supported(title_clean, clean_evidence, updated):
+            updated["location_flexible"] = True
+            updated["can_be_done_at_current_location"] = True
+            semantic_text = f"{title_clean} {clean_evidence}"
+            if not updated.get("activity_role"):
+                role = self._semantic_activity_role(semantic_text)
+                if role:
+                    updated["activity_role"] = role
+            if updated.get("activity_role") == "study":
+                updated["travel_context_required"] = True
+            if re.search(r"\b(?:quiet|study|rest|proposal|writing|focused|focus|call)\b", title_clean + " " + clean_evidence):
+                updated["quiet_place_required"] = True
+            if not self._has_explicit_physical_place(updated, clean_evidence):
+                updated["travel_required"] = False
+                updated["location_kind"] = "no_location_required"
+                updated["location_category"] = "home_or_online"
+                updated["location_resolution_status"] = "not_required"
+                updated["location_status"] = "not_required"
+                updated["location"] = None
+                updated["location_label"] = None
+                updated["location_normalized"] = None
+                if overwrite_timing:
+                    updated["semantic_constraint_type"] = updated.get("semantic_constraint_type") or "location_flexible"
+                jlog(
+                    "SEMANTIC_CONSTRAINT",
+                    f"title={title} type=location_flexible evidence=\"{self._short_evidence(operation_evidence)}\"",
+                    None,
+                )
+
+        return updated
+
+    def _semantic_validate_only_diagnostics(
+        self,
+        *,
+        title: str,
+        operation: Dict[str, Any],
+        evidence: str,
+        overwrite_timing: bool,
+        validation_issues: Optional[List[str]],
+    ) -> None:
+        if overwrite_timing:
+            return
+        clean_evidence = clean_title(evidence or "")
+        times = re.findall(r"\b\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b", evidence or "", flags=re.IGNORECASE)
+        activity_markers = re.findall(
+            r"\b(?:lunch|dinner|meeting|appointment|workshop|class|pickup|pick\s+up|drop|dropoff|doctor|gym|grocery|pharmacy)\b",
+            clean_evidence,
+        )
+        if len(times) >= 2 and len(set(activity_markers)) >= 2:
+            kept = (
+                parse_clock(operation.get("fixed_start") or operation.get("fixedStart"))
+                or parse_clock(operation.get("preferred_start") or operation.get("preferredStart"))
+            )
+            kept_text = f" keeping Module A time {format_clock(kept)}" if kept is not None else " keeping Module A timing"
+            message = f"Timing evidence for {title or 'this activity'} was ambiguous;{kept_text}."
+            if validation_issues is not None:
+                validation_issues.append(message)
+            jlog(
+                "SEMANTIC_CONSTRAINT",
+                (
+                    f"reason=broad_multi_time_clause title={title} "
+                    f"times={len(times)} activities={len(set(activity_markers))} evidence=\"{self._short_evidence(evidence)}\""
+                ),
+                "VALIDATE_ONLY",
+            )
+
+    def _apply_default_service_duration(self, operation: Dict[str, Any], evidence: str) -> None:
+        if re.search(r"\b\d+\s*(?:min|mins|minute|minutes|h|hr|hour|hours)\b", evidence or "", flags=re.IGNORECASE):
+            return
+        explicit = any(
+            operation.get(key) not in {None, ""}
+            for key in ("duration_minutes", "durationMinutes", "duration")
+        )
+        if not explicit or int(parse_duration_minutes(operation.get("duration_minutes") or operation.get("duration"), minimum=1)) >= 30:
+            operation["duration_minutes"] = 15
+
+    def _semantic_time_from_evidence(
+        self,
+        evidence: str,
+        operation: Dict[str, Any],
+        *,
+        prefer_start: bool = False,
+        prefer_end: bool = False,
+    ) -> Optional[int]:
+        patterns = []
+        if prefer_end:
+            patterns.extend([
+                r"\b(?:be\s+)?back\s+home\s+by\s+(?P<time>\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\b",
+                r"\b(?:return|get|go|arrive)\s+home\s+by\s+(?P<time>\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\b",
+                r"\bmust\s+be\s+home\s+by\s+(?P<time>\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\b",
+                r"\bbe\s+there\s+by\s+(?P<time>\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\b",
+                r"\b(?:by|before)\s+(?P<time>\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\b",
+            ])
+        if prefer_start:
+            patterns.extend([
+                r"\b(?:at|from)\s+(?P<time>\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\b",
+            ])
+        for pattern in patterns:
+            match = re.search(pattern, evidence or "", flags=re.IGNORECASE)
+            if not match:
+                continue
+            if not re.search(r"\b(?:am|pm)\b", match.group("time"), flags=re.IGNORECASE):
+                operation_time = parse_clock(operation.get("fixed_start") or operation.get("fixedStart") or operation.get("preferred_start") or operation.get("preferredStart"))
+                if operation_time is not None:
+                    return operation_time
+            parsed = parse_clock(match.group("time"))
+            if parsed is not None:
+                return parsed
+        for key in ("fixed_start", "fixedStart", "preferred_start", "preferredStart", "startTime"):
+            parsed = parse_clock(operation.get(key))
+            if parsed is not None:
+                return parsed
+        for key in ("fixed_end", "fixedEnd", "latest_end", "latestEnd", "endTime"):
+            parsed = parse_clock(operation.get(key))
+            if parsed is not None:
+                return parsed
+        return None
+
+    def _dropoff_deadline_supported(self, title_clean: str, evidence_clean: str) -> bool:
+        return bool(
+            re.search(r"\b(?:drop|dropoff|drop\s+off|send|bring)\b", title_clean + " " + evidence_clean)
+            and re.search(r"\b(?:by|before|be\s+there\s+by)\s+\d{1,2}", evidence_clean)
+        )
+
+    def _pickup_fixed_supported(self, title_clean: str, evidence_clean: str) -> bool:
+        return bool(
+            re.search(r"\b(?:pick|pickup|pick\s+up)\b", title_clean + " " + evidence_clean)
+            and re.search(r"\b(?:at|from)\s+\d{1,2}", evidence_clean)
+        )
+
+    def _return_home_deadline_supported(self, title_clean: str, evidence_clean: str) -> bool:
+        return bool(
+            ("return home" in title_clean or "go home" in title_clean or "back home" in title_clean or "home" == title_clean)
+            and re.search(r"\b(?:(?:be\s+)?back\s+home|return\s+home|get\s+home|go\s+home|arrive\s+home|must\s+be\s+home|home)\s+by\s+\d{1,2}", evidence_clean)
+        )
+
+    def _exact_anchor_supported(
+        self,
+        title_clean: str,
+        evidence_clean: str,
+        operation: Dict[str, Any],
+    ) -> bool:
+        if re.search(r"\b(?:flexible|around|preferably|if\s+possible|sometime)\b", evidence_clean):
+            return False
+        exact_time = re.search(r"\b(?:at|from)\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b", evidence_clean)
+        fixed_kind = bool(
+            re.search(r"\b(?:birthday|lunch|dinner|meeting|appointment|workshop|class|presentation|reservation|pickup|pick\s+up)\b", title_clean + " " + evidence_clean)
+        )
+        return bool(exact_time and fixed_kind)
+
+    def _location_flexible_supported(
+        self,
+        title_clean: str,
+        evidence_clean: str,
+        operation: Dict[str, Any],
+    ) -> bool:
+        if self._has_explicit_physical_place(operation, evidence_clean):
+            return False
+        return bool(
+            re.search(r"\b(?:study|rest|writing|proposal|admin|laptop|call|phone|focused|deep\s+work)\b", title_clean + " " + evidence_clean)
+        )
+
+    def _semantic_activity_role(self, evidence_clean: str) -> Optional[str]:
+        if re.search(r"\b(?:rest|relax|recharge|nap|break|recover|recovery)\b", evidence_clean):
+            return "recovery"
+        if re.search(r"\b(?:study|revision|homework)\b", evidence_clean):
+            return "study"
+        if re.search(r"\b(?:review|assignment|focused|focus|deep\s+work|writing|proposal|admin|laptop)\b", evidence_clean):
+            return "focus"
+        if re.search(r"\b(?:call|phone)\b", evidence_clean):
+            return "call"
+        return None
+
+    def _has_explicit_physical_place(self, operation: Dict[str, Any], evidence_clean: str) -> bool:
+        if operation.get("explicit_user_location") and self._is_non_home_explicit_text(operation.get("raw_location_text") or operation.get("location")):
+            return True
+        return bool(re.search(r"\b(?:at|in|near)\s+(?:the\s+)?(?:library|campus|office|school|cafe|restaurant|gym|store|supermarket|bank|mall)\b", evidence_clean))
+
+    def _low_fatigue_preference_detected(self, source_text: str) -> bool:
+        return bool(re.search(r"\b(?:practical|not\s+too\s+tiring|less\s+tiring|not\s+rushed|realistic)\b", clean_title(source_text or "")))
+
+    def _short_evidence(self, evidence: str, limit: int = 120) -> str:
+        text = re.sub(r"\s+", " ", evidence or "").strip()
+        return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
     def _log_location_and_timing_summary(
         self,
@@ -333,15 +737,7 @@ class LocationNormalizerMixin:
                 category = self._normalize_semantic_category(generic_explicit.get("category"))
             explicit_user_location = True
 
-        if raw_location_text and self._is_home_location_text(raw_location_text):
-            kind = "home"
-            category = "home"
-            explicit_user_location = True
-        elif raw_location_text and self._is_online_location_text(raw_location_text):
-            kind = "online"
-            category = "home_or_online"
-            explicit_user_location = True
-        elif self._is_non_home_explicit_text(raw_location_text) and kind in {"home", "online", "no_location_required"}:
+        if self._is_non_home_explicit_text(raw_location_text) and kind in {"home", "online", "no_location_required"}:
             ignored_default = kind
             kind = "exact_named_place"
             if category in {"home", "home_or_online", "no_location"}:
@@ -353,7 +749,28 @@ class LocationNormalizerMixin:
                 f"title={title} kept=\"{raw_location_text}\" ignored_default=\"{ignored_default}\"",
                 "PRESERVE_EXPLICIT",
             )
-
+        elif raw_location_text and self._is_home_location_text(raw_location_text):
+            kind = "home"
+            category = "home"
+            explicit_user_location = True
+            jlog(
+                "LOCATION_NORMALIZE",
+                f"title={title} reason=explicit_home_or_module_a_home",
+                "PRESERVE_HOME",
+            )
+        elif kind == "home":
+            category = "home"
+            explicit_user_location = True
+            raw_location_text = raw_location_text or clean_optional_text(updated.get("location")) or "home"
+            jlog(
+                "LOCATION_NORMALIZE",
+                f"title={title} reason=explicit_home_or_module_a_home",
+                "PRESERVE_HOME",
+            )
+        elif raw_location_text and self._is_online_location_text(raw_location_text):
+            kind = "online"
+            category = "home_or_online"
+            explicit_user_location = True
         travel_required = self._semantic_travel_required(updated, category, kind)
         if explicit_user_location and kind == "no_location_required":
             kind = "exact_named_place"
@@ -376,6 +793,20 @@ class LocationNormalizerMixin:
         else:
             label = raw_location_text or clean_optional_text(updated.get("location"))
 
+        if kind == "home":
+            saved_home = self._match_saved_location_for_category("home", saved_locations)
+            if saved_home:
+                updated["resolved_location"] = {
+                    "label": saved_home.get("label") or "home",
+                    "display_name": saved_home.get("display_name") or saved_home.get("label") or "home",
+                    "address": saved_home.get("address") or saved_home.get("display_name") or "home",
+                    "latitude": saved_home.get("latitude"),
+                    "longitude": saved_home.get("longitude"),
+                    "source": saved_home.get("source") or "saved_location",
+                    "confirmed_by_user": bool(saved_home.get("confirmed_by_user", True)),
+                }
+                status = "resolved_coordinates"
+
         has_coordinates = self._operation_has_coordinates(updated)
         legacy_status = self._semantic_legacy_status(status, kind, has_coordinates)
         if kind == "home":
@@ -396,6 +827,7 @@ class LocationNormalizerMixin:
         updated["location_status"] = legacy_status
         updated["explicit_user_location"] = bool(explicit_user_location)
         updated["travel_required"] = bool(travel_required)
+        updated["location_policy"] = self._location_policy_from_semantics(updated)
         if status == "ambiguous":
             updated["needs_clarification"] = True
         if legacy_status in {"needs_resolution", "unresolved"} and label:
@@ -410,6 +842,18 @@ class LocationNormalizerMixin:
             "LOCATION",
         )
         return updated
+
+    def _location_policy_from_semantics(self, operation: Dict[str, Any]) -> str:
+        kind = clean_title(operation.get("location_kind") or "").replace(" ", "_").replace("-", "_")
+        category = clean_title(operation.get("location_category") or "")
+        status = clean_title(operation.get("location_resolution_status") or operation.get("location_status") or "")
+        if bool(operation.get("location_flexible")):
+            return "location_flexible"
+        if kind in {"no_location_required", "online"} or category in {"home_or_online", "no_location", "none"} or status in {"not_required", "no_location_required"}:
+            return "no_location_required"
+        if kind in {"exact_named_place", "home"} or operation.get("explicit_user_location"):
+            return "exact_location_required"
+        return "category_location_required"
 
     def _timing_summary_line(self, title: str, operation: Dict[str, Any]) -> str:
         parts: List[str] = []
@@ -505,6 +949,16 @@ class LocationNormalizerMixin:
 
         has_evidence = False
         if is_home:
+            if (
+                clean_title(operation.get("location_kind") or "") == "home"
+                or clean_title(operation.get("location_category") or "") == "home"
+            ):
+                jlog(
+                    "LOCATION_NORMALIZE",
+                    f"title={operation.get('title')} reason=existing_location_kind_home",
+                    "SKIP_CATEGORY_REINFER",
+                )
+                return operation
             has_evidence = any(word in clause_text for word in ["home", "house", "my place"])
         else:
             # For non-home locations, the LLM might have used synonyms (campus -> school) or resolved shared clauses.

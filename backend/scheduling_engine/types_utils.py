@@ -246,7 +246,9 @@ TRAVEL_INTENT_PATTERN = re.compile(
     r"\bmake\s+it\s+realistic\s+with\s+(?:the\s+)?(?:accurate\s+|actual\s+|real\s+)?(?:travel|route|commute)\b|"
     r"\bkeep\s+enough\s+(?:travel|route|commute)(?:\s+and\s+buffer)?\s+time\b|"
     r"\bleave\s+(?:enough\s+)?(?:travel|route|commute|buffer)(?:\s+and\s+(?:travel|route|commute|buffer))*\s+time\b|"
-    r"\bmake\s+room\s+for\s+(?:travel|route|commute|buffer)\s+time\b",
+    r"\bmake\s+room\s+for\s+(?:travel|route|commute|buffer)\s+time\b|"
+    r"\b(?:drop\s+off|dropoff|pick\s+up|pickup)\b.*\b(?:grocery|shopping|lunch|dinner|birthday|gift|errand)\b|"
+    r"\b(?:practical|not\s+too\s+tiring|less\s+tiring|not\s+rushed)\b",
     re.IGNORECASE
 )
 
@@ -331,6 +333,8 @@ Critical rules:
 def parse_clock(value: Optional[str]) -> Optional[int]:
     if value is None:
         return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return int(value)
     text = str(value).strip()
     if not text:
         return None

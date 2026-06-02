@@ -39,8 +39,17 @@ export type ActivityBlock = {
   location_category?: string;
   location_status?: string;
   location_source?: string;
+  location_policy?: "no_location_required" | "location_flexible" | "exact_location_required" | "category_location_required" | string;
   location_confidence?: number;
   location_warning?: string;
+  location_flexible?: boolean;
+  can_be_done_at_current_location?: boolean;
+  quiet_place_required?: boolean;
+  activity_role?: string;
+  travel_context_required?: boolean;
+  semantic_constraint_type?: string;
+  service_kind?: string;
+  arrive_by?: number | null;
   saved_location_label?: string;
   resolved_location?: {
     label?: string;
@@ -56,6 +65,7 @@ export type ActivityBlock = {
   };
   travel_estimate_source?: "heuristic" | "routing_service" | "fallback" | string;
   travel_validation_status?: string;
+  travel_required?: boolean;
   route_duration_minutes?: number;
   display_label?: string;
   is_start_route?: boolean;
@@ -109,7 +119,9 @@ export type DailySchedule = {
   planning_mode?: "feasibility_first" | "clash_allowed" | string;
   allow_clash?: boolean;
   accurate_travel_time?: boolean;
+  travel_intent?: boolean;
   preferences?: Record<string, unknown>;
+  schedule_constraints?: Record<string, unknown>;
   activities: ActivityBlock[];
   schedule_blocks?: ActivityBlock[];
   committed_schedule_blocks?: ActivityBlock[];
