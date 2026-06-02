@@ -355,7 +355,7 @@ class ModuleCConstructorMixin:
                     })
 
             # B. Activity Block
-            blocks.append({
+            activity_block = {
                 "block_type": "activity",
                 "id": act.get("id"),
                 "stable_activity_id": act.get("stable_activity_id") or act.get("id"),
@@ -414,7 +414,9 @@ class ModuleCConstructorMixin:
                 "is_conflicting": act.get("is_conflict", False),
                 "conflict_ids": list(act.get("conflict_ids") or []),
                 "reason": "Scheduled activity"
-            })
+            }
+            copy_preference_metadata(act, activity_block, overwrite=False)
+            blocks.append(activity_block)
             
             last_end = end_min
             if travel_required:
@@ -542,6 +544,7 @@ class ModuleCConstructorMixin:
         activities: List[Dict[str, Any]],
         preferences: Dict[str, Any],
     ) -> Dict[str, Any]:
+        module_c_started = time.perf_counter()
         self._normalize_day_boundary_preferences(preferences)
         day_start = parse_clock(preferences.get("day_start")) or DEFAULT_DAY_START
         day_end = parse_clock(preferences.get("day_end")) or DEFAULT_DAY_END
@@ -777,7 +780,7 @@ class ModuleCConstructorMixin:
         # FINAL PASS: Materialize
         final_blocks = self._materialize_blocks(timeline, day_start, min_travel)
 
-        return {
+        result = {
             "activities": timeline,
             "schedule_blocks": final_blocks,
             "unscheduled_activities": unscheduled,
@@ -785,6 +788,8 @@ class ModuleCConstructorMixin:
             "day_end": format_clock(day_end),
             **refinement_metadata,
         }
+        jlog("TIMER", f"module_c_greedy_seconds={time.perf_counter() - module_c_started:.2f}", None)
+        return result
 
     def _normalize_day_boundary_preferences(self, preferences: Dict[str, Any]) -> None:
         """Map UI preference names into the fields Module C already consumes."""
@@ -1270,6 +1275,130 @@ class ModuleCConstructorMixin:
             adjustment += 60.0
         return adjustment
 
+    def _route_candidate_practicality_adjustment(
+        self,
+        item: Dict[str, Any],
+        previous_real_item: Optional[Dict[str, Any]],
+        next_real_item: Optional[Dict[str, Any]],
+    ) -> float:
+        """Penalize obvious route zigzags using the already-built route context."""
+        if not self._active_route_context() or not self._activity_requires_travel(item):
+            return 0.0
+        if not previous_real_item or not next_real_item:
+            return 0.0
+        if not self._activity_requires_travel(previous_real_item) or not self._activity_requires_travel(next_real_item):
+            return 0.0
+        if self._route_context_activity_key(item) in {
+            self._route_context_activity_key(previous_real_item),
+            self._route_context_activity_key(next_real_item),
+        }:
+            return 0.0
+        direct = self._transition_minutes(previous_real_item, next_real_item, 0)
+        via = self._transition_minutes(previous_real_item, item, 0) + self._transition_minutes(item, next_real_item, 0)
+        route_delta = max(0, via - direct)
+        if route_delta <= 10:
+            return 0.0
+        previous_fixed = previous_real_item.get("timing_mode") == TimingMode.FIXED or previous_real_item.get("fixed_start") is not None
+        next_fixed = next_real_item.get("timing_mode") == TimingMode.FIXED or next_real_item.get("fixed_start") is not None
+        if previous_fixed or next_fixed:
+            penalty = route_delta * 18.0
+            if route_delta >= 30:
+                jlog(
+                    "ROUTE_GUARD",
+                    (
+                        f"title={item.get('title')} reason=route_zigzag_between_fixed_anchors "
+                        f"route_delta={route_delta}"
+                    ),
+                    "REJECT_GLOBAL_RESCUE",
+                )
+            else:
+                jlog_verbose(
+                    "ROUTE_GUARD",
+                    f"title={item.get('title')} route_delta={route_delta} penalty={round(penalty, 2)}",
+                    "SCORE",
+                )
+            return -penalty
+        return -(route_delta * 4.0)
+
+    def _short_low_weight_flex(self, item: Dict[str, Any]) -> bool:
+        if item.get("timing_mode") == TimingMode.FIXED or item.get("fixed_start") is not None:
+            return False
+        duration = int(item.get("duration_minutes") or DEFAULT_DURATION)
+        priority = clean_title(item.get("priority") or "medium")
+        preference = preference_window_info(item) or {}
+        weight = clean_title(preference.get("weight") or item.get("preference_weight") or "")
+        return bool(
+            duration <= 20
+            and (
+                priority == "low"
+                or weight in {"low", "optional"}
+                or not item.get("is_mandatory", item.get("isMandatory", True))
+                or item.get("optional_reason")
+                or "coffee" in clean_title(item.get("title") or "")
+            )
+        )
+
+    def _optional_route_cost_adjustment(
+        self,
+        item: Dict[str, Any],
+        previous_real_item: Optional[Dict[str, Any]],
+        next_real_item: Optional[Dict[str, Any]],
+    ) -> float:
+        if not self._active_route_context() or not self._short_low_weight_flex(item):
+            return 0.0
+        duration = max(1, int(item.get("duration_minutes") or DEFAULT_DURATION))
+        inbound = self._transition_minutes(previous_real_item, item, 0) if previous_real_item else 0
+        outbound = self._transition_minutes(item, next_real_item, 0) if next_real_item else 0
+        direct = self._transition_minutes(previous_real_item, next_real_item, 0) if previous_real_item and next_real_item else 0
+        detour = max(0, inbound + outbound - direct)
+        jlog(
+            "OPTIONAL_ROUTE_GUARD",
+            (
+                f"title={item.get('title')} prev={(previous_real_item or {}).get('title')} "
+                f"next={(next_real_item or {}).get('title')} prev_next={direct} "
+                f"prev_item={inbound} item_next={outbound} detour={detour}"
+            ),
+            "EVALUATE",
+        )
+        near_anchor = False
+        for neighbor in (previous_real_item, next_real_item):
+            entry = self._route_context_entry(neighbor, item) or self._route_context_entry(item, neighbor)
+            if not entry:
+                continue
+            route_minutes = int(entry.get("duration_minutes") or 0)
+            if entry.get("source") in {"same_location", "near_location"} or route_minutes <= 8:
+                near_anchor = True
+                break
+        if near_anchor or detour <= max(8, duration + 5):
+            jlog(
+                "OPTIONAL_ROUTE_GUARD",
+                f"title={item.get('title')} reason=small_incremental_detour",
+                "ACCEPT",
+            )
+            return 120.0 if near_anchor else 80.0
+        one_sided_route = not previous_real_item or not next_real_item
+        if one_sided_route and detour > max(20, duration + 5):
+            jlog(
+                "OPTIONAL_ROUTE_GUARD",
+                (
+                    f"title={item.get('title')} detour_minutes={detour} duration={duration} "
+                    "reason=low_weight_detour_too_high"
+                ),
+                "REJECT",
+            )
+            return -detour * 8.0
+        if detour > max(20, duration * 2):
+            jlog(
+                "OPTIONAL_ROUTE_GUARD",
+                (
+                    f"title={item.get('title')} detour_minutes={detour} duration={duration} "
+                    "reason=low_weight_detour_too_high"
+                ),
+                "REJECT",
+            )
+            return -detour * 8.0
+        return 0.0
+
     def _mark_soft_anchor_boosts(self, flexible: List[Dict[str, Any]]) -> None:
         referenced_titles = set()
         for item in flexible:
@@ -1446,12 +1575,33 @@ class ModuleCConstructorMixin:
                 after_transition,
             )
             candidate_end = candidate_start + duration
+            if self._short_low_weight_flex(item) and previous_item:
+                jlog(
+                    "CANDIDATE_DEBUG",
+                    (
+                        f"title={item.get('title')} candidate_slot=after {previous_item.get('title')} "
+                        "generated=true"
+                    ),
+                    None,
+                )
 
             # Feasibility Checks
             if candidate_end + after_transition > gap_end:
+                if self._short_low_weight_flex(item) and previous_item:
+                    jlog(
+                        "CANDIDATE_REJECT",
+                        f"title={item.get('title')} slot=after {previous_item.get('title')} reason=insufficient_gap_after_travel",
+                        None,
+                    )
                 continue 
             
             if candidate_end > latest_end_limit:
+                if self._short_low_weight_flex(item) and previous_item:
+                    jlog(
+                        "CANDIDATE_REJECT",
+                        f"title={item.get('title')} slot=after {previous_item.get('title')} reason=latest_end_limit",
+                        None,
+                    )
                 continue 
 
             candidate = deepcopy(item)
@@ -1467,6 +1617,12 @@ class ModuleCConstructorMixin:
             if route_violations:
                 first_violation = route_violations[0]
                 reason = first_violation.get("reason") or "route_infeasible"
+                if self._short_low_weight_flex(item) and previous_item:
+                    jlog(
+                        "CANDIDATE_REJECT",
+                        f"title={item.get('title')} slot=after {previous_item.get('title')} reason={reason}",
+                        None,
+                    )
                 if reason == "start_route_blocker":
                     jlog(
                         "MODULE_C",
@@ -1497,38 +1653,67 @@ class ModuleCConstructorMixin:
             if preferred_start is not None:
                 total_score -= abs(candidate_start - preferred_start) * 1.5
             preferred_window_penalty = 0.0
+            generic_preference = preference_window_deviation(item, candidate_start, candidate_end)
+            generic_info = generic_preference.get("info") or {}
+            if generic_preference.get("hard_violation"):
+                jlog(
+                    "PREF_WINDOW",
+                    (
+                        f"title={item.get('title')} reason=hard_window_violation "
+                        f"window={format_clock(generic_info.get('acceptable_start'))}-{format_clock(generic_info.get('acceptable_end'))}"
+                    ),
+                    "REJECT",
+                )
+                continue
+            if generic_info:
+                jlog_verbose(
+                    "PREF_WINDOW",
+                    (
+                        f"title={item.get('title')} source={generic_info.get('source')} "
+                        f"window={format_clock(generic_info.get('acceptable_start'))}-{format_clock(generic_info.get('acceptable_end'))} "
+                        f"weight={generic_info.get('weight')}"
+                    ),
+                    "DETECT",
+                )
             if preferred_window_start is not None or preferred_window_end is not None:
                 window_start = preferred_window_start if preferred_window_start is not None else day_start
                 window_end = preferred_window_end if preferred_window_end is not None else day_end
                 window_label = clean_title(item.get("preferred_time_window") or "")
                 if candidate_start >= window_start and candidate_end <= window_end:
                     total_score += 160
-                    if window_label in {"evening", "lunch"}:
-                        jlog(
-                            "PREFERRED_WINDOW",
-                            f"title={item.get('title')} window={window_label} start={format_clock(candidate_start)} status=within_window penalty=0",
-                            None,
-                        )
+                    jlog_verbose(
+                        "PREFERRED_WINDOW",
+                        f"title={item.get('title')} window={window_label or 'preferred'} start={format_clock(candidate_start)} status=within_window penalty=0",
+                        None,
+                    )
                 else:
                     penalty_multiplier = 4.0
-                    if window_label == "lunch" and candidate_end > window_end:
-                        penalty_multiplier = 12.0
-                        if candidate_start >= 14 * 60:
-                            penalty_multiplier = 24.0
-                        if candidate_start >= 15 * 60:
-                            penalty_multiplier = 40.0
                     if candidate_start < window_start:
                         preferred_window_penalty += (window_start - candidate_start) * penalty_multiplier
                     if candidate_end > window_end:
                         preferred_window_penalty += (candidate_end - window_end) * penalty_multiplier
-                        if window_label == "lunch":
-                            severity = "very_strong" if candidate_start >= 15 * 60 else ("strong" if candidate_start >= 14 * 60 else "moderate")
-                            jlog(
-                                "MEAL_WINDOW",
-                                f"title={item.get('title')} start={format_clock(candidate_start)} severity={severity}",
-                                "PENALTY",
-                            )
                     total_score -= preferred_window_penalty
+            generic_penalty = float(generic_preference.get("penalty") or 0)
+            if generic_info:
+                jlog_verbose(
+                    "PREF_WINDOW",
+                    (
+                        f"title={item.get('title')} start={format_clock(candidate_start)} "
+                        f"window={format_clock(generic_info.get('acceptable_start'))}-{format_clock(generic_info.get('acceptable_end'))} "
+                        f"deviation={int(generic_preference.get('deviation') or 0)} penalty={round(generic_penalty, 2)}"
+                    ),
+                    "SCORE",
+                )
+                jlog_verbose(
+                    "PREF_WINDOW",
+                    f"title={item.get('title')} affects_total_score=true",
+                    "SCORE_APPLIED",
+                )
+                if not generic_penalty:
+                    weight_bonus = {"hard": 220, "high": 180, "medium": 80, "low": 25}.get(str(generic_info.get("weight")), 60)
+                    total_score += weight_bonus
+            if generic_penalty > preferred_window_penalty:
+                total_score -= generic_penalty - preferred_window_penalty
             order_delta, order_violations = self._preferred_order_score_adjustment(
                 item,
                 timeline,
@@ -1542,6 +1727,16 @@ class ModuleCConstructorMixin:
                 index,
                 candidate_start,
                 candidate_end,
+            )
+            total_score += self._route_candidate_practicality_adjustment(
+                item,
+                previous_real_item,
+                next_real_item,
+            )
+            total_score += self._optional_route_cost_adjustment(
+                item,
+                previous_real_item,
+                next_real_item,
             )
             
             if total_score > best_score:

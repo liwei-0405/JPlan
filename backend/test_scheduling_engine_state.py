@@ -3118,10 +3118,14 @@ def test_busy_workday_semantic_defaults_and_location_requests():
     operations = normalized["operations"]
     lunch = next(item for item in operations if item["title"] == "Lunch")
     bank = next(item for item in operations if item["title"] == "Bank visit")
+    standup = next(item for item in operations if item["title"] == "Team stand-up")
     call = next(item for item in operations if item["title"] == "Follow-up call")
     proposal = next(item for item in operations if item["title"] == "Proposal writing")
     coffee = next(item for item in operations if item["title"] == "Coffee break")
 
+    assert standup["travel_required"] is True
+    assert standup["location_resolution_status"] == "needs_coordinates"
+    assert standup["location"] == "the office"
     assert lunch["preferred_window_start"] == parse_clock("12:00 PM")
     assert lunch["preferred_window_end"] == parse_clock("02:00 PM")
     assert lunch["earliest_start"] == parse_clock("11:00 AM")
@@ -3154,6 +3158,7 @@ def test_busy_workday_semantic_defaults_and_location_requests():
 
     assert parse_clock(lunch_block["startTime"]) >= parse_clock("11:00 AM")
     assert parse_clock(bank_block["startTime"]) >= parse_clock("09:00 AM")
+    assert "Team stand-up" in requested
     assert "Bank visit" in requested
     assert "Grocery shopping" in requested
     assert "Proposal writing" not in requested
@@ -3190,6 +3195,41 @@ def test_proposal_writing_at_physical_place_requests_location():
     assert proposal["travel_required"] is True
     assert proposal["location_resolution_status"] == "needs_coordinates"
     assert proposal["location"] == "library"
+
+
+def test_exact_office_location_overrides_stale_not_required_status():
+    engine = SchedulingEngine(DummyClient(), travel_service=FakeTravelService())
+    request_text = "I have a team stand-up from 8:30 AM to 9:00 AM at the office."
+    parsed = {
+        "intent": "add",
+        "reply": "Draft created.",
+        "transcription": request_text,
+        "date": "2026-08-18",
+        "preferences": {"travel_intent": True},
+        "operations": [
+            {
+                "op": "add",
+                "title": "Team stand-up",
+                "timing_mode": TimingMode.FIXED,
+                "fixed_start": "08:30",
+                "duration_minutes": 30,
+                "location": "the office",
+                "raw_location_text": "the office",
+                "location_kind": "exact_named_place",
+                "location_category": "work",
+                "travel_required": False,
+                "location_resolution_status": "not_required",
+            },
+        ],
+    }
+
+    normalized = engine._normalize_parsed_locations(parsed, request_text)
+    standup = normalized["operations"][0]
+
+    assert standup["travel_required"] is True
+    assert standup["location_resolution_status"] == "needs_coordinates"
+    assert standup["location_status"] == "needs_resolution"
+    assert standup["location"] == "the office"
 
 
 def test_semantic_constraint_normalizer_deadline_pickup_lunch_and_return_home(monkeypatch):
@@ -3682,6 +3722,520 @@ def test_post_repair_backfill_rejects_later_move(capsys):
 
     assert move is None
     assert "reason=not_earlier_backfill" in capsys.readouterr().out
+
+
+def test_preference_rescue_moves_high_weight_window_into_free_slot(capsys):
+    engine = SchedulingEngine(DummyClient(), travel_service=FakeTravelService(route_minutes=5))
+    locations = [
+        {"label": "Home", "display_name": "Home", "latitude": 2.88, "longitude": 101.58},
+        {"label": "Office", "display_name": "Office", "latitude": 2.90, "longitude": 101.60},
+        {"label": "Bank", "display_name": "Bank", "latitude": 2.91, "longitude": 101.61},
+        {"label": "Tamarind", "display_name": "Tamarind", "latitude": 2.92, "longitude": 101.62},
+    ]
+    repaired = {
+        "date": "2026-05-02",
+        "preferences": _accurate_preferences(day_start="07:00", day_end="22:00"),
+        "activities": [
+            {
+                "id": "presentation",
+                "stable_activity_id": "presentation",
+                "title": "Client presentation",
+                "scheduled_start": parse_clock("11:00 AM"),
+                "scheduled_end": parse_clock("12:00 PM"),
+                "duration_minutes": 60,
+                "timing_mode": TimingMode.FIXED,
+                "fixed_start": parse_clock("11:00 AM"),
+                "fixed_end": parse_clock("12:00 PM"),
+                "is_user_fixed": True,
+                "can_move_for_repair": False,
+                "repair_protection": "fixed",
+                "location": "Office",
+                "location_label": "Office",
+                "location_status": "resolved",
+                "resolved_location": locations[1],
+                "travel_required": True,
+                "status": "active",
+            },
+            {
+                "id": "bank",
+                "stable_activity_id": "bank",
+                "title": "Bank visit",
+                "scheduled_start": parse_clock("12:39 PM"),
+                "scheduled_end": parse_clock("01:24 PM"),
+                "duration_minutes": 45,
+                "timing_mode": TimingMode.UNSPECIFIED,
+                "can_move_for_repair": True,
+                "repair_protection": "flexible",
+                "location": "Bank",
+                "location_label": "Bank",
+                "location_status": "resolved",
+                "resolved_location": locations[2],
+                "travel_required": True,
+                "status": "active",
+            },
+            {
+                "id": "lunch",
+                "stable_activity_id": "lunch",
+                "title": "Lunch",
+                "scheduled_start": parse_clock("02:24 PM"),
+                "scheduled_end": parse_clock("03:24 PM"),
+                "duration_minutes": 60,
+                "timing_mode": TimingMode.UNSPECIFIED,
+                "preferred_time_window": "lunch",
+                "preferred_window_start": parse_clock("12:00 PM"),
+                "preferred_window_end": parse_clock("02:00 PM"),
+                "preference_weight": "high",
+                "can_move_for_repair": True,
+                "repair_protection": "flexible",
+                "location": "Tamarind",
+                "location_label": "Tamarind",
+                "location_status": "resolved",
+                "resolved_location": locations[3],
+                "travel_required": True,
+                "status": "active",
+            },
+        ],
+        "schedule_blocks": [
+            {"block_type": "activity", "id": "presentation", "stable_activity_id": "presentation", "title": "Client presentation", "start": "11:00 AM", "end": "12:00 PM", "startTime": "11:00 AM", "endTime": "12:00 PM", "location": "Office", "location_label": "Office", "location_status": "resolved", "resolved_location": locations[1], "travel_required": True, "timing_mode": TimingMode.FIXED, "fixed_start": parse_clock("11:00 AM"), "fixed_end": parse_clock("12:00 PM"), "is_user_fixed": True, "can_move_for_repair": False, "repair_protection": "fixed"},
+            {"block_type": "activity", "id": "bank", "stable_activity_id": "bank", "title": "Bank visit", "start": "12:39 PM", "end": "01:24 PM", "startTime": "12:39 PM", "endTime": "01:24 PM", "duration_minutes": 45, "location": "Bank", "location_label": "Bank", "location_status": "resolved", "resolved_location": locations[2], "travel_required": True, "can_move_for_repair": True, "repair_protection": "flexible"},
+            {"block_type": "idle", "title": "Free Time", "start": "01:24 PM", "end": "02:14 PM", "duration_minutes": 50},
+            {"block_type": "activity", "id": "lunch", "stable_activity_id": "lunch", "title": "Lunch", "start": "02:24 PM", "end": "03:24 PM", "startTime": "02:24 PM", "endTime": "03:24 PM", "duration_minutes": 60, "preferred_time_window": "lunch", "preferred_window_start": parse_clock("12:00 PM"), "preferred_window_end": parse_clock("02:00 PM"), "preference_weight": "high", "location": "Tamarind", "location_label": "Tamarind", "location_status": "resolved", "resolved_location": locations[3], "travel_required": True, "can_move_for_repair": True, "repair_protection": "flexible"},
+        ],
+    }
+    route_context = engine._build_route_context(repaired, repaired["activities"], locations)
+    validation = engine._final_validate_route_aware_repair(
+        original=repaired,
+        repaired=repaired,
+        route_context=route_context,
+    )
+
+    result = engine._post_repair_preference_rescue(
+        original=repaired,
+        repaired=repaired,
+        validation=validation,
+        route_context=route_context,
+    )
+
+    assert result is not None
+    lunch = _activity_by_title(result["repaired"], "Lunch")
+    assert lunch["scheduled_start"] < parse_clock("02:24 PM")
+    assert "PREF_RESCUE][FREE_SLOT_SCAN" in capsys.readouterr().out
+
+
+def test_repair_records_preserve_preference_metadata_from_activities():
+    engine = SchedulingEngine(DummyClient(), travel_service=FakeTravelService(route_minutes=5))
+    envelope = {
+        "activities": [
+            {
+                "id": "lunch",
+                "stable_activity_id": "lunch",
+                "title": "Lunch",
+                "duration_minutes": 60,
+                "scheduled_start": parse_clock("12:00 PM"),
+                "scheduled_end": parse_clock("01:00 PM"),
+                "preferred_time_window": "lunch",
+                "preferred_window_start": parse_clock("12:00 PM"),
+                "preferred_window_end": parse_clock("02:00 PM"),
+                "preference_weight": "high",
+                "status": "active",
+            }
+        ],
+        "schedule_blocks": [
+            {
+                "block_type": "activity",
+                "id": "lunch",
+                "stable_activity_id": "lunch",
+                "title": "Lunch",
+                "start": "02:24 PM",
+                "end": "03:24 PM",
+                "startTime": "02:24 PM",
+                "endTime": "03:24 PM",
+                "duration_minutes": 60,
+            }
+        ],
+    }
+
+    records = engine._activity_records_for_repair(envelope)
+
+    assert len(records) == 1
+    assert records[0]["_repair_start"] == parse_clock("02:24 PM")
+    assert records[0]["preferred_time_window"] == "lunch"
+    assert records[0]["preference_weight"] == "high"
+
+
+def test_preference_rescue_reorders_same_location_lower_priority_blocker(capsys):
+    engine = SchedulingEngine(DummyClient(), travel_service=FakeTravelService(route_minutes=5))
+    locations = [
+        {"label": "Home", "display_name": "Home", "latitude": 2.88, "longitude": 101.58},
+        {"label": "Bank", "display_name": "Bank", "latitude": 2.91, "longitude": 101.61},
+        {"label": "Tamarind", "display_name": "Tamarind", "latitude": 2.92, "longitude": 101.62},
+    ]
+    repaired = {
+        "date": "2026-05-02",
+        "preferences": _accurate_preferences(day_start="07:00", day_end="22:00"),
+        "activities": [
+            {
+                "id": "bank",
+                "stable_activity_id": "bank",
+                "title": "Bank visit",
+                "scheduled_start": parse_clock("12:39 PM"),
+                "scheduled_end": parse_clock("01:24 PM"),
+                "duration_minutes": 45,
+                "timing_mode": TimingMode.UNSPECIFIED,
+                "can_move_for_repair": True,
+                "repair_protection": "flexible",
+                "location": "Bank",
+                "location_label": "Bank",
+                "location_status": "resolved",
+                "resolved_location": locations[1],
+                "travel_required": True,
+                "status": "active",
+            },
+            {
+                "id": "grocery",
+                "stable_activity_id": "grocery",
+                "title": "Grocery shopping",
+                "scheduled_start": parse_clock("01:34 PM"),
+                "scheduled_end": parse_clock("02:19 PM"),
+                "duration_minutes": 45,
+                "timing_mode": TimingMode.UNSPECIFIED,
+                "can_move_for_repair": True,
+                "repair_protection": "flexible",
+                "location": "Tamarind",
+                "location_label": "Tamarind",
+                "location_status": "resolved",
+                "resolved_location": locations[2],
+                "travel_required": True,
+                "status": "active",
+            },
+            {
+                "id": "lunch",
+                "stable_activity_id": "lunch",
+                "title": "Lunch",
+                "scheduled_start": parse_clock("02:24 PM"),
+                "scheduled_end": parse_clock("03:24 PM"),
+                "duration_minutes": 60,
+                "timing_mode": TimingMode.UNSPECIFIED,
+                "preferred_time_window": "lunch",
+                "preferred_window_start": parse_clock("12:00 PM"),
+                "preferred_window_end": parse_clock("02:00 PM"),
+                "preference_weight": "high",
+                "can_move_for_repair": True,
+                "repair_protection": "flexible",
+                "location": "Tamarind",
+                "location_label": "Tamarind",
+                "location_status": "resolved",
+                "resolved_location": locations[2],
+                "travel_required": True,
+                "status": "active",
+            },
+        ],
+    }
+    repaired["schedule_blocks"] = engine._materialize_blocks(repaired["activities"], parse_clock("07:00 AM"), 0)
+    route_context = engine._build_route_context(repaired, repaired["activities"], locations)
+    validation = engine._final_validate_route_aware_repair(
+        original=repaired,
+        repaired=repaired,
+        route_context=route_context,
+    )
+
+    result = engine._post_repair_preference_rescue(
+        original=repaired,
+        repaired=repaired,
+        validation=validation,
+        route_context=route_context,
+    )
+
+    assert result is not None
+    lunch = _activity_by_title(result["repaired"], "Lunch")
+    grocery = _activity_by_title(result["repaired"], "Grocery shopping")
+    assert lunch["scheduled_start"] == parse_clock("01:34 PM")
+    assert grocery["scheduled_start"] == lunch["scheduled_end"]
+    logs = capsys.readouterr().out
+    assert "PREF_RESCUE][BLOCKER_SCAN" in logs
+    assert "PREF_RESCUE][REORDER_CANDIDATE" in logs
+    assert "reason=reorder_same_location_blocker" in logs
+
+
+def test_module_d_score_prefers_high_weight_window_candidate():
+    engine = SchedulingEngine(DummyClient())
+    early = [
+        {
+            "id": "lunch",
+            "stable_activity_id": "lunch",
+            "title": "Lunch",
+            "scheduled_start": parse_clock("12:30 PM"),
+            "scheduled_end": parse_clock("01:30 PM"),
+            "duration_minutes": 60,
+            "timing_mode": TimingMode.UNSPECIFIED,
+            "preferred_time_window": "lunch",
+            "preferred_window_start": parse_clock("12:00 PM"),
+            "preferred_window_end": parse_clock("02:00 PM"),
+            "preference_weight": "high",
+            "can_move_for_repair": True,
+            "repair_protection": "flexible",
+            "status": "active",
+        }
+    ]
+    late = [dict(early[0], scheduled_start=parse_clock("02:24 PM"), scheduled_end=parse_clock("03:24 PM"))]
+
+    assert engine._module_d_score(early, [], parse_clock("07:00 AM"), parse_clock("10:00 PM"), 0) > engine._module_d_score(
+        late,
+        [],
+        parse_clock("07:00 AM"),
+        parse_clock("10:00 PM"),
+        0,
+    )
+
+
+def test_route_guard_penalizes_flex_zigzag_between_fixed_anchors():
+    engine = SchedulingEngine(DummyClient())
+    standup = {
+        "id": "standup",
+        "stable_activity_id": "standup",
+        "title": "Team stand-up",
+        "timing_mode": TimingMode.FIXED,
+        "fixed_start": parse_clock("08:30 AM"),
+        "scheduled_start": parse_clock("08:30 AM"),
+        "scheduled_end": parse_clock("09:00 AM"),
+        "location": "TRX",
+        "travel_required": True,
+    }
+    bank = {
+        "id": "bank",
+        "stable_activity_id": "bank",
+        "title": "Bank visit",
+        "timing_mode": TimingMode.UNSPECIFIED,
+        "scheduled_start": parse_clock("09:30 AM"),
+        "scheduled_end": parse_clock("10:00 AM"),
+        "location": "Cyberjaya",
+        "travel_required": True,
+    }
+    client = {
+        "id": "client",
+        "stable_activity_id": "client",
+        "title": "Client presentation",
+        "timing_mode": TimingMode.FIXED,
+        "fixed_start": parse_clock("11:00 AM"),
+        "scheduled_start": parse_clock("11:00 AM"),
+        "scheduled_end": parse_clock("12:00 PM"),
+        "location": "Bangsar",
+        "travel_required": True,
+    }
+    engine._current_route_context = {
+        "enabled": True,
+        "pairs": {
+            "standup->client": {"duration_minutes": 18},
+            "standup->bank": {"duration_minutes": 37},
+            "bank->client": {"duration_minutes": 35},
+        },
+    }
+
+    assert engine._route_candidate_practicality_adjustment(bank, standup, client) < -400
+
+
+def test_travel_validation_logs_perf_summary(capsys):
+    engine = SchedulingEngine(DummyClient(), travel_service=FakeTravelService())
+    envelope = {"preferences": {}, "schedule_blocks": [], "activities": []}
+
+    engine._apply_accurate_travel_if_requested(envelope, [])
+
+    logs = capsys.readouterr().out
+    assert "[JPLAN][TIMER] route_matrix_seconds=" in logs
+    assert "[JPLAN][TIMER] route_fetch_seconds=" in logs
+    assert "[JPLAN][PERF][ROUTE_API_CALLS] count=" in logs
+    assert "[JPLAN][PERF][ROUTE_CACHE] hits=" in logs
+
+
+def test_route_context_uses_near_location_shortcut_without_route_api(capsys):
+    service = FakeTravelService(route_minutes=42)
+    engine = SchedulingEngine(DummyClient(), travel_service=service)
+    standup = {
+        "id": "standup",
+        "stable_activity_id": "standup",
+        "title": "Team stand-up",
+        "location": "TRX Project Office",
+        "location_label": "TRX Project Office",
+        "location_kind": "exact_named_place",
+        "location_status": "resolved",
+        "travel_required": True,
+        "resolved_location": {"display_name": "TRX Project Office", "latitude": 3.142, "longitude": 101.721},
+        "status": "active",
+    }
+    coffee = {
+        "id": "coffee",
+        "stable_activity_id": "coffee",
+        "title": "Coffee break",
+        "location": "Tun Razak Exchange",
+        "location_label": "Tun Razak Exchange",
+        "location_kind": "exact_named_place",
+        "location_status": "resolved",
+        "travel_required": True,
+        "resolved_location": {"display_name": "Tun Razak Exchange", "latitude": 3.1423, "longitude": 101.7212},
+        "status": "active",
+    }
+
+    context = engine._build_route_context({"preferences": {}}, [standup, coffee], [])
+
+    pair = context["pairs"]["id:standup->id:coffee"]
+    assert pair["source"] == "near_location"
+    assert pair["duration_minutes"] in {3, 5}
+    assert len(context["physical_nodes"]) == 1
+    assert service.route_calls == 0
+    assert "NEAR_LOCATION_GROUP" in capsys.readouterr().out
+
+
+def test_route_context_dedupes_physical_nodes_and_expands_activity_pairs():
+    service = FakeTravelService(route_minutes=17)
+    engine = SchedulingEngine(DummyClient(), travel_service=service)
+    lunch = {
+        "id": "lunch",
+        "stable_activity_id": "lunch",
+        "title": "Lunch",
+        "location": "Tamarind",
+        "location_label": "Tamarind",
+        "location_status": "resolved",
+        "travel_required": True,
+        "resolved_location": {"display_name": "Tamarind", "latitude": 3.1, "longitude": 101.6},
+        "status": "active",
+    }
+    grocery = {
+        "id": "grocery",
+        "stable_activity_id": "grocery",
+        "title": "Grocery shopping",
+        "location": "Tamarind",
+        "location_label": "Tamarind",
+        "location_status": "resolved",
+        "travel_required": True,
+        "resolved_location": {"display_name": "Tamarind", "latitude": 3.1, "longitude": 101.6},
+        "status": "active",
+    }
+    client = {
+        "id": "client",
+        "stable_activity_id": "client",
+        "title": "Client presentation",
+        "location": "Bangsar",
+        "location_label": "Bangsar",
+        "location_status": "resolved",
+        "travel_required": True,
+        "resolved_location": {"display_name": "Bangsar", "latitude": 3.13, "longitude": 101.67},
+        "status": "active",
+    }
+
+    context = engine._build_route_context({"preferences": {}}, [lunch, grocery, client], [])
+
+    assert len(context["physical_nodes"]) == 2
+    assert service.route_calls == 2
+    assert context["pairs"]["id:lunch->id:grocery"]["source"] == "same_location"
+    assert context["pairs"]["id:grocery->id:client"]["duration_minutes"] == 17
+    assert context["pairs"]["id:lunch->id:client"]["duration_minutes"] == 17
+
+
+def test_optional_route_guard_keeps_short_flex_near_anchor_and_penalizes_detour():
+    engine = SchedulingEngine(DummyClient())
+    standup = {
+        "id": "standup",
+        "stable_activity_id": "standup",
+        "title": "Team stand-up",
+        "timing_mode": TimingMode.FIXED,
+        "scheduled_start": parse_clock("08:30 AM"),
+        "scheduled_end": parse_clock("09:00 AM"),
+        "location": "TRX Project Office",
+        "travel_required": True,
+    }
+    coffee = {
+        "id": "coffee",
+        "stable_activity_id": "coffee",
+        "title": "Coffee break",
+        "duration_minutes": 15,
+        "priority": "low",
+        "preference_weight": "low",
+        "location": "TRX",
+        "travel_required": True,
+    }
+    client = {
+        "id": "client",
+        "stable_activity_id": "client",
+        "title": "Client presentation",
+        "scheduled_start": parse_clock("11:00 AM"),
+        "scheduled_end": parse_clock("12:00 PM"),
+        "location": "Bangsar",
+        "travel_required": True,
+    }
+    engine._current_route_context = {
+        "enabled": True,
+        "pairs": {
+            "id:standup->id:coffee": {"duration_minutes": 3, "source": "near_location"},
+            "id:coffee->id:client": {"duration_minutes": 13, "source": "routing_service"},
+            "id:standup->id:client": {"duration_minutes": 13, "source": "routing_service"},
+            "id:client->id:coffee": {"duration_minutes": 38, "source": "routing_service"},
+        },
+    }
+
+    assert engine._optional_route_cost_adjustment(coffee, standup, client) > 0
+    engine._current_route_context = {
+        "enabled": True,
+        "pairs": {
+            "id:standup->id:coffee": {"duration_minutes": 6, "source": "route_cache"},
+            "id:coffee->id:client": {"duration_minutes": 23, "source": "route_cache"},
+            "id:standup->id:client": {"duration_minutes": 18, "source": "route_cache"},
+        },
+    }
+    assert engine._optional_route_cost_adjustment(coffee, standup, client) > 0
+    assert engine._optional_route_cost_adjustment(coffee, client, None) < 0
+
+
+def test_module_d_route_total_guard_rejects_low_weight_total_travel_increase():
+    engine = SchedulingEngine(DummyClient())
+    coffee = {
+        "id": "coffee",
+        "stable_activity_id": "coffee",
+        "title": "Coffee break",
+        "duration_minutes": 15,
+        "priority": "low",
+        "preference_weight": "low",
+        "travel_required": True,
+    }
+    engine._current_route_context = {"enabled": True, "pairs": {}}
+
+    rejected, reason = engine._module_d_route_total_guard_reject(
+        {"type": "relocate", "activity_id": "coffee", "title": "Coffee break"},
+        [coffee],
+        route_delta=25,
+    )
+
+    assert rejected is True
+    assert reason == "low_weight_total_route_worse"
+    assert engine._module_d_route_total_guard_reject(
+        {"type": "relocate", "activity_id": "coffee", "title": "Coffee break"},
+        [coffee],
+        route_delta=5,
+    ) == (False, "")
+
+
+def test_in_window_lunch_does_not_log_violation_allowed(capsys):
+    engine = SchedulingEngine(DummyClient())
+    repaired = {
+        "activities": [
+            {
+                "id": "lunch",
+                "stable_activity_id": "lunch",
+                "title": "Lunch",
+                "scheduled_start": parse_clock("01:19 PM"),
+                "scheduled_end": parse_clock("02:19 PM"),
+                "duration_minutes": 60,
+                "preferred_time_window": "lunch",
+                "preferred_window_start": parse_clock("12:00 PM"),
+                "preferred_window_end": parse_clock("02:00 PM"),
+                "preference_weight": "high",
+            }
+        ],
+        "preference_rescue_attempts": {},
+    }
+
+    engine._log_preference_window_violations(repaired)
+
+    assert "VIOLATION_ALLOWED" not in capsys.readouterr().out
 
 
 def test_return_home_deadline_conflict_is_enforced_after_travel_validation():

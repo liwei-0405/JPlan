@@ -196,6 +196,13 @@ class TravelService:
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key or os.getenv("OPENROUTESERVICE_API_KEY") or os.getenv("ORS_API_KEY")
         self.route_cache: Dict[Tuple[float, float, float, float, str, Optional[str]], int] = {}
+        self.route_stats: Dict[str, Any] = {
+            "route_api_calls": 0,
+            "route_cache_hits": 0,
+            "route_cache_misses": 0,
+            "route_fetch_seconds": 0.0,
+            "geocode_seconds": 0.0,
+        }
         self.geocode_memory_cache: Dict[Tuple[str, str, Optional[str], Optional[str]], List[Dict[str, Any]]] = {}
         self.nominatim_cache: Dict[Tuple[str, Optional[str], Optional[str]], List[Dict[str, Any]]] = {}
         self.enable_nominatim_fallback = _env_bool("ENABLE_NOMINATIM_FALLBACK", True)
@@ -211,6 +218,18 @@ class TravelService:
 
     def has_api_key(self) -> bool:
         return bool(_clean(self.api_key))
+
+    def reset_stats(self) -> None:
+        self.route_stats = {
+            "route_api_calls": 0,
+            "route_cache_hits": 0,
+            "route_cache_misses": 0,
+            "route_fetch_seconds": 0.0,
+            "geocode_seconds": 0.0,
+        }
+
+    def stats_snapshot(self) -> Dict[str, Any]:
+        return dict(self.route_stats)
 
     def expand_alias(self, label: str, category: Optional[str] = None) -> str:
         clean = _clean_key(label)
@@ -296,6 +315,7 @@ class TravelService:
         category: Optional[str] = None,
         limit: int = 5,
     ) -> Dict[str, Any]:
+        started = time.perf_counter()
         limit = max(1, min(limit, 5))
         country_hint = _cache_country_hint(query)
         category_hint = _cache_category_hint(category)
@@ -345,14 +365,19 @@ class TravelService:
         else:
             status = "fallback_unavailable"
 
-        return {
-            "candidates": merged,
-            "geocode_status": status,
-            "providers_used": providers_used,
-            "warnings": warnings,
-            "warning": warnings[0] if warnings else None,
-            "primary_error": str(ors_error) if ors_error else None,
-        }
+        try:
+            return {
+                "candidates": merged,
+                "geocode_status": status,
+                "providers_used": providers_used,
+                "warnings": warnings,
+                "warning": warnings[0] if warnings else None,
+                "primary_error": str(ors_error) if ors_error else None,
+            }
+        finally:
+            self.route_stats["geocode_seconds"] = float(self.route_stats.get("geocode_seconds") or 0.0) + (
+                time.perf_counter() - started
+            )
 
     def _cache_get(
         self,
@@ -582,7 +607,9 @@ class TravelService:
             time_bucket,
         )
         if key in self.route_cache:
+            self.route_stats["route_cache_hits"] = int(self.route_stats.get("route_cache_hits") or 0) + 1
             return self.route_cache[key]
+        self.route_stats["route_cache_misses"] = int(self.route_stats.get("route_cache_misses") or 0) + 1
 
         body = {
             "coordinates": [
@@ -591,12 +618,19 @@ class TravelService:
             ],
             "instructions": False,
         }
-        response = requests.post(
-            f"{ORS_BASE_URL}/v2/directions/{transport_mode}/geojson",
-            headers={"Authorization": self.api_key, "Content-Type": "application/json"},
-            json=body,
-            timeout=15,
-        )
+        fetch_started = time.perf_counter()
+        self.route_stats["route_api_calls"] = int(self.route_stats.get("route_api_calls") or 0) + 1
+        try:
+            response = requests.post(
+                f"{ORS_BASE_URL}/v2/directions/{transport_mode}/geojson",
+                headers={"Authorization": self.api_key, "Content-Type": "application/json"},
+                json=body,
+                timeout=15,
+            )
+        finally:
+            self.route_stats["route_fetch_seconds"] = float(self.route_stats.get("route_fetch_seconds") or 0.0) + (
+                time.perf_counter() - fetch_started
+            )
         response.raise_for_status()
         payload = response.json()
         duration_seconds = None

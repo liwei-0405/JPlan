@@ -1,6 +1,7 @@
 import os
 import re
-from typing import Any, Optional
+from copy import deepcopy
+from typing import Any, Dict, Optional, Tuple
 
 from jplan_logging import jlog
 
@@ -226,6 +227,169 @@ PREFERRED_TIME_WINDOWS = {
     "night": (20 * 60, DEFAULT_DAY_END),
     "not_too_late": (DEFAULT_DAY_START, 20 * 60),
 }
+
+PREFERENCE_WEIGHT_MULTIPLIERS = {
+    "hard": 100000.0,
+    "high": 18.0,
+    "medium": 5.0,
+    "low": 1.5,
+}
+
+PREFERENCE_METADATA_FIELDS = (
+    "preferred_time_window",
+    "preferred_window_start",
+    "preferred_window_end",
+    "earliest_preferred_start",
+    "latest_preferred_end",
+    "ideal_start",
+    "ideal_end",
+    "ideal_start_range",
+    "acceptable_start",
+    "acceptable_end",
+    "acceptable_start_range",
+    "preference_weight",
+    "preference_priority",
+    "preference_type",
+    "is_hard_window",
+    "is_soft_window",
+    "activity_role",
+    "semantic_constraint_type",
+)
+
+
+def copy_preference_metadata(source: Dict[str, Any], target: Dict[str, Any], *, overwrite: bool = False) -> Dict[str, Any]:
+    for field in PREFERENCE_METADATA_FIELDS:
+        if field not in source:
+            continue
+        if source.get(field) in {None, ""}:
+            continue
+        if overwrite or target.get(field) in {None, ""}:
+            target[field] = deepcopy(source.get(field)) if isinstance(source.get(field), (dict, list)) else source.get(field)
+    return target
+
+
+def preference_window_info(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    label = clean_title(item.get("preferred_time_window") or item.get("preference_type") or "")
+    source = ""
+    ideal_start = _coerce_pref_minute(
+        item.get("earliest_preferred_start")
+        or item.get("ideal_start")
+        or item.get("preferred_window_start")
+    )
+    ideal_end = _coerce_pref_minute(
+        item.get("latest_preferred_end")
+        or item.get("ideal_end")
+        or item.get("preferred_window_end")
+    )
+    if label:
+        source = "preferred_time_window"
+        if (ideal_start is None or ideal_end is None) and label in PREFERRED_TIME_WINDOWS:
+            default_start, default_end = PREFERRED_TIME_WINDOWS[label]
+            ideal_start = ideal_start if ideal_start is not None else default_start
+            ideal_end = ideal_end if ideal_end is not None else default_end
+
+    if (ideal_start is None or ideal_end is None) and isinstance(item.get("ideal_start_range"), (list, tuple)):
+        values = item.get("ideal_start_range") or []
+        if len(values) >= 2:
+            ideal_start = _coerce_pref_minute(values[0])
+            ideal_end = _coerce_pref_minute(values[1])
+            source = source or "ideal_start_range"
+
+    acceptable_start = _coerce_pref_minute(item.get("acceptable_start"))
+    acceptable_end = _coerce_pref_minute(item.get("acceptable_end"))
+    if isinstance(item.get("acceptable_start_range"), (list, tuple)):
+        values = item.get("acceptable_start_range") or []
+        if len(values) >= 2:
+            acceptable_start = _coerce_pref_minute(values[0])
+            acceptable_end = _coerce_pref_minute(values[1])
+            source = source or "acceptable_start_range"
+    acceptable_start = acceptable_start if acceptable_start is not None else ideal_start
+    acceptable_end = acceptable_end if acceptable_end is not None else ideal_end
+
+    if ideal_start is None or ideal_end is None:
+        semantic = clean_title(item.get("semantic_constraint_type") or item.get("activity_role") or "")
+        if semantic in PREFERRED_TIME_WINDOWS:
+            ideal_start, ideal_end = PREFERRED_TIME_WINDOWS[semantic]
+            acceptable_start, acceptable_end = ideal_start, ideal_end
+            label = label or semantic
+            source = "semantic"
+    if ideal_start is None or ideal_end is None:
+        # Legacy fallback only. Structured metadata above owns the normal path.
+        title = clean_title(item.get("title") or "")
+        for fallback_label in ("lunch", "coffee_break", "evening", "business_hours"):
+            if fallback_label.replace("_", " ") in title:
+                ideal_start, ideal_end = PREFERRED_TIME_WINDOWS[fallback_label]
+                acceptable_start, acceptable_end = ideal_start, ideal_end
+                label = label or fallback_label
+                source = "fallback_title"
+                break
+    if ideal_start is None or ideal_end is None:
+        return None
+
+    raw_weight = clean_title(item.get("preference_weight") or item.get("preference_priority") or "")
+    if item.get("is_hard_window") or label == "business_hours":
+        weight = "hard"
+    elif raw_weight in {"hard", "high", "medium", "low"}:
+        weight = raw_weight
+    elif item.get("is_soft_window"):
+        weight = "medium"
+    elif label in {"lunch", "evening"}:
+        weight = "high"
+    elif label == "coffee_break":
+        weight = "low"
+    else:
+        weight = "medium"
+
+    return {
+        "label": label or "preferred_window",
+        "source": source or "metadata",
+        "ideal_start": int(ideal_start),
+        "ideal_end": int(ideal_end),
+        "acceptable_start": int(acceptable_start if acceptable_start is not None else ideal_start),
+        "acceptable_end": int(acceptable_end if acceptable_end is not None else ideal_end),
+        "weight": weight,
+        "hard": weight == "hard" or bool(item.get("is_hard_window")),
+    }
+
+
+def preference_window_deviation(item: Dict[str, Any], start: Optional[int], end: Optional[int]) -> Dict[str, Any]:
+    info = preference_window_info(item)
+    if not info or start is None or end is None:
+        return {"info": info, "deviation": 0, "penalty": 0.0, "hard_violation": False}
+    acceptable_start = int(info["acceptable_start"])
+    acceptable_end = int(info["acceptable_end"])
+    deviation = 0
+    if int(start) < acceptable_start:
+        deviation += acceptable_start - int(start)
+    if int(end) > acceptable_end:
+        deviation += int(end) - acceptable_end
+    severity = 1.0
+    if deviation >= 60:
+        severity = 2.0
+    elif deviation >= 30:
+        severity = 1.5
+    multiplier = PREFERENCE_WEIGHT_MULTIPLIERS.get(str(info["weight"]), 5.0)
+    penalty = float(deviation) * multiplier * severity
+    return {
+        "info": info,
+        "deviation": deviation,
+        "penalty": penalty,
+        "hard_violation": bool(info["hard"] and deviation > 0),
+    }
+
+
+def should_run_preference_rescue(item: Dict[str, Any], start: Optional[int], end: Optional[int]) -> bool:
+    result = preference_window_deviation(item, start, end)
+    info = result.get("info") or {}
+    return bool(result.get("deviation", 0) > 0 and info.get("weight") in {"hard", "high"})
+
+
+def _coerce_pref_minute(value: Any) -> Optional[int]:
+    if value in {None, ""}:
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    return parse_clock(str(value))
 
 ACCURATE_TRAVEL_REQUEST_PATTERN = re.compile(
     r"\b(?:accurate|actual|real|route(?:-|\s*)aware)\s+(?:travel|route|commute)\s+time\b|"

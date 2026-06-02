@@ -35,7 +35,7 @@ import time
 from copy import deepcopy
 from typing import Any, Dict, List, Optional, Tuple
 
-from jplan_logging import jlog
+from jplan_logging import jlog, jlog_verbose
 from .types_utils import *
 
 
@@ -124,18 +124,13 @@ class ModuleDRefinementMixin:
             cursor = max(cursor, int(item.get("scheduled_end") or cursor))
         total_idle += max(0, day_end - cursor)
 
-        preferred_penalty = 0
+        preferred_penalty = 0.0
         fixed_penalty = 0
         for item in ordered:
             start = item.get("scheduled_start")
             end = item.get("scheduled_end")
-            window_start = item.get("preferred_window_start")
-            window_end = item.get("preferred_window_end")
-            if start is not None and end is not None:
-                if window_start is not None and start < int(window_start):
-                    preferred_penalty += int(window_start) - int(start)
-                if window_end is not None and end > int(window_end):
-                    preferred_penalty += int(end) - int(window_end)
+            preference = preference_window_deviation(item, start, end)
+            preferred_penalty += float(preference.get("penalty") or 0)
             if item.get("is_user_fixed") and item.get("fixed_start") is not None and start != item.get("fixed_start"):
                 fixed_penalty += 100000
 
@@ -154,7 +149,7 @@ class ModuleDRefinementMixin:
             "total_travel_minutes": total_travel,
             "total_buffer_minutes": total_buffer,
             "total_idle_minutes": total_idle,
-            "preferred_window_penalty": preferred_penalty,
+            "preferred_window_penalty": round(float(preferred_penalty), 2),
             "route_conflict_penalty": route_conflict_penalty,
             "same_location_split_penalty": same_location_split_penalty,
             "revisit_location_penalty": revisit_penalty,
@@ -404,6 +399,7 @@ class ModuleDRefinementMixin:
         current_score = before_score
         accepted_moves: List[Dict[str, Any]] = []
         rejected_moves: List[Dict[str, Any]] = []
+        candidate_stats = {"generated": 0, "pruned": 0, "validated": 0}
         iterations = 0
 
         if any(item.get("is_conflict") for item in current):
@@ -452,6 +448,7 @@ class ModuleDRefinementMixin:
         while iterations < MODULE_D_MAX_ITERATIONS and time.perf_counter() < deadline:
             iterations += 1
             best_candidate: Optional[Tuple[float, List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]] = None
+            current_route_total = self._module_d_route_sequence_total(current, day_start) if self._active_route_context() else 0
 
             for candidate_timeline, candidate_unscheduled, move in self._module_d_generate_candidates(
                 current,
@@ -460,8 +457,10 @@ class ModuleDRefinementMixin:
                 day_end,
                 min_travel,
             ):
+                candidate_stats["generated"] += 1
                 feasible, reject_reason = self._module_d_is_feasible(candidate_timeline, day_start, day_end, min_travel)
                 if not feasible:
+                    candidate_stats["pruned"] += 1
                     if len(rejected_moves) < 20:
                         rejected_moves.append({**move, "reason": reject_reason})
                     if move.get("type") == "same_location_cluster":
@@ -469,9 +468,33 @@ class ModuleDRefinementMixin:
                     jlog("MODULE_D", f"reason={reject_reason}", "REJECT")
                     continue
 
+                route_delta = 0
+                if self._active_route_context():
+                    candidate_route_total = self._module_d_route_sequence_total(candidate_timeline, day_start)
+                    route_delta = candidate_route_total - current_route_total
+                    move["route_total_before"] = current_route_total
+                    move["route_total_after"] = candidate_route_total
+                    move["route_delta"] = route_delta
+                    guarded, guard_reason = self._module_d_route_total_guard_reject(move, candidate_timeline, route_delta)
+                    if guarded:
+                        candidate_stats["pruned"] += 1
+                        if len(rejected_moves) < 20:
+                            rejected_moves.append({**move, "reason": guard_reason})
+                        jlog(
+                            "MODULE_D",
+                            (
+                                f"title={move.get('title')} before={current_route_total} "
+                                f"after={candidate_route_total} delta={route_delta} reason={guard_reason}"
+                            ),
+                            "ROUTE_TOTAL_GUARD",
+                        )
+                        continue
+
                 candidate_score = self._module_d_score(candidate_timeline, candidate_unscheduled, day_start, day_end, min_travel)
+                candidate_stats["validated"] += 1
                 delta = candidate_score - current_score
                 if delta <= MODULE_D_MIN_IMPROVEMENT:
+                    candidate_stats["pruned"] += 1
                     if len(rejected_moves) < 20:
                         rejected_moves.append({**move, "reason": "score_delta_below_threshold", "score_delta": round(delta, 4)})
                     if move.get("type") == "same_location_cluster":
@@ -517,8 +540,17 @@ class ModuleDRefinementMixin:
         if not applied and (has_movable or has_insertable):
             no_candidate_reason = self._module_d_no_candidate_reason(rejected_moves)
             jlog("MODULE_D", f"reason={no_candidate_reason}", "NO_CANDIDATE")
+        jlog("TIMER", f"module_d_optimize_seconds={time.perf_counter() - started:.2f}", None)
         jlog("MODULE_D", f"before={before_score:.2f} after={after_score:.2f}", "SCORE")
         jlog("MODULE_D", f"applied={str(applied).lower()} iterations={iterations}", "DONE")
+        jlog(
+            "PERF",
+            (
+                f"generated={candidate_stats['generated']} pruned={candidate_stats['pruned']} "
+                f"validated={candidate_stats['validated']}"
+            ),
+            "CANDIDATES",
+        )
         return (
             current,
             remaining_unscheduled,
@@ -574,6 +606,74 @@ class ModuleDRefinementMixin:
             "refinement_rejected_moves": rejected_moves or [],
             "route_efficiency": route_efficiency or {},
         }
+
+    def _module_d_route_sequence_total(self, timeline: List[Dict[str, Any]], day_start: int) -> int:
+        if not self._active_route_context():
+            return 0
+        ordered = sorted(timeline or [], key=lambda item: item.get("scheduled_start") or 0)
+        physical = [item for item in ordered if self._activity_requires_travel(item)]
+        if not physical:
+            return 0
+        total = 0
+        first_entry = self._route_context_start_entry(physical[0])
+        if first_entry:
+            total += int(first_entry.get("duration_minutes") or 0)
+        for left, right in zip(physical, physical[1:]):
+            total += self._transition_minutes(left, right, 0)
+        return int(total)
+
+    def _module_d_route_total_guard_reject(
+        self,
+        move: Dict[str, Any],
+        candidate_timeline: List[Dict[str, Any]],
+        route_delta: int,
+    ) -> Tuple[bool, str]:
+        if route_delta <= 0:
+            return False, ""
+        target = self._module_d_find_by_activity_id(candidate_timeline, move.get("activity_id")) if move.get("activity_id") else None
+        if not target:
+            return False, ""
+        short_low_weight = (
+            self._short_low_weight_flex(target)
+            if hasattr(self, "_short_low_weight_flex")
+            else self._module_d_short_low_weight_flex(target)
+        )
+        if short_low_weight and route_delta > max(10, int(target.get("duration_minutes") or 0)):
+            return True, "low_weight_total_route_worse"
+        if route_delta > 30 and move.get("type") not in {"same_location_cluster"}:
+            return True, "total_route_worse"
+        return False, ""
+
+    def _module_d_find_by_activity_id(
+        self,
+        timeline: List[Dict[str, Any]],
+        activity_id: Any,
+    ) -> Optional[Dict[str, Any]]:
+        if activity_id is None:
+            return None
+        target_key = str(activity_id)
+        for item in timeline or []:
+            if str(item.get("stable_activity_id") or item.get("id") or "") == target_key:
+                return item
+        return None
+
+    def _module_d_short_low_weight_flex(self, item: Dict[str, Any]) -> bool:
+        if item.get("timing_mode") == TimingMode.FIXED or item.get("fixed_start") is not None:
+            return False
+        duration = int(item.get("duration_minutes") or DEFAULT_DURATION)
+        priority = clean_title(item.get("priority") or "medium")
+        preference = preference_window_info(item) or {}
+        weight = clean_title(preference.get("weight") or item.get("preference_weight") or "")
+        return bool(
+            duration <= 20
+            and (
+                priority == "low"
+                or weight in {"low", "optional"}
+                or not item.get("is_mandatory", item.get("isMandatory", True))
+                or item.get("optional_reason")
+                or "coffee" in clean_title(item.get("title") or "")
+            )
+        )
 
     def _module_d_generate_candidates(
         self,
@@ -704,10 +804,26 @@ class ModuleDRefinementMixin:
                         candidate_item["scheduled_start"] = start
                         candidate_item["scheduled_end"] = end
                         candidate_timeline = sorted(base + [candidate_item], key=lambda item: item.get("scheduled_start") or 0)
+                        order_rejection = self._module_d_same_location_preference_order_rejection(
+                            before=ordered,
+                            candidate=candidate_timeline,
+                            target=target,
+                            anchor=anchor,
+                        )
+                        if order_rejection:
+                            jlog(
+                                "SAME_LOCATION",
+                                order_rejection,
+                                "REJECT_ORDER",
+                            )
+                            continue
                         key = (target_key, anchor_key, start, end)
                         if key in seen:
                             continue
                         seen.add(key)
+                        pref_order_log = self._module_d_same_location_preference_order_log(candidate_timeline, [target, anchor])
+                        if pref_order_log:
+                            jlog("SAME_LOCATION", pref_order_log, "PREF_ORDER")
                         jlog(
                             "MODULE_D",
                             f"type=same_location_cluster target={target.get('title')} anchor={anchor.get('title')}",
@@ -729,6 +845,129 @@ class ModuleDRefinementMixin:
                             },
                         ))
         return candidates
+
+    def _module_d_same_location_preference_order_rejection(
+        self,
+        *,
+        before: List[Dict[str, Any]],
+        candidate: List[Dict[str, Any]],
+        target: Dict[str, Any],
+        anchor: Dict[str, Any],
+    ) -> str:
+        before_by_key = {
+            self._route_context_activity_key(item): item
+            for item in before
+            if self._route_context_activity_key(item)
+        }
+        candidate_by_key = {
+            self._route_context_activity_key(item): item
+            for item in candidate
+            if self._route_context_activity_key(item)
+        }
+        watched = [target, anchor]
+        order_rejection = self._module_d_same_location_order_rejection_by_swap(candidate, watched, target, anchor)
+        if order_rejection:
+            return order_rejection
+        for original in watched:
+            key = self._route_context_activity_key(original)
+            before_item = before_by_key.get(key)
+            after_item = candidate_by_key.get(key)
+            if not before_item or not after_item:
+                continue
+            before_pref = preference_window_deviation(
+                before_item,
+                before_item.get("scheduled_start"),
+                before_item.get("scheduled_end"),
+            )
+            after_pref = preference_window_deviation(
+                after_item,
+                after_item.get("scheduled_start"),
+                after_item.get("scheduled_end"),
+            )
+            info = after_pref.get("info") or before_pref.get("info") or {}
+            if info.get("weight") not in {"hard", "high"}:
+                continue
+            if int(after_pref.get("deviation") or 0) > int(before_pref.get("deviation") or 0):
+                return (
+                    f"order=[{target.get('title')}, {anchor.get('title')}] "
+                    f"reason=worsens_preferred_window title={original.get('title')}"
+                )
+        return ""
+
+    def _module_d_same_location_order_rejection_by_swap(
+        self,
+        candidate: List[Dict[str, Any]],
+        watched: List[Dict[str, Any]],
+        target: Dict[str, Any],
+        anchor: Dict[str, Any],
+    ) -> str:
+        keys = {self._route_context_activity_key(item) for item in watched}
+        ordered = [
+            item for item in sorted(candidate, key=lambda entry: entry.get("scheduled_start") or 0)
+            if self._route_context_activity_key(item) in keys
+        ]
+        if len(ordered) != 2:
+            return ""
+        first, second = ordered
+        first_duration = int((first.get("scheduled_end") or 0) - (first.get("scheduled_start") or 0) or first.get("duration_minutes") or 60)
+        second_duration = int((second.get("scheduled_end") or 0) - (second.get("scheduled_start") or 0) or second.get("duration_minutes") or 60)
+        cluster_start = int(first.get("scheduled_start") or 0)
+        current_penalty = self._module_d_same_location_order_penalty(ordered)
+        swapped_first = deepcopy(second)
+        swapped_second = deepcopy(first)
+        swapped_first["scheduled_start"] = cluster_start
+        swapped_first["scheduled_end"] = cluster_start + second_duration
+        swapped_second["scheduled_start"] = cluster_start + second_duration
+        swapped_second["scheduled_end"] = cluster_start + second_duration + first_duration
+        swapped = [swapped_first, swapped_second]
+        swapped_penalty = self._module_d_same_location_order_penalty(swapped)
+        protected = [
+            item for item in ordered
+            if (preference_window_deviation(item, item.get("scheduled_start"), item.get("scheduled_end")).get("info") or {}).get("weight")
+            in {"hard", "high"}
+        ]
+        if not protected or swapped_penalty >= current_penalty:
+            return ""
+        harmed = max(
+            protected,
+            key=lambda item: float(preference_window_deviation(item, item.get("scheduled_start"), item.get("scheduled_end")).get("penalty") or 0),
+        )
+        return (
+            f"order={[item.get('title') for item in ordered]} "
+            f"reason=worsens_preferred_window title={harmed.get('title')}"
+        )
+
+    def _module_d_same_location_order_penalty(self, ordered: List[Dict[str, Any]]) -> float:
+        total = 0.0
+        for item in ordered:
+            preference = preference_window_deviation(item, item.get("scheduled_start"), item.get("scheduled_end"))
+            total += float(preference.get("penalty") or 0)
+        return total
+
+    def _module_d_same_location_preference_order_log(
+        self,
+        candidate: List[Dict[str, Any]],
+        items: List[Dict[str, Any]],
+    ) -> str:
+        item_keys = {self._route_context_activity_key(item) for item in items}
+        ordered = [
+            item for item in sorted(candidate, key=lambda entry: entry.get("scheduled_start") or 0)
+            if self._route_context_activity_key(item) in item_keys
+        ]
+        if len(ordered) < 2:
+            return ""
+        protected = [
+            item for item in ordered
+            if (preference_window_deviation(item, item.get("scheduled_start"), item.get("scheduled_end")).get("info") or {}).get("weight")
+            in {"hard", "high"}
+        ]
+        if not protected:
+            return ""
+        return (
+            f"activities={[item.get('title') for item in ordered]} "
+            f"chosen_order={[item.get('title') for item in ordered]} "
+            "reason=protect_high_weight_preference"
+        )
 
     def _module_d_is_movable(self, item: Dict[str, Any], timeline: List[Dict[str, Any]]) -> bool:
         movable, _ = self._module_d_movable_reason(item, timeline)
@@ -831,6 +1070,15 @@ class ModuleDRefinementMixin:
                 return False, "time_window"
             if item.get("latest_end") is not None and end > int(item.get("latest_end") or 0):
                 return False, "time_window"
+            preference = preference_window_deviation(item, start, end)
+            if preference.get("hard_violation"):
+                info = preference.get("info") or {}
+                jlog(
+                    "PREF_WINDOW",
+                    f"title={item.get('title')} reason=hard_window_violation window={format_clock(info.get('acceptable_start'))}-{format_clock(info.get('acceptable_end'))}",
+                    "REJECT",
+                )
+                return False, "hard_window_violation"
             if index == 0:
                 continue
             previous = ordered[index - 1]
@@ -912,6 +1160,26 @@ class ModuleDRefinementMixin:
                         score -= (preferred_start - start) * 0.08
                     if end > preferred_end:
                         score -= (end - preferred_end) * 0.08
+            preference = preference_window_deviation(item, item.get("scheduled_start"), item.get("scheduled_end"))
+            info = preference.get("info") or {}
+            penalty = float(preference.get("penalty") or 0)
+            if info:
+                jlog_verbose(
+                    "PREF_WINDOW",
+                    (
+                        f"title={item.get('title')} start={format_clock(item.get('scheduled_start'))} "
+                        f"window={format_clock(info.get('acceptable_start'))}-{format_clock(info.get('acceptable_end'))} "
+                        f"deviation={int(preference.get('deviation') or 0)} penalty={round(penalty, 2)}"
+                    ),
+                    "SCORE",
+                )
+            if penalty:
+                score -= penalty
+                jlog_verbose(
+                    "PREF_WINDOW",
+                    f"title={item.get('title')} affects_total_score=true",
+                    "SCORE_APPLIED",
+                )
             if item.get("timing_mode") == TimingMode.PREFERRED:
                 score += 2.0
 

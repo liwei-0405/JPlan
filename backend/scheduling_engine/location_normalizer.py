@@ -598,7 +598,7 @@ class LocationNormalizerMixin:
         travel_required = bool(raw_value) if raw_value is not None else True
         if kind in {"no_location_required", "online"} or category in {"home_or_online", "no_location", "none"}:
             return False
-        if category in {"medical", "meal_place", "supermarket", "pharmacy", "fitness_center", "bank", "home", "institution", "campus_area", "office", "library"}:
+        if category in {"medical", "meal_place", "supermarket", "pharmacy", "fitness_center", "bank", "home", "institution", "campus_area", "office", "work", "library"}:
             return True
         return travel_required
 
@@ -736,6 +736,23 @@ class LocationNormalizerMixin:
             if category in {"unknown", "home_or_online", "no_location"}:
                 category = self._normalize_semantic_category(generic_explicit.get("category"))
             explicit_user_location = True
+
+        if (
+            raw_location_text
+            and self._is_non_home_explicit_text(raw_location_text)
+            and kind in {"exact_named_place", "area_only", "category_only", "unknown_physical", "unknown"}
+            and status == "not_required"
+            and not no_location_work_default
+        ):
+            status = "needs_coordinates"
+            explicit_user_location = True
+            if category in {"home", "home_or_online", "no_location", "none", "unknown"}:
+                category = "unknown"
+            jlog(
+                "LOCATION_NORMALIZER",
+                f"title={title} kept=\"{raw_location_text}\" corrected_status=needs_coordinates",
+                "PRESERVE_EXPLICIT",
+            )
 
         if self._is_non_home_explicit_text(raw_location_text) and kind in {"home", "online", "no_location_required"}:
             ignored_default = kind
