@@ -6352,6 +6352,35 @@ def test_relative_derived_materialized_block_stays_recalculable():
     assert canonical["placement_source"] == "system_derived"
 
 
+def test_route_repair_preserves_relative_derived_activity_semantics():
+    engine = SchedulingEngine(DummyClient(), travel_service=FakeTravelService())
+
+    prepared = engine._prepare_activity_for_route_repair({
+        "id": "gym",
+        "stable_activity_id": "gym",
+        "title": "Gym",
+        "timing_mode": TimingMode.RELATIVE,
+        "scheduled_start": parse_clock("01:55 PM"),
+        "scheduled_end": parse_clock("02:40 PM"),
+        "fixed_start": None,
+        "fixed_end": None,
+        "duration_minutes": 45,
+        "anchor_relation": {"kind": "before", "target_activity_id": "dinner", "target_title": "Dinner with family"},
+        "placement_source": "system_derived",
+        "is_derived_time": True,
+        "is_user_fixed": False,
+        "can_move_for_repair": False,
+        "repair_protection": "derived",
+    })
+
+    assert prepared["timing_mode"] == TimingMode.RELATIVE
+    assert prepared["repair_protection"] == "derived"
+    assert prepared["locked_fixed"] is False
+    assert prepared["fixed_start"] is None
+    assert prepared["scheduled_start"] is None
+    assert prepared["anchor_relation"]["target_title"] == "Dinner with family"
+
+
 def test_schedule_envelope_accepts_legacy_unscheduled_activity_without_reason():
     import main as backend_main
 

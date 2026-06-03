@@ -343,6 +343,16 @@ export function PlanningInputPage({
       message: "Hi! I'm your planning assistant. I'll generate a draft schedule here first. Nothing is saved until you press Save & Implement Plan."
     }
   ]);
+  const isScheduleBusy = isProcessing || isRunningScheduler;
+
+  useEffect(() => {
+    if (!isScheduleBusy) return;
+    setEditingEvent(null);
+    setIsManualLocationPickerOpen(false);
+    setMapPickerRequest(null);
+    setMapPickerCandidate(null);
+    setIsEditingPlanSettings(false);
+  }, [isScheduleBusy]);
 
   // Voice Recognition state
   const [isRecording, setIsRecording] = useState(false);
@@ -584,6 +594,7 @@ export function PlanningInputPage({
   };
 
   const handleAddManualActivity = () => {
+    if (isScheduleBusy) return;
     if (!activityName.trim() || !activityTime.trim()) return;
 
     const formattedStartTime = formatTo12Hour(activityTime);
@@ -659,10 +670,12 @@ export function PlanningInputPage({
   };
 
   const handleEventClick = (event: ActivityBlock) => {
+    if (isScheduleBusy) return;
     setEditingEvent(event);
   };
 
   const handleSaveEdit = (updatedEvent: ActivityBlock) => {
+    if (isScheduleBusy) return;
     if (!previewSchedule) return;
     const baseDraft = clearRouteRepairPreview(previewSchedule);
     const originalEvent = editingEvent || baseDraft.activities.find(a => a.id === updatedEvent.id) || updatedEvent;
@@ -743,6 +756,7 @@ export function PlanningInputPage({
   };
 
   const handleDeleteEvent = () => {
+    if (isScheduleBusy) return;
     if (!editingEvent || !previewSchedule) return;
     const baseDraft = clearRouteRepairPreview(previewSchedule);
     const updatedActivities = baseDraft.activities.filter(a => a.id !== editingEvent.id);
@@ -757,6 +771,7 @@ export function PlanningInputPage({
   };
 
   const handleSendMessage = async () => {
+    if (isScheduleBusy) return;
     if (!chatInput.trim()) return;
 
     const userMessage = chatInput;
@@ -1249,6 +1264,7 @@ export function PlanningInputPage({
   };
 
   const runTravelValidation = async (source: "toggle" | "manual" = "manual") => {
+    if (isScheduleBusy) return;
     const hasScheduleItems = Boolean((previewSchedule?.schedule_blocks?.length || 0) || (previewSchedule?.activities?.length || 0));
     if (!previewSchedule || !user?.id) {
       setConversationHistory(prev => [...prev, {
@@ -1314,6 +1330,7 @@ export function PlanningInputPage({
   };
 
   const sendRepairConfirmation = async (message: "yes" | "no") => {
+    if (isScheduleBusy) return;
     if (!previewSchedule || !user?.id) return;
     const currentHistory = [...conversationHistory, { role: "user" as const, message }];
     setConversationHistory(currentHistory);
@@ -1422,10 +1439,12 @@ export function PlanningInputPage({
   };
 
   const handleCompleteTravelValidation = async () => {
+    if (isScheduleBusy) return;
     await runTravelValidation("manual");
   };
 
   const handleRunScheduler = async () => {
+    if (isScheduleBusy) return;
     if (!previewSchedule || !user?.id) return;
     const shouldRunAccurateTravel = Boolean(
       accurateTravelTime
@@ -1477,6 +1496,7 @@ export function PlanningInputPage({
   };
 
   const handleSaveCurrentPlan = () => {
+    if (isScheduleBusy) return;
     const baseSchedule = materializeAutoRoutePreview(withPlanningPreferences(previewSchedule || { date: isoDateStr, activities: [] }));
     const savingPartialFixedRouteConflict = String(baseSchedule.travel_validation_status || "") === "partial_feasible_with_fixed_route_conflicts";
     const finalSchedule = {
@@ -1504,6 +1524,7 @@ export function PlanningInputPage({
   };
 
   const handleAccurateTravelToggle = async (checked: boolean) => {
+    if (isScheduleBusy) return;
     if (!checked) {
       setAccurateTravelTime(false);
       setPreviewSchedule(prev => prev ? clearRouteRepairPreview(prev) : prev);
@@ -1527,6 +1548,7 @@ export function PlanningInputPage({
   const manualLocationPoint = candidateToMapPoint(manualLocationCandidate);
 
   const handleConfirmManualLocation = async (candidate: GeocodeCandidate) => {
+    if (isScheduleBusy) return;
     const displayName = candidate.display_name || candidate.address || activityLocation || activityName || "Manual event location";
     const address = candidate.address || candidate.display_name || displayName;
     rememberRecentLocation(candidateToPlanningLocation(candidate, "manual_event"));
@@ -1630,6 +1652,7 @@ export function PlanningInputPage({
       : "cursor-not-allowed bg-muted/50 text-muted-foreground opacity-70"
   }`;
   const beginPlanSettingsEdit = () => {
+    if (isScheduleBusy) return;
     setDraftDayStart(toCanonicalTime(activeDayStart) || "08:00");
     setDraftDayEnd(toCanonicalTime(activeDayEnd) || "22:00");
     setDraftStartLocationKey(
@@ -1640,6 +1663,7 @@ export function PlanningInputPage({
     setIsEditingPlanSettings(true);
   };
   const applyPlanSettingsEdit = () => {
+    if (isScheduleBusy) return;
     setPreviewSchedule((prev) => {
       if (!prev) return prev;
       const selectedSavedLocation = savedStartLocationOptions.find((location) => locationOptionKey(location) === draftStartLocationKey);
@@ -1695,6 +1719,20 @@ export function PlanningInputPage({
           </p>
         </div>
 
+        {isScheduleBusy && (
+          <div className="mb-4 rounded-2xl border border-blue-200 bg-blue-50 p-4 text-blue-950 shadow-sm">
+            <div className="flex items-start gap-3">
+              <Loader2 className="mt-0.5 h-4 w-4 shrink-0 animate-spin text-blue-600" />
+              <div>
+                <p className="text-sm font-medium">Planner is updating this schedule.</p>
+                <p className="mt-1 text-xs text-blue-800">
+                  Editing is disabled until the backend finishes, so the returned plan cannot overwrite a newer manual change.
+                </p>
+              </div>
+            </div>
+          </div>
+        )}
+
         <div className="grid lg:grid-cols-2 gap-6 items-stretch">
           {/* Left: Live Schedule Preview */}
           <div className="lg:col-span-7 flex flex-col bg-card rounded-2xl border border-border shadow-sm overflow-hidden" style={{ height: "550px" }}>
@@ -1710,7 +1748,7 @@ export function PlanningInputPage({
                   <select
                     value={displayedStartLocationKey}
                     onChange={(event) => setDraftStartLocationKey(event.target.value)}
-                    disabled={!isEditingPlanSettings}
+                    disabled={!isEditingPlanSettings || isScheduleBusy}
                     className={`${planSettingControlClass} max-w-[160px]`}
                     aria-label="Plan start location for this day"
                   >
@@ -1734,7 +1772,7 @@ export function PlanningInputPage({
                   <select
                     value={displayedDayStart}
                     onChange={(event) => setDraftDayStart(event.target.value)}
-                    disabled={!isEditingPlanSettings}
+                    disabled={!isEditingPlanSettings || isScheduleBusy}
                     className={planSettingControlClass}
                     aria-label="Plan start time"
                   >
@@ -1746,7 +1784,7 @@ export function PlanningInputPage({
                   <select
                     value={displayedDayEnd}
                     onChange={(event) => setDraftDayEnd(event.target.value)}
-                    disabled={!isEditingPlanSettings}
+                    disabled={!isEditingPlanSettings || isScheduleBusy}
                     className={planSettingControlClass}
                     aria-label="Plan end time"
                   >
@@ -1760,11 +1798,12 @@ export function PlanningInputPage({
                     size="sm"
                     className="h-7 rounded-full px-2 text-xs"
                     onClick={isEditingPlanSettings ? applyPlanSettingsEdit : beginPlanSettingsEdit}
+                    disabled={isScheduleBusy}
                   >
                     {isEditingPlanSettings ? "Apply" : "Edit"}
                   </Button>
                   {isEditingPlanSettings && (
-                    <Button type="button" size="sm" variant="outline" className="h-7 rounded-full px-2 text-xs" onClick={() => setIsEditingPlanSettings(false)}>
+                    <Button type="button" size="sm" variant="outline" className="h-7 rounded-full px-2 text-xs" disabled={isScheduleBusy} onClick={() => setIsEditingPlanSettings(false)}>
                       Cancel
                     </Button>
                   )}
@@ -1784,9 +1823,9 @@ export function PlanningInputPage({
               {previewSchedule && (previewSchedule.schedule_blocks?.length || previewSchedule.activities.length > 0) ? (
                 <TimelineGrid
                   activities={timelineActivities}
-                  interactive={!hasPendingRoutePreview}
+                  interactive={!hasPendingRoutePreview && !isScheduleBusy}
                   onActivityClick={handleEventClick}
-                  showEditIcon={!hasPendingRoutePreview}
+                  showEditIcon={!hasPendingRoutePreview && !isScheduleBusy}
                 />
               ) : (
                 <div className="h-full flex flex-col items-center justify-center text-muted-foreground opacity-30 italic">
@@ -1806,7 +1845,7 @@ export function PlanningInputPage({
                 variant={activeMode === "assistant" ? "default" : "ghost"}
                 onClick={() => setActiveMode("assistant")}
                 className="rounded-xl gap-2"
-                disabled={isProcessing}
+                disabled={isScheduleBusy}
               >
                 <MessageSquare size={16} /> AI Assistant
               </Button>
@@ -1814,7 +1853,7 @@ export function PlanningInputPage({
                 variant={activeMode === "manual" ? "default" : "ghost"}
                 onClick={() => setActiveMode("manual")}
                 className="rounded-xl gap-2"
-                disabled={isProcessing}
+                disabled={isScheduleBusy}
               >
                 <Settings2 size={16} /> Manual Mode
               </Button>
@@ -1840,7 +1879,7 @@ export function PlanningInputPage({
                     size="sm"
                     className="rounded-xl gap-2"
                     onClick={handleRunScheduler}
-                    disabled={isProcessing || isRunningScheduler}
+                    disabled={isScheduleBusy}
                   >
                     {isRunningScheduler ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
                     Run scheduler
@@ -1851,7 +1890,7 @@ export function PlanningInputPage({
                     variant="outline"
                     className="rounded-xl bg-white"
                     onClick={handleSaveCurrentPlan}
-                    disabled={!previewSchedule || previewSchedule.activities.length === 0 || isProcessing}
+                    disabled={!previewSchedule || previewSchedule.activities.length === 0 || isScheduleBusy}
                   >
                     Save without rerun
                   </Button>
@@ -1871,7 +1910,7 @@ export function PlanningInputPage({
                 <Switch
                   checked={allowClash}
                   onCheckedChange={setAllowClash}
-                  disabled={isProcessing}
+                  disabled={isScheduleBusy}
                   aria-label="Allow conflicting schedules"
                 />
               </div>
@@ -1891,7 +1930,7 @@ export function PlanningInputPage({
                 <Switch
                   checked={accurateTravelTime}
                   onCheckedChange={handleAccurateTravelToggle}
-                  disabled={isProcessing}
+                  disabled={isScheduleBusy}
                   aria-label="Accurate travel time"
                 />
               </div>
@@ -1933,7 +1972,7 @@ export function PlanningInputPage({
                           <Button
                             size="sm"
                             className="rounded-xl"
-                            disabled={isProcessing}
+                            disabled={isScheduleBusy}
                             onClick={() => sendRepairConfirmation("yes")}
                           >
                             Apply change
@@ -1942,7 +1981,7 @@ export function PlanningInputPage({
                             size="sm"
                             variant="outline"
                             className="rounded-xl bg-white"
-                            disabled={isProcessing}
+                            disabled={isScheduleBusy}
                             onClick={() => sendRepairConfirmation("no")}
                           >
                             Keep current plan
@@ -2051,8 +2090,11 @@ export function PlanningInputPage({
                                 <Button
                                   size="sm"
                                   className="rounded-xl"
-                                  disabled={resolvingLocationId === request.activity_id}
-                                  onClick={() => openLocationMapPicker(request)}
+                                  disabled={isScheduleBusy || resolvingLocationId === request.activity_id}
+                                  onClick={() => {
+                                    if (isScheduleBusy) return;
+                                    openLocationMapPicker(request);
+                                  }}
                                 >
                                   {request.request_type === "start_location" ? "Choose starting point" : "Choose exact location"}
                                 </Button>
@@ -2063,7 +2105,7 @@ export function PlanningInputPage({
                         <Button
                           variant="default"
                           className="w-full rounded-xl"
-                          disabled={isProcessing || pendingLocationRequests.length > 0}
+                          disabled={isScheduleBusy || pendingLocationRequests.length > 0}
                           onClick={handleCompleteTravelValidation}
                         >
                           Complete travel validation
@@ -2079,7 +2121,7 @@ export function PlanningInputPage({
                       <Button
                         variant="default"
                         className="w-full rounded-xl"
-                        disabled={isProcessing}
+                        disabled={isScheduleBusy}
                         onClick={handleCompleteTravelValidation}
                       >
                         Complete travel validation
@@ -2116,7 +2158,7 @@ export function PlanningInputPage({
                         variant={isRecording ? "destructive" : "ghost"}
                         size="icon"
                         className={`h-10 w-10 rounded-xl shrink-0 transition-all ${isRecording ? 'animate-pulse scale-110 shadow-lg shadow-destructive/20' : ''}`}
-                        disabled={isProcessing}
+                        disabled={isScheduleBusy}
                         onClick={isRecording ? stopSpeechRecognition : startSpeechRecognition}
                       >
                         <Mic size={20} className={isRecording ? "text-white" : "text-muted-foreground"} />
@@ -2126,13 +2168,13 @@ export function PlanningInputPage({
                         onChange={(e) => setChatInput(e.target.value)}
                         placeholder={isRecording ? "Listening..." : "e.g. Move lunch to 1pm..."}
                         className="min-h-[80px] rounded-xl resize-none"
-                        disabled={isProcessing}
+                        disabled={isScheduleBusy}
                         onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSendMessage(); } }}
                       />
                       <Button
                         id="chat-send-button"
                         onClick={handleSendMessage}
-                        disabled={isProcessing || !chatInput.trim()}
+                        disabled={isScheduleBusy || !chatInput.trim()}
                         className="h-10 w-10 rounded-xl shrink-0 p-0"
                       >
                         {isProcessing ? <Loader2 className="h-5 w-5 animate-spin" /> : <Send size={18} />}
@@ -2153,6 +2195,7 @@ export function PlanningInputPage({
                         <Button
                           variant={manualActivityType === "activity" ? "default" : "outline"}
                           size="sm"
+                          disabled={isScheduleBusy}
                           onClick={() => {
                             setManualActivityType("activity");
                             if (!activityName) setActivityName("");
@@ -2164,6 +2207,7 @@ export function PlanningInputPage({
                         <Button
                           variant={manualActivityType === "travel" ? "default" : "outline"}
                           size="sm"
+                          disabled={isScheduleBusy}
                           onClick={() => {
                             setManualActivityType("travel");
                             setActivityLocation("");
@@ -2176,6 +2220,7 @@ export function PlanningInputPage({
                         <Button
                           variant={manualActivityType === "buffer" ? "default" : "outline"}
                           size="sm"
+                          disabled={isScheduleBusy}
                           onClick={() => {
                             setManualActivityType("buffer");
                             setActivityLocation("");
@@ -2194,6 +2239,7 @@ export function PlanningInputPage({
                       </Label>
                       <Input
                         value={activityName}
+                        disabled={isScheduleBusy}
                         onChange={e => { setActivityName(e.target.value); setIsConflict(false); }}
                         placeholder={manualActivityType === "activity" ? "Meeting, Gym..." : "Travel, Break..."}
                         className={`rounded-xl ${isConflict ? "border-destructive focus-visible:ring-destructive" : ""}`}
@@ -2205,6 +2251,7 @@ export function PlanningInputPage({
                         <Input
                           type="time"
                           value={activityTime}
+                          disabled={isScheduleBusy}
                           onChange={e => { setActivityTime(e.target.value); setIsConflict(false); }}
                           className={`rounded-xl ${isConflict ? "border-destructive focus-visible:ring-destructive" : ""}`}
                         />
@@ -2213,6 +2260,7 @@ export function PlanningInputPage({
                         <Label>Duration</Label>
                         <Input
                           value={activityDuration}
+                          disabled={isScheduleBusy}
                           onChange={e => { setActivityDuration(e.target.value); setIsConflict(false); }}
                           placeholder="1h 30m"
                           className={`rounded-xl ${isConflict ? "border-destructive focus-visible:ring-destructive" : ""}`}
@@ -2241,7 +2289,11 @@ export function PlanningInputPage({
                             type="button"
                             variant="outline"
                             className="rounded-xl"
-                            onClick={() => setIsManualLocationPickerOpen(true)}
+                            disabled={isScheduleBusy}
+                            onClick={() => {
+                              if (isScheduleBusy) return;
+                              setIsManualLocationPickerOpen(true);
+                            }}
                           >
                             <MapPin className="mr-2 h-4 w-4" />
                             {manualResolvedLocation ? "Change Location" : "Pick Location"}
@@ -2251,6 +2303,7 @@ export function PlanningInputPage({
                               type="button"
                               variant="ghost"
                               className="rounded-xl"
+                              disabled={isScheduleBusy}
                               onClick={() => {
                                 setActivityLocation("");
                                 setManualResolvedLocation(null);
@@ -2265,7 +2318,7 @@ export function PlanningInputPage({
                     <Button
                       onClick={handleAddManualActivity}
                       className={`w-full rounded-xl gap-2 mt-4 ${isConflict ? "bg-destructive hover:bg-destructive/90 animate-pulse" : ""}`}
-                      disabled={(!activityName || !activityTime) && !isConflict}
+                      disabled={isScheduleBusy || ((!activityName || !activityTime) && !isConflict)}
                     >
                       {isConflict ? (
                         <>Conflict Detected</>
@@ -2290,7 +2343,7 @@ export function PlanningInputPage({
             <Button
               onClick={handleSaveCurrentPlan}
               className="w-full rounded-xl py-6 text-lg font-semibold shadow-lg hover:shadow-xl transition-all"
-              disabled={!previewSchedule || previewSchedule.activities.length === 0 || isProcessing}
+              disabled={!previewSchedule || previewSchedule.activities.length === 0 || isScheduleBusy}
             >
               {isProcessing ? (
                 <>
@@ -2315,7 +2368,7 @@ export function PlanningInputPage({
 
         </div>
       </div>
-      {editingEvent && (
+      {editingEvent && !isScheduleBusy && (
         <EventEditModal
           event={editingEvent}
           onSave={handleSaveEdit}
@@ -2391,8 +2444,11 @@ export function PlanningInputPage({
       ) : null}
 
       <LocationPickerDialog
-        open={isManualLocationPickerOpen}
-        onOpenChange={setIsManualLocationPickerOpen}
+        open={isManualLocationPickerOpen && !isScheduleBusy}
+        onOpenChange={(open) => {
+          if (isScheduleBusy) return;
+          setIsManualLocationPickerOpen(open);
+        }}
         title={`Pick location for ${activityName || "manual activity"}`}
         description={`Search, choose a saved place, or click the exact point for ${activityName || "this manual activity"}.`}
         label={activityName || "manual activity"}

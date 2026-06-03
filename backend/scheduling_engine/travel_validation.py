@@ -2392,6 +2392,20 @@ class TravelValidationMixin:
                 )
             return prepared
 
+        if prepared.get("anchor_relation") and not prepared.get("is_user_fixed"):
+            prepared["preserve_scheduled_time"] = False
+            prepared["locked_fixed"] = False
+            prepared["can_move_for_repair"] = False
+            prepared["repair_protection"] = prepared.get("repair_protection") or "derived"
+            prepared["timing_mode"] = TimingMode.RELATIVE
+            prepared["fixed_start"] = None
+            prepared["fixed_end"] = None
+            prepared["scheduled_start"] = None
+            prepared["scheduled_end"] = None
+            prepared["placement_source"] = prepared.get("placement_source") or "system_derived"
+            prepared["is_derived_time"] = True
+            return prepared
+
         prepared["can_move_for_repair"] = False
         prepared["locked_fixed"] = True
         if prepared.get("fixed_start") is None and prepared.get("scheduled_start") is not None:
