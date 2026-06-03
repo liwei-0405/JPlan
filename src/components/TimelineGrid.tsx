@@ -11,6 +11,7 @@ import {
 
 const PIXELS_PER_MINUTE = 1.8; 
 const MIN_BLOCK_HEIGHT = 65;   
+const MIN_CLASH_CARD_HEIGHT = 86;
 const MIN_CELL_WIDTH = 120;   // Minimum width for each event card in a clash grid
 
 type RouteWarningGroup = {
@@ -165,16 +166,18 @@ function CollisionGroupRow({
   }
 
   const groupDuration = group.groupEnd - group.groupStart;
+  const mainActivityCount = group.activities.filter((act) => getTimelineBlockKind(act) === "activity").length;
   const containerHeight = Math.max(
     MIN_BLOCK_HEIGHT,
-    groupDuration * PIXELS_PER_MINUTE
+    groupDuration * PIXELS_PER_MINUTE,
+    mainActivityCount > 1 ? MIN_CLASH_CARD_HEIGHT : MIN_BLOCK_HEIGHT
   );
-  const mainActivityCount = group.activities.filter((act) => getTimelineBlockKind(act) === "activity").length;
   const conflictLabel = mainActivityCount >= 2
     ? `Time Clash — ${mainActivityCount} overlapping events`
     : mainActivityCount === 0
       ? "Route timing conflict — overlapping travel/buffer blocks"
       : "Route timing conflict — travel/buffer overlaps an activity";
+  const shouldAlignActivityClashCards = mainActivityCount >= 2;
 
   return (
     <div className="relative group/group-row">
@@ -196,60 +199,92 @@ function CollisionGroupRow({
         </span>
       </div>
 
-      <div
-        className="overflow-x-auto pb-2 -mx-2 px-2 no-scrollbar"
-        style={{
-          display: "grid",
-          gridTemplateColumns: `repeat(${group.activities.length}, minmax(${MIN_CELL_WIDTH}px, 1fr))`,
-          gap: "12px",
-          minHeight: `${containerHeight}px`,
-        }}
-      >
-        {group.activities.map((act) => {
-          const dur = getDurationMinutes(act);
-          const blockHeight = Math.max(
-            MIN_BLOCK_HEIGHT,
-            (dur / groupDuration) * containerHeight
-          );
+      {shouldAlignActivityClashCards ? (
+        <div
+          className="grid gap-3 overflow-x-auto pb-2 -mx-2 px-2 no-scrollbar"
+          style={{
+            gridTemplateColumns: `repeat(${group.activities.length}, minmax(190px, 1fr))`,
+          }}
+        >
+          {group.activities.map((act) => {
+            const blockKind = getTimelineBlockKind(act);
 
-          const stStr = act.startTime || act.start || "00:00";
-          const actStart = timeToMinutes(stStr);
-          let normalizedStart = actStart - group.groupStart;
-          if (normalizedStart < 0) normalizedStart += 24 * 60;
-          const topOffset = (normalizedStart / groupDuration) * containerHeight;
+            if (blockKind === "free_time") {
+              return null;
+            }
+            if (blockKind !== "activity") {
+              return <SupportTimelineBlock key={act.id || act.title} activity={act} kind={blockKind} />;
+            }
 
-          const blockKind = getTimelineBlockKind(act);
+            return (
+              <ActivityCard
+                key={act.id || act.title}
+                activity={act}
+                isClashing={true}
+                interactive={interactive}
+                onActivityClick={onActivityClick}
+                showEditIcon={showEditIcon}
+                compact={compact}
+                heightPx={undefined}
+              />
+            );
+          })}
+        </div>
+      ) : (
+        <div
+          className="overflow-x-auto pb-2 -mx-2 px-2 no-scrollbar"
+          style={{
+            display: "grid",
+            gridTemplateColumns: `repeat(${group.activities.length}, minmax(${MIN_CELL_WIDTH}px, 1fr))`,
+            gap: "12px",
+            minHeight: `${containerHeight}px`,
+          }}
+        >
+          {group.activities.map((act) => {
+            const blockKind = getTimelineBlockKind(act);
+            const dur = getDurationMinutes(act);
+            const blockHeight = Math.max(
+              MIN_BLOCK_HEIGHT,
+              (dur / groupDuration) * containerHeight
+            );
 
-          if (blockKind === "free_time") {
-            return null;
-          }
-          if (blockKind !== "activity") {
+            const stStr = act.startTime || act.start || "00:00";
+            const actStart = timeToMinutes(stStr);
+            let normalizedStart = actStart - group.groupStart;
+            if (normalizedStart < 0) normalizedStart += 24 * 60;
+            const topOffset = (normalizedStart / groupDuration) * containerHeight;
+
+            if (blockKind === "free_time") {
+              return null;
+            }
+            if (blockKind !== "activity") {
+              return (
+                <div key={act.id || act.title} style={{ position: "relative", height: `${containerHeight}px` }}>
+                  <div style={{ position: "absolute", top: `${topOffset}px`, width: "100%" }}>
+                    <SupportTimelineBlock activity={act} kind={blockKind} />
+                  </div>
+                </div>
+              );
+            }
+
             return (
               <div key={act.id || act.title} style={{ position: "relative", height: `${containerHeight}px` }}>
-                <div style={{ position: "absolute", top: `${topOffset}px`, width: "100%" }}>
-                  <SupportTimelineBlock activity={act} kind={blockKind} />
+                <div style={{ position: "absolute", top: `${topOffset}px`, width: "100%", height: `${blockHeight}px` }}>
+                  <ActivityCard
+                    activity={act}
+                    isClashing={true}
+                    interactive={interactive}
+                    onActivityClick={onActivityClick}
+                    showEditIcon={showEditIcon}
+                    compact={compact}
+                    heightPx={blockHeight}
+                  />
                 </div>
               </div>
             );
-          }
-
-          return (
-            <div key={act.id || act.title} style={{ position: "relative", height: `${containerHeight}px` }}>
-              <div style={{ position: "absolute", top: `${topOffset}px`, width: "100%", height: `${blockHeight}px` }}>
-                <ActivityCard
-                  activity={act}
-                  isClashing={true}
-                  interactive={interactive}
-                  onActivityClick={onActivityClick}
-                  showEditIcon={showEditIcon}
-                  compact={compact}
-                  heightPx={blockHeight}
-                />
-              </div>
-            </div>
-          );
-        })}
-      </div>
+          })}
+        </div>
+      )}
     </div>
   );
 }
@@ -366,74 +401,106 @@ function ActivityCard({
   return (
     <Tag
       onClick={interactive && onActivityClick ? () => onActivityClick(activity) : undefined}
-      className={`w-full bg-card rounded-2xl shadow-sm transition-all text-left group ${
+      className={`w-full text-left group ${
         isClashing
-          ? "border-2 border-red-400 hover:border-red-500 shadow-red-100"
-          : "border border-border hover:border-primary/30"
-      } ${interactive ? "hover:shadow-md cursor-pointer" : "cursor-default"}`}
+          ? "bg-white border border-red-200 rounded-2xl shadow-sm hover:shadow-red-100/80"
+          : "bg-white border border-slate-100 rounded-2xl shadow-sm hover:shadow-slate-200/80"
+      } ${interactive ? "hover:shadow-md cursor-pointer" : "cursor-default"} transition-shadow duration-200`}
       style={{
-        padding: compact ? "12px" : "20px",
+        padding: "12px 14px",
         height: heightPx ? `${heightPx}px` : "auto",
         overflow: "hidden",
         display: "flex",
         flexDirection: "column",
-        justifyContent: "center",
+        gap: "8px",
       }}
     >
-      <div className="flex items-start justify-between mb-2">
-        <div className="flex items-center gap-2 flex-wrap">
-          <h4 style={{ fontSize: "15px" }}>{activity.title}</h4>
+      {/* Top row: title + badges */}
+      <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: "8px" }}>
+        <h4
+          title={activity.title}
+          style={{
+            fontSize: "13.5px",
+            fontWeight: 600,
+            lineHeight: 1.3,
+            color: isClashing ? "#b91c1c" : "#111827",
+            margin: 0,
+            display: "-webkit-box",
+            WebkitLineClamp: 2,
+            WebkitBoxOrient: "vertical",
+            overflow: "hidden",
+          }}
+        >
+          {activity.title}
+        </h4>
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: "4px", flexShrink: 0 }}>
           {isClashing && (
             <span
               style={{
-                fontSize: "10px",
-                padding: "2px 7px",
-                borderRadius: "9999px",
-                backgroundColor: "#fef2f2",
+                display: "inline-flex",
+                alignItems: "center",
+                gap: "3px",
+                background: "#fee2e2",
                 color: "#dc2626",
+                fontSize: "10px",
                 fontWeight: 700,
-                border: "1px solid #fca5a5",
+                padding: "2px 6px",
+                borderRadius: "4px",
+                letterSpacing: "0.04em",
                 whiteSpace: "nowrap",
               }}
             >
               ⚡ Clash
             </span>
           )}
-        </div>
-        <div className="flex items-center gap-2">
           {activity.duration && (
             <span
-              className={`text-sm px-3 py-1 rounded-full ${
-                isClashing ? "bg-red-50 text-red-600" : "bg-secondary text-secondary-foreground"
-              }`}
+              style={{
+                background: isClashing ? "#fee2e2" : "#f1f5f9",
+                color: isClashing ? "#b91c1c" : "#475569",
+                fontSize: "11px",
+                fontWeight: 500,
+                padding: "2px 7px",
+                borderRadius: "4px",
+                whiteSpace: "nowrap",
+              }}
             >
               {activity.duration}
             </span>
           )}
           {showEditIcon && (
             <div className="opacity-0 group-hover:opacity-100 transition-opacity">
-              <Edit2 className="h-4 w-4 text-primary" />
+              <Edit2 size={12} style={{ color: "var(--primary)" }} />
             </div>
           )}
         </div>
       </div>
 
-      <div className="flex items-center gap-3 text-sm text-muted-foreground flex-wrap">
-        <div
-          className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full ${
-            isClashing ? "bg-red-50 text-red-700" : "bg-muted/50"
-          }`}
-        >
-          <Clock className="h-4 w-4" />
-          <span>
+      {/* Bottom row: time + location */}
+      <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: "5px" }}>
+          <Clock size={12} style={{ flexShrink: 0, color: isClashing ? "#ef4444" : "#94a3b8" }} />
+          <span style={{ fontSize: "11.5px", color: isClashing ? "#dc2626" : "#64748b", whiteSpace: "nowrap", fontVariantNumeric: "tabular-nums" }}>
             {st} – {et}
           </span>
         </div>
-
         {activity.location && (
-          <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-muted/50">
-            <MapPin className="h-4 w-4" />
-            <span>{activity.location}</span>
+          <div style={{ display: "flex", alignItems: "flex-start", gap: "5px" }}>
+            <MapPin size={12} style={{ flexShrink: 0, marginTop: "2px", color: "#94a3b8" }} />
+            <span
+              title={activity.location}
+              style={{
+                fontSize: "11.5px",
+                color: "#64748b",
+                lineHeight: 1.4,
+                display: "-webkit-box",
+                WebkitLineClamp: 2,
+                WebkitBoxOrient: "vertical",
+                overflow: "hidden",
+              }}
+            >
+              {activity.location}
+            </span>
           </div>
         )}
       </div>
@@ -717,17 +784,63 @@ function SupportTimelineBlock({ activity, kind }: { activity: ActivityBlock; kin
     ? "text-indigo-500"
     : "text-emerald-500";
 
+  const isTravelOrRoute = kind === "travel" || kind === "start_route" || kind === "route_conflict";
+
+  const bgStyle: React.CSSProperties = kind === "travel" || kind === "start_route"
+    ? { background: "linear-gradient(90deg, #eef2ff 0%, #f5f3ff 100%)", borderColor: "#c7d2fe" }
+    : kind === "route_conflict"
+    ? { background: "#fff1f2", borderColor: "#fecaca" }
+    : { background: "linear-gradient(90deg, #f0fdf4 0%, #ecfdf5 100%)", borderColor: "#bbf7d0" };
+
+  const accentColor = kind === "travel" || kind === "start_route"
+    ? "#6366f1"
+    : kind === "route_conflict"
+    ? "#ef4444"
+    : "#10b981";
+
+  const Icon = kind === "buffer" ? Clock : MapPin;
+
   return (
-    <div className={`rounded-xl border px-3 py-2 shadow-sm ${colorClass}`}>
-      <div className="flex items-center justify-between gap-3">
-        <span className="flex items-center gap-2 text-xs font-semibold">
-          {kind === "buffer" ? <Clock className={`h-3.5 w-3.5 ${iconClass}`} /> : <MapPin className={`h-3.5 w-3.5 ${iconClass}`} />}
+    <div
+      style={{
+        borderRadius: "10px",
+        border: "1px solid",
+        ...bgStyle,
+        padding: "8px 12px",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "space-between",
+        gap: "12px",
+        boxShadow: "0 1px 3px rgba(0,0,0,0.05)",
+      }}
+    >
+      <div style={{ display: "flex", alignItems: "center", gap: "7px", minWidth: 0, flex: 1 }}>
+        <Icon size={13} style={{ flexShrink: 0, color: accentColor }} />
+        <span
+          style={{
+            fontSize: "12.5px",
+            fontWeight: 500,
+            color: kind === "route_conflict" ? "#b91c1c" : "#374151",
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+          }}
+          title={label}
+        >
           {label}
         </span>
-        <span className="text-xs font-medium opacity-75 whitespace-nowrap">
-          {st} – {et}
-        </span>
       </div>
+      <span
+        style={{
+          fontSize: "11.5px",
+          color: "#6b7280",
+          whiteSpace: "nowrap",
+          flexShrink: 0,
+          fontVariantNumeric: "tabular-nums",
+        }}
+      >
+        {st} – {et}
+      </span>
     </div>
   );
 }

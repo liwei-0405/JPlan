@@ -17,6 +17,7 @@ import { Textarea } from "./ui/textarea";
 import { Input } from "./ui/input";
 import { Label } from "./ui/label";
 import { Switch } from "./ui/switch";
+import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
 import {
   ArrowLeft,
   Plus,
@@ -32,7 +33,8 @@ import {
   Edit3,
   Lightbulb,
   RefreshCw,
-  AlertTriangle
+  AlertTriangle,
+  Info
 } from "lucide-react";
 import type { DailySchedule, ActivityBlock } from "../App";
 import { EventEditModal } from "./EventEditModal";
@@ -1733,13 +1735,27 @@ export function PlanningInputPage({
           </div>
         )}
 
-        <div className="grid lg:grid-cols-2 gap-6 items-stretch">
+        <div className="grid gap-6 lg:grid-cols-2 items-stretch">
           {/* Left: Live Schedule Preview */}
-          <div className="lg:col-span-7 flex flex-col bg-card rounded-2xl border border-border shadow-sm overflow-hidden" style={{ height: "550px" }}>
-            <div className="p-5 border-b bg-secondary/10 flex justify-between items-center">
+          <div
+            className="flex flex-col overflow-hidden rounded-2xl border border-border bg-card shadow-sm"
+            style={{ height: "550px" }}
+          >
+            <div className="p-5 border-b bg-secondary/10 flex justify-between items-start gap-4">
               <div className="min-w-0 flex-1">
-                <h3 className="text-lg font-bold">Live Schedule</h3>
-                <p className="text-xs text-muted-foreground">{previewSchedule?.date || "No activities yet"}</p>
+                <div className="flex flex-wrap items-center gap-2">
+                  <h3 className="text-lg font-bold">Live Schedule</h3>
+                  {isDirtySchedule && (
+                    <span className="inline-flex items-center gap-1 rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[11px] font-medium text-amber-800">
+                      <AlertTriangle className="h-3 w-3" />
+                      Not re-optimized
+                    </span>
+                  )}
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  {previewSchedule?.date || "No activities yet"}
+                  {saveWithoutRerunNotice ? " · Saved, but not re-optimized" : ""}
+                </p>
                 <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
                   <span className="inline-flex items-center gap-1 text-muted-foreground">
                     <MapPin className="h-3.5 w-3.5" />
@@ -1809,14 +1825,28 @@ export function PlanningInputPage({
                   )}
                 </div>
               </div>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => onViewExplanation(previewSchedule || { date: isoDateStr, activities: [] })}
-                className="rounded-xl gap-2 text-xs border-primary/20 hover:bg-primary/5"
-              >
-                <Lightbulb size={14} className="text-yellow-500" /> Explain Schedule
-              </Button>
+              <div className="flex shrink-0 flex-col items-end gap-2">
+                {isDirtySchedule && (
+                  <Button
+                    type="button"
+                    size="sm"
+                    className="h-8 rounded-xl gap-2 px-3 text-xs"
+                    onClick={handleRunScheduler}
+                    disabled={isScheduleBusy}
+                  >
+                    {isRunningScheduler ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+                    Run scheduler
+                  </Button>
+                )}
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => onViewExplanation(previewSchedule || { date: isoDateStr, activities: [] })}
+                  className="rounded-xl gap-2 text-xs border-primary/20 hover:bg-primary/5"
+                >
+                  <Lightbulb size={14} className="text-yellow-500" /> Explain Schedule
+                </Button>
+              </div>
             </div>
 
             <div className="flex-1 overflow-y-auto p-6 bg-secondary/5">
@@ -1837,107 +1867,52 @@ export function PlanningInputPage({
           </div>
 
           {/* RIGHT: Control Panel (5 Columns) */}
-          <div className="lg:col-span-5 flex flex-col gap-4">
+          <div
+            className="flex min-h-0 flex-col gap-3 overflow-hidden"
+            style={{ height: "550px" }}
+          >
 
             {/* Mode Switcher */}
-            <div className="grid grid-cols-2 p-1 bg-secondary/30 rounded-2xl border border-border">
-              <Button
-                variant={activeMode === "assistant" ? "default" : "ghost"}
-                onClick={() => setActiveMode("assistant")}
-                className="rounded-xl gap-2"
-                disabled={isScheduleBusy}
-              >
-                <MessageSquare size={16} /> AI Assistant
-              </Button>
-              <Button
-                variant={activeMode === "manual" ? "default" : "ghost"}
-                onClick={() => setActiveMode("manual")}
-                className="rounded-xl gap-2"
-                disabled={isScheduleBusy}
-              >
-                <Settings2 size={16} /> Manual Mode
-              </Button>
-            </div>
-
-            {isDirtySchedule && (
-              <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-amber-950 shadow-sm">
-                <div className="flex items-start gap-3">
-                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
-                  <div className="min-w-0 flex-1">
-                    <p className="text-sm font-medium">This plan has manual changes that have not been re-optimized.</p>
-                    <p className="mt-1 text-xs text-amber-800">
-                      Run scheduler reruns full optimization. Complete travel validation only refreshes routes.
-                    </p>
-                    {saveWithoutRerunNotice && (
-                      <p className="mt-1 text-xs font-medium text-amber-900">Saved, but not re-optimized.</p>
-                    )}
-                  </div>
-                </div>
-                <div className="mt-3 grid grid-cols-2 gap-2">
+            <div className="flex shrink-0 items-center gap-2">
+              <div className="grid flex-1 grid-cols-2 p-1 bg-secondary/30 rounded-2xl border border-border">
+                <Button
+                  variant={activeMode === "assistant" ? "default" : "ghost"}
+                  onClick={() => setActiveMode("assistant")}
+                  className="rounded-xl gap-2"
+                  disabled={isScheduleBusy}
+                >
+                  <MessageSquare size={16} /> AI Assistant
+                </Button>
+                <Button
+                  variant={activeMode === "manual" ? "default" : "ghost"}
+                  onClick={() => setActiveMode("manual")}
+                  className="rounded-xl gap-2"
+                  disabled={isScheduleBusy}
+                >
+                  <Settings2 size={16} /> Manual Mode
+                </Button>
+              </div>
+              <Tooltip>
+                <TooltipTrigger asChild>
                   <Button
                     type="button"
-                    size="sm"
-                    className="rounded-xl gap-2"
-                    onClick={handleRunScheduler}
+                    variant="ghost"
+                    size="icon"
+                    className="h-9 w-9 rounded-full"
                     disabled={isScheduleBusy}
+                    aria-label="Planning mode information"
                   >
-                    {isRunningScheduler ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
-                    Run scheduler
+                    <Info className="h-4 w-4 text-muted-foreground" />
                   </Button>
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="outline"
-                    className="rounded-xl bg-white"
-                    onClick={handleSaveCurrentPlan}
-                    disabled={!previewSchedule || previewSchedule.activities.length === 0 || isScheduleBusy}
-                  >
-                    Save without rerun
-                  </Button>
-                </div>
-              </div>
-            )}
-
-            <div className="flex items-center justify-between rounded-2xl border border-border bg-card px-4 py-3 shadow-sm">
-              <div>
-                <p className="text-sm font-medium">Allow conflicting schedules</p>
-                <p className="text-xs text-muted-foreground">
-                  {allowClash ? "On: keep user-requested overlaps and mark them clearly." : "Off: only feasible schedules will be committed."}
-                </p>
-              </div>
-              <div className="flex items-center gap-3">
-                <span className="text-xs text-muted-foreground">Allow clash</span>
-                <Switch
-                  checked={allowClash}
-                  onCheckedChange={setAllowClash}
-                  disabled={isScheduleBusy}
-                  aria-label="Allow conflicting schedules"
-                />
-              </div>
-            </div>
-
-            <div className="flex items-center justify-between rounded-2xl border border-border bg-card px-4 py-3 shadow-sm">
-              <div>
-                <p className="text-sm font-medium">Accurate travel time</p>
-                <p className="text-xs text-muted-foreground">
-                  {accurateTravelTime
-                    ? "On: confirm exact locations before final route validation."
-                    : "Off: use fast heuristic travel estimates."}
-                </p>
-              </div>
-              <div className="flex items-center gap-3">
-                <span className="text-xs text-muted-foreground">Accurate</span>
-                <Switch
-                  checked={accurateTravelTime}
-                  onCheckedChange={handleAccurateTravelToggle}
-                  disabled={isScheduleBusy}
-                  aria-label="Accurate travel time"
-                />
-              </div>
+                </TooltipTrigger>
+                <TooltipContent className="max-w-xs text-xs">
+                  Switch between AI chat and manual edits anytime. This page stays as a draft until you save, and manual changes are preserved.
+                </TooltipContent>
+              </Tooltip>
             </div>
 
             {/* Dynamic Content Area */}
-            <div className="bg-card rounded-2xl border border-border shadow-sm flex flex-col overflow-hidden" style={{ height: "380px" }}>
+            <div className="min-h-0 flex-1 bg-card rounded-2xl border border-border shadow-sm flex flex-col overflow-hidden">
               {activeMode === "assistant" ? (
                 /* Assistant UI */
                 <>
@@ -2153,6 +2128,28 @@ export function PlanningInputPage({
                     <div ref={chatEndRef} />
                   </div>
                   <div className="p-4 border-t bg-secondary/5">
+                    <div className="mb-3 flex flex-wrap items-center gap-2">
+                      <CompactPlanningToggle
+                        label="Accurate travel"
+                        checked={accurateTravelTime}
+                        disabled={isScheduleBusy}
+                        onCheckedChange={handleAccurateTravelToggle}
+                        tooltip={accurateTravelTime
+                          ? "Uses exact locations and route validation before finalizing travel blocks."
+                          : "Uses fast heuristic travel estimates until accurate travel is enabled."}
+                        ariaLabel="Accurate travel time"
+                      />
+                      <CompactPlanningToggle
+                        label="Allow clash"
+                        checked={allowClash}
+                        disabled={isScheduleBusy}
+                        onCheckedChange={setAllowClash}
+                        tooltip={allowClash
+                          ? "Keeps user-requested overlaps and marks them clearly instead of blocking the draft."
+                          : "Only feasible schedules will be committed unless you allow clashes."}
+                        ariaLabel="Allow conflicting schedules"
+                      />
+                    </div>
                     <div className="flex gap-2 items-end">
                       <Button
                         variant={isRecording ? "destructive" : "ghost"}
@@ -2331,18 +2328,10 @@ export function PlanningInputPage({
               )}
             </div>
 
-            {/* Hint Box */}
-            <div className="p-4 bg-primary/5 border border-primary/10 rounded-2xl">
-              <p className="text-xs text-muted-foreground leading-relaxed">
-                💡 <b>Tip:</b> You can switch between AI and Manual mode anytime.
-                Manual changes are preserved when you talk to the AI, and this page stays as a draft until you save.
-              </p>
-            </div>
-
             {/* Save Button */}
             <Button
               onClick={handleSaveCurrentPlan}
-              className="w-full rounded-xl py-6 text-lg font-semibold shadow-lg hover:shadow-xl transition-all"
+              className="w-full shrink-0 rounded-xl py-6 text-lg font-semibold shadow-lg hover:shadow-xl transition-all"
               disabled={!previewSchedule || previewSchedule.activities.length === 0 || isScheduleBusy}
             >
               {isProcessing ? (
@@ -2489,6 +2478,56 @@ export function PlanningInputPage({
         onConfirm={handleConfirmMapLocation}
       />
     </div >
+  );
+}
+
+function CompactPlanningToggle({
+  label,
+  checked,
+  disabled,
+  onCheckedChange,
+  tooltip,
+  ariaLabel,
+}: {
+  label: string;
+  checked: boolean;
+  disabled: boolean;
+  onCheckedChange: (checked: boolean) => void;
+  tooltip: string;
+  ariaLabel: string;
+}) {
+  return (
+    <div
+      className={`inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs shadow-sm transition-colors ${
+        checked
+          ? "border-primary/25 bg-primary/10 text-primary"
+          : "border-border bg-background text-muted-foreground"
+      }`}
+    >
+      <span className="font-medium">{label}</span>
+      <Switch
+        checked={checked}
+        onCheckedChange={onCheckedChange}
+        disabled={disabled}
+        aria-label={ariaLabel}
+        className="scale-75"
+      />
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <button
+            type="button"
+            className="inline-flex h-5 w-5 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-50"
+            disabled={disabled}
+            aria-label={`${label} help`}
+          >
+            <Info className="h-3.5 w-3.5" />
+          </button>
+        </TooltipTrigger>
+        <TooltipContent className="max-w-xs text-xs">
+          {tooltip}
+        </TooltipContent>
+      </Tooltip>
+    </div>
   );
 }
 
