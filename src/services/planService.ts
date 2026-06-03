@@ -414,7 +414,14 @@ export async function deletePlan(date: string, userId: string): Promise<{ succes
 /**
  * Export a daily schedule to Google Calendar via backend API
  */
-export async function exportPlanToGoogle(date: string, userId: string): Promise<{ success: boolean; exportedCount?: number; error?: string }> {
+export async function exportPlanToGoogle(date: string, userId: string): Promise<{
+    success: boolean;
+    exportedCount?: number;
+    activityCount?: number;
+    travelCount?: number;
+    skippedCount?: number;
+    error?: string;
+}> {
     try {
         if (!userId) return { success: false, error: 'User not authenticated' };
         const response = await fetch(`${API_BASE_URL}/api/export-calendar`, {
@@ -422,9 +429,24 @@ export async function exportPlanToGoogle(date: string, userId: string): Promise<
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ user_id: userId, date }),
         });
-        if (!response.ok) return { success: false, error: 'Failed' };
+        if (!response.ok) {
+            let detail = 'Failed';
+            try {
+                const errorData = await response.json();
+                detail = errorData.detail || errorData.error || detail;
+            } catch {
+                // Keep the generic fallback when the backend returns a non-JSON error.
+            }
+            return { success: false, error: detail };
+        }
         const data = await response.json();
-        return { success: true, exportedCount: data.exported_count };
+        return {
+            success: true,
+            exportedCount: data.exported_count,
+            activityCount: data.activity_count,
+            travelCount: data.travel_count,
+            skippedCount: data.skipped_count,
+        };
     } catch (err) {
         return { success: false, error: 'Connection failed' };
     }

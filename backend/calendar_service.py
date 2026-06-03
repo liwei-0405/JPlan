@@ -1,13 +1,25 @@
 import os
 import requests
 import json
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime, timedelta
 from supabase import Client
 
 from jplan_logging import jlog
 
 CALENDAR_VERBOSE_LOGS = os.getenv("JPLAN_CALENDAR_DEBUG", "").lower() in {"1", "true", "yes", "on"}
+JPLAN_EXPORT_MARKER = "Created via JPlan"
+EXPORTABLE_TRAVEL_TYPES = {"travel", "transition", "start_route"}
+SKIPPED_EXPORT_TYPES = {
+    "free",
+    "free_time",
+    "idle",
+    "buffer",
+    "prep",
+    "support",
+    "route_conflict",
+    "warning",
+}
 
 
 def _calendar_log(message: str, stage: str = "INFO") -> None:
@@ -19,11 +31,253 @@ def _calendar_debug(message: str) -> None:
         _calendar_log(message, "DEBUG")
 
 
+def _normalize_export_type(block: Dict[str, Any]) -> str:
+    return str(block.get("block_type") or block.get("type") or "").strip().lower()
+
+
+def _activity_key(item: Dict[str, Any]) -> str:
+    for field in ("stable_activity_id", "activity_id", "id", "source_activity_id"):
+        value = item.get(field)
+        if value:
+            return str(value)
+    title = str(item.get("title") or item.get("activity") or "").strip().lower()
+    duration = item.get("duration_minutes") or item.get("duration")
+    return f"title:{title}|duration:{duration or ''}"
+
+
+def _first_text(*values: Any) -> str:
+    for value in values:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text and text.lower() not in {"none", "null", "undefined"}:
+            return text
+    return ""
+
+
+def _best_location_label(item: Dict[str, Any]) -> str:
+    resolved = item.get("resolved_location") if isinstance(item.get("resolved_location"), dict) else {}
+    return _first_text(
+        item.get("location_label"),
+        item.get("location"),
+        resolved.get("display_name"),
+        resolved.get("address"),
+        resolved.get("label"),
+        item.get("saved_location_label"),
+        item.get("to_location"),
+    )
+
+
+def _format_minutes_as_time(minutes: Any) -> Optional[str]:
+    try:
+        total = int(minutes)
+    except (TypeError, ValueError):
+        return None
+    total %= 24 * 60
+    hour = total // 60
+    minute = total % 60
+    suffix = "AM" if hour < 12 else "PM"
+    hour_12 = hour % 12 or 12
+    return f"{hour_12:02d}:{minute:02d} {suffix}"
+
+
+def _item_start_end(item: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+    start = item.get("startTime") or item.get("start")
+    end = item.get("endTime") or item.get("end")
+    if not start:
+        start = _format_minutes_as_time(item.get("scheduled_start") or item.get("fixed_start"))
+    if not end:
+        end = _format_minutes_as_time(item.get("scheduled_end") or item.get("fixed_end"))
+    return start, end
+
+
+def _is_display_only(block: Dict[str, Any]) -> bool:
+    return bool(block.get("display_only") or block.get("is_route_conflict"))
+
+
+def _is_exportable_travel(block: Dict[str, Any]) -> bool:
+    kind = _normalize_export_type(block)
+    if _is_display_only(block):
+        return False
+    if kind in EXPORTABLE_TRAVEL_TYPES:
+        return True
+    title = str(block.get("title") or "").lower()
+    return kind == "activity_support" and "travel" in title
+
+
+def _looks_like_legacy_activity(block: Dict[str, Any]) -> bool:
+    kind = _normalize_export_type(block)
+    if kind:
+        return False
+    title = str(block.get("title") or block.get("activity") or "").strip().lower()
+    if not title:
+        return False
+    if title in {"free time", "prep / buffer"} or title.startswith("travel to") or "route warning" in title:
+        return False
+    start, end = _item_start_end(block)
+    return bool(start and end)
+
+
+def _is_exportable_activity(block: Dict[str, Any]) -> bool:
+    kind = _normalize_export_type(block)
+    return not _is_display_only(block) and (kind == "activity" or _looks_like_legacy_activity(block))
+
+
+def _has_unresolved_start_route_conflict(plan: Dict[str, Any]) -> bool:
+    for conflict in plan.get("route_conflicts") or []:
+        if not isinstance(conflict, dict):
+            continue
+        reason_code = str(conflict.get("reason_code") or "")
+        has_start_marker = any(
+            conflict.get(field)
+            for field in ("leave_by", "first_physical_event", "blocker_activity_id", "blocker_activity_title")
+        )
+        if reason_code == "start_route_blocker" or (reason_code == "fixed_to_fixed_infeasible" and has_start_marker):
+            return True
+    return False
+
+
+def _start_route_export_event(plan: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if _has_unresolved_start_route_conflict(plan):
+        return None
+    summary = plan.get("start_route_summary")
+    if not isinstance(summary, dict):
+        return None
+
+    start_location = _first_text(summary.get("start_location"))
+    destination = _first_text(
+        summary.get("first_physical_event_location"),
+        summary.get("destination_location"),
+        summary.get("to_location"),
+        summary.get("first_physical_event"),
+    )
+    leave_by = _first_text(summary.get("leave_by"))
+    duration = summary.get("travel_duration_minutes")
+    if not start_location or not destination or not leave_by or not duration:
+        return None
+
+    end_time = _first_text(summary.get("first_physical_event_start"))
+    if not end_time:
+        try:
+            leave_minutes = datetime.strptime(leave_by, "%I:%M %p").hour * 60 + datetime.strptime(leave_by, "%I:%M %p").minute
+            end_time = _format_minutes_as_time(leave_minutes + int(duration)) or ""
+        except Exception:
+            end_time = ""
+    if not end_time:
+        return None
+
+    return {
+        "summary": f"Travel to {destination}",
+        "startTime": leave_by,
+        "endTime": end_time,
+        "location": destination,
+        "description": "\n".join([
+            JPLAN_EXPORT_MARKER,
+            f"Route: {start_location} -> {destination}",
+            f"Travel time: {duration} min",
+        ]),
+        "jplan_export_type": "travel",
+    }
+
+
+def build_google_export_events(plan: Dict[str, Any], date_str: str) -> Dict[str, Any]:
+    """Build Google Calendar event payloads from the committed JPlan timeline."""
+    activities = plan.get("activities") or []
+    activity_by_key = {
+        _activity_key(activity): activity
+        for activity in activities
+        if isinstance(activity, dict)
+    }
+    blocks = plan.get("schedule_blocks") or []
+    export_source = blocks if blocks else activities
+
+    events: List[Dict[str, Any]] = []
+    skipped_count = 0
+    activity_count = 0
+    travel_count = 0
+
+    start_route_event = _start_route_export_event(plan)
+    if start_route_event:
+        events.append(start_route_event)
+        travel_count += 1
+
+    for raw in export_source:
+        if not isinstance(raw, dict):
+            skipped_count += 1
+            continue
+
+        kind = _normalize_export_type(raw)
+        if _is_display_only(raw):
+            skipped_count += 1
+            continue
+
+        is_activity = _is_exportable_activity(raw)
+        is_travel = _is_exportable_travel(raw)
+        if kind in SKIPPED_EXPORT_TYPES and not is_travel:
+            skipped_count += 1
+            continue
+        if not is_activity and not is_travel:
+            skipped_count += 1
+            continue
+
+        source_activity = activity_by_key.get(_activity_key(raw), {}) if is_activity else {}
+        item = {**source_activity, **raw}
+        start_time, end_time = _item_start_end(item)
+        if not start_time or not end_time:
+            skipped_count += 1
+            continue
+
+        if is_activity:
+            summary = _first_text(item.get("title"), item.get("activity"), "JPlan Activity")
+            description = JPLAN_EXPORT_MARKER
+            activity_count += 1
+        else:
+            destination = _first_text(item.get("to_activity"), item.get("to_location"), item.get("location"))
+            summary = _first_text(item.get("title"), f"Travel to {destination}" if destination else "Travel")
+            duration = item.get("duration_minutes") or item.get("route_duration_minutes")
+            from_label = _first_text(item.get("from_activity"), item.get("from_location"))
+            to_label = _first_text(item.get("to_activity"), item.get("to_location"))
+            details = [JPLAN_EXPORT_MARKER]
+            if from_label or to_label:
+                details.append(f"Route: {from_label or 'previous stop'} -> {to_label or 'next stop'}")
+            if duration:
+                details.append(f"Travel time: {duration} min")
+            description = "\n".join(details)
+            travel_count += 1
+
+        location = _best_location_label(item)
+        event = {
+            "summary": summary,
+            "startTime": start_time,
+            "endTime": end_time,
+            "description": description,
+            "jplan_export_type": "activity" if is_activity else "travel",
+        }
+        if location:
+            event["location"] = location
+        events.append(event)
+
+    _calendar_log(
+        f"Prepared Google export date={date_str} activities={activity_count} travel={travel_count} skipped={skipped_count}",
+        "EXPORT",
+    )
+    return {
+        "events": events,
+        "activity_count": activity_count,
+        "travel_count": travel_count,
+        "skipped_count": skipped_count,
+    }
+
+
 class CalendarService:
     def __init__(self, supabase_client: Client):
         self.supabase = supabase_client
         self.client_id = os.getenv("GOOGLE_CLIENT_ID")
         self.client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
+
+    @staticmethod
+    def _empty_export_result() -> Dict[str, int]:
+        return {"exported_count": 0, "activity_count": 0, "travel_count": 0, "skipped_count": 0}
 
     def list_calendars(self, access_token: str) -> List[Dict[str, Any]]:
         """List all calendars available to the user"""
@@ -273,20 +527,21 @@ class CalendarService:
             _calendar_log(f"Bulk sync failed for user {user_id}: {e}", "ERROR")
             return {}
 
-    def export_schedule_to_google(self, user_id: str, date_str: str, activities: List[Dict[str, Any]]) -> int:
+    def export_schedule_to_google(self, user_id: str, date_str: str, plan: Dict[str, Any]) -> Dict[str, int]:
         """
-        Push JPlan activities to Google Calendar
+        Push the committed JPlan timeline to Google Calendar.
         """
         try:
             # 1. Get refresh token
             res = self.supabase.table("profiles").select("google_refresh_token").eq("id", user_id).execute()
             if not res.data or len(res.data) == 0:
                 _calendar_log(f"No profile found for user {user_id}", "ERROR")
-                return False
+                raise Exception("TOKEN_EXPIRED")
             
             refresh_token = res.data[0].get("google_refresh_token")
             if not refresh_token:
-                return False
+                _calendar_log(f"No Google refresh token found for user {user_id}", "ERROR")
+                raise Exception("TOKEN_EXPIRED")
 
             # 2. Get access token
             try:
@@ -296,7 +551,7 @@ class CalendarService:
             except Exception as e:
                 if str(e) == "TOKEN_EXPIRED":
                     raise e
-                return False
+                raise Exception("TOKEN_EXPIRED")
 
             headers = {
                 "Authorization": f"Bearer {access_token}",
@@ -348,24 +603,19 @@ class CalendarService:
             
             _calendar_debug(f"Cleanup finished; deleted={deleted_count}")
 
-            # 4. Push each activity
+            # 4. Push each exportable timeline item
+            export_payload = build_google_export_events(plan, date_str)
+            export_events = export_payload["events"]
             exported_count = 0
-            _calendar_debug(f"Starting export user={user_id} date={date_str} activities={len(activities)}")
-            for act in activities:
-                _calendar_debug(f"Processing activity='{act.get('title')}' source={act.get('source')} type={act.get('type')}")
-                
-                # Push EVERYTHING to ensure Google matches JPlan exactly
-                
-                # Only export 'activity' types
-                if act.get("type") != "activity":
-                    _calendar_debug(f"Skipping '{act.get('title')}' because type={act.get('type')}")
-                    continue
+            _calendar_debug(f"Starting export user={user_id} date={date_str} items={len(export_events)}")
+            for event_item in export_events:
+                _calendar_debug(f"Processing export item='{event_item.get('summary')}' type={event_item.get('jplan_export_type')}")
 
-                start_dt = parse_time_to_dt(act.get("startTime"), date_str)
-                end_dt = parse_time_to_dt(act.get("endTime"), date_str)
+                start_dt = parse_time_to_dt(event_item.get("startTime"), date_str)
+                end_dt = parse_time_to_dt(event_item.get("endTime"), date_str)
                 
                 if not start_dt or not end_dt:
-                    _calendar_debug(f"Skipping '{act.get('title')}' because time parsing failed")
+                    _calendar_debug(f"Skipping '{event_item.get('summary')}' because time parsing failed")
                     continue
 
                 # FIX: Handle cases where end time is physically before start time (e.g. crossing midnight)
@@ -377,13 +627,14 @@ class CalendarService:
                 end_payload = {"dateTime": end_dt.strftime("%Y-%m-%dT%H:%M:%S") + "+08:00"}
 
                 event = {
-                    "summary": act.get("title", "JPlan Activity"),
-                    "location": act.get("location", ""),
-                    "description": "Created via JPlan",
+                    "summary": event_item.get("summary", "JPlan Activity"),
+                    "description": event_item.get("description") or JPLAN_EXPORT_MARKER,
                     "start": start_payload,
                     "end": end_payload,
                     "reminders": {"useDefault": True}
                 }
+                if event_item.get("location"):
+                    event["location"] = event_item["location"]
                 
                 _calendar_debug(f"Sending event payload to Google: {json.dumps(event)}")
 
@@ -397,11 +648,20 @@ class CalendarService:
                 resp.raise_for_status()
                 exported_count += 1
 
-            _calendar_log(f"Successfully exported {exported_count} activities to Google", "EXPORT")
-            return exported_count
+            _calendar_log(
+                f"Successfully exported {exported_count} timeline items to Google "
+                f"(activities={export_payload['activity_count']} travel={export_payload['travel_count']})",
+                "EXPORT",
+            )
+            return {
+                "exported_count": exported_count,
+                "activity_count": export_payload["activity_count"],
+                "travel_count": export_payload["travel_count"],
+                "skipped_count": export_payload["skipped_count"],
+            }
 
         except Exception as e:
             if "TOKEN_EXPIRED" in str(e) or "insufficientPermissions" in str(e):
                 raise e
             _calendar_log(f"Export failed for user {user_id}: {e}", "ERROR")
-            return 0
+            return self._empty_export_result()

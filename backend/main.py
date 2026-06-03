@@ -1224,9 +1224,9 @@ async def export_calendar(request: ExportRequest):
         if not plan or not plan.get("activities"):
             raise HTTPException(status_code=404, detail="No activities found for this date")
             
-        count = cal_service.export_schedule_to_google(request.user_id, request.date, plan.get("activities"))
+        result = cal_service.export_schedule_to_google(request.user_id, request.date, plan)
             
-        return {"message": "Success", "exported_count": count}
+        return {"message": "Success", **result}
     except Exception as e:
         error_msg = str(e)
         jlog("API", f"Export error: {error_msg}", "CALENDAR")

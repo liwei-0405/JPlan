@@ -62,10 +62,16 @@ export function ScheduleViewPage({
       }
 
       const count = result.exportedCount || 0;
+      const activityCount = result.activityCount || 0;
+      const travelCount = result.travelCount || 0;
       if (count === 0) {
         toast.info("No new activities to export. (Synced Google events are skipped)", { id: exportToast, duration: 5000 });
       } else {
-        toast.success(`Successfully exported ${count} activities to Google Calendar!`, { id: exportToast, duration: 4000 });
+        const parts = [
+          `${activityCount} ${activityCount === 1 ? "activity" : "activities"}`,
+          `${travelCount} travel ${travelCount === 1 ? "block" : "blocks"}`,
+        ];
+        toast.success(`Exported ${parts.join(" and ")} to Google Calendar.`, { id: exportToast, duration: 4000 });
       }
     } catch (err: any) {
       toast.error(err.message || "Failed to export", { id: exportToast, duration: 4000 });
