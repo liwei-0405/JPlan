@@ -174,6 +174,8 @@ class ModuleCConstructorMixin:
             return False
         if self._location_flexible_selected_endpoint_requires_route(activity):
             return True
+        if self._activity_has_user_selected_physical_endpoint(activity):
+            return True
         status = clean_title(activity.get("location_status") or "")
         category = clean_title(activity.get("location_category") or "")
         raw_travel_required = activity.get("travel_required")
@@ -186,6 +188,36 @@ class ModuleCConstructorMixin:
         if category in {"home_or_online", "none"}:
             return False
         return True
+
+    def _activity_has_user_selected_physical_endpoint(self, activity: Dict[str, Any]) -> bool:
+        resolved = activity.get("resolved_location")
+        if not isinstance(resolved, dict):
+            return False
+        if not self._coordinate_from_activity_payload(resolved):
+            return False
+        label_text = clean_title(
+            " ".join(
+                str(value or "")
+                for value in (
+                    activity.get("location_label"),
+                    activity.get("location"),
+                    resolved.get("label"),
+                    resolved.get("display_name"),
+                )
+            )
+        )
+        if re.search(r"\b(current location|current place|starting point|start location|default start)\b", label_text):
+            return False
+        policy = clean_title(activity.get("location_policy") or "").replace(" ", "_").replace("-", "_")
+        source = clean_title(activity.get("location_source") or "").replace(" ", "_").replace("-", "_")
+        kind = clean_title(activity.get("location_kind") or "").replace(" ", "_").replace("-", "_")
+        return bool(
+            activity.get("travel_required") is True
+            or policy == "exact_location_required"
+            or source in {"event_manual_location", "selected_geocode", "event_confirmed", "manual_edit"}
+            or kind in {"exact_named_place", "area_only", "unknown_physical"}
+            or activity.get("explicit_user_location")
+        )
 
     def _location_flexible_selected_endpoint_requires_route(self, activity: Dict[str, Any]) -> bool:
         if not bool(activity.get("location_flexible") and activity.get("travel_context_required")):

@@ -37,7 +37,9 @@ export type ActivityBlock = {
   location?: string;
   location_label?: string;
   location_category?: string;
+  location_kind?: string;
   location_status?: string;
+  location_resolution_status?: string;
   location_source?: string;
   location_policy?: "no_location_required" | "location_flexible" | "exact_location_required" | "category_location_required" | string;
   location_confidence?: number;
@@ -85,6 +87,7 @@ export type ActivityBlock = {
   duration_minutes?: number;
   priority?: "low" | "medium" | "high";
   isMandatory?: boolean;
+  is_mandatory?: boolean;
   timing_mode?: string;
   original_timing_mode?: string;
   is_user_fixed?: boolean;

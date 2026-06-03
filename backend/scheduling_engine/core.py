@@ -312,7 +312,18 @@ class SchedulingEngine(
             for item in loaded_canonical
             if item.get("status") == "active"
         ]
+        for item in active_set:
+            if item.get("resolved_location") or item.get("location_status") == "resolved":
+                jlog(
+                    "RUN_SCHEDULER",
+                    (
+                        f"title={item.get('title')} travel_required={str(bool(item.get('travel_required'))).lower()} "
+                        f"location_status={item.get('location_status') or item.get('location_resolution_status')}"
+                    ),
+                    "INPUT_LOCATION",
+                )
         schedule_date = working.get("date") or self._local_today_iso()
+        jlog("MODULE_9", f"replanning date={schedule_date} source=manual_button full_optimizer=true", "REPLAN")
         planned_result = self._plan_schedule(schedule_date, active_set, preferences)
         conflicts = self._build_conflicts(planned_result.get("activities", []), set())
         warnings = self._collect_schedule_warnings(
@@ -439,6 +450,35 @@ class SchedulingEngine(
 
     def _prepare_activity_for_manual_scheduler(self, item: Dict[str, Any]) -> Dict[str, Any]:
         prepared = deepcopy(item)
+        resolved_location = prepared.get("resolved_location") if isinstance(prepared.get("resolved_location"), dict) else {}
+        has_coordinates = (
+            resolved_location.get("latitude") is not None
+            and resolved_location.get("longitude") is not None
+        )
+        if has_coordinates:
+            display_name = (
+                resolved_location.get("display_name")
+                or resolved_location.get("address")
+                or prepared.get("location_label")
+                or prepared.get("location")
+            )
+            if display_name:
+                prepared["location"] = display_name
+                prepared["location_label"] = display_name
+            existing_kind = str(prepared.get("location_kind") or "").strip().lower().replace(" ", "_").replace("-", "_")
+            existing_category = str(prepared.get("location_category") or "").strip().lower().replace(" ", "_").replace("-", "_")
+            prepared["location_status"] = "resolved"
+            prepared["location_resolution_status"] = "resolved"
+            prepared["location_policy"] = "exact_location_required"
+            if existing_kind in {"", "no_location_required", "online", "none", "no_location"}:
+                prepared["location_kind"] = "exact_named_place"
+            if existing_category in {"", "home_or_online", "no_location", "none"}:
+                prepared["location_category"] = resolved_location.get("category") or "manual_place"
+            prepared["location_source"] = prepared.get("location_source") or resolved_location.get("source") or "selected_geocode"
+            prepared["travel_required"] = True
+            prepared["location_flexible"] = False
+            prepared["can_be_done_at_current_location"] = False
+
         protection = str(prepared.get("repair_protection") or "").lower()
         timing_mode = str(prepared.get("timing_mode") or "").lower()
         original_mode = str(prepared.get("original_timing_mode") or "").lower()

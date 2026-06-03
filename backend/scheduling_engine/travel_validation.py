@@ -83,6 +83,7 @@ class TravelValidationMixin:
         updated["travel_intent"] = travel_intent
         preferences["travel_intent"] = travel_intent
         updated.setdefault("schedule_status", updated.get("status") or "ok")
+        self._sync_activity_locations_to_schedule_blocks(updated)
 
         if not accurate:
             if travel_intent:
@@ -119,6 +120,7 @@ class TravelValidationMixin:
             jlog("TIMER", f"accurate_travel_validation_seconds={time.perf_counter() - validation_started:.2f}", None)
             return updated
 
+        self._sync_activity_locations_to_schedule_blocks(updated)
         location_requests = self._location_resolution_requests(updated, saved_locations)
         if location_requests:
             updated["schedule_status"] = "location_pending"
@@ -160,6 +162,7 @@ class TravelValidationMixin:
         committed_activities = deepcopy(updated.get("activities") or [])
         committed_unscheduled = deepcopy(updated.get("unscheduled_activities") or [])
 
+        self._sync_activity_locations_to_schedule_blocks(updated)
         validation = self._validate_routes_with_service(updated, saved_locations)
         if validation.get("route_conflicts"):
             repair_meta = self._attempt_route_repair(updated, saved_locations, validation["route_conflicts"])
@@ -1096,6 +1099,7 @@ class TravelValidationMixin:
         ]
         if not active:
             return None
+        self._sync_activity_locations_to_schedule_blocks(repair_source)
         route_context = self._build_route_context(repair_source, active, saved_locations)
         preferences["_route_context"] = route_context
         start_route_constraints = self._start_route_repair_constraints(route_conflicts)
@@ -1147,6 +1151,7 @@ class TravelValidationMixin:
             )
         else:
             repaired["schedule_blocks"] = planned.get("schedule_blocks", [])
+        self._sync_activity_locations_to_schedule_blocks(repaired)
         jlog("SUPPORT_BLOCK", f"blocks={len(repaired.get('schedule_blocks') or [])}", "REBUILD_FINAL")
         raw_unscheduled = list(planned.get("unscheduled_activities", [])) + conflict_unfit
         repaired["unscheduled_activities"] = [
@@ -4614,6 +4619,8 @@ class TravelValidationMixin:
         return requests
 
     def _block_has_no_location_policy(self, block: Dict[str, Any]) -> bool:
+        if self._block_has_user_selected_physical_endpoint(block):
+            return False
         policy = clean_title(block.get("location_policy") or "").replace(" ", "_").replace("-", "_")
         if policy == "no_location_required":
             return True
@@ -4676,6 +4683,8 @@ class TravelValidationMixin:
 
     def _block_is_physical_route_context(self, block: Dict[str, Any]) -> bool:
         if self._location_flexible_selected_endpoint_requires_route(block):
+            return True
+        if self._block_has_user_selected_physical_endpoint(block):
             return True
         if self._embedded_activity_coordinate(block):
             return True
@@ -4824,6 +4833,8 @@ class TravelValidationMixin:
     def _block_requires_travel_coordinate(self, block: Dict[str, Any]) -> bool:
         if self._location_flexible_selected_endpoint_requires_route(block):
             return True
+        if self._block_has_user_selected_physical_endpoint(block):
+            return True
         status = clean_title(block.get("location_status") or "")
         semantic_status = clean_title(block.get("location_resolution_status") or "").replace(" ", "_").replace("-", "_")
         location_kind = clean_title(block.get("location_kind") or "").replace(" ", "_").replace("-", "_")
@@ -4859,6 +4870,33 @@ class TravelValidationMixin:
         if re.search(r"\b(home|online|virtual|remote|zoom|teams|google meet|current location|current place)\b", text):
             return False
         return not bool(self._embedded_activity_coordinate(block))
+
+    def _block_has_user_selected_physical_endpoint(self, block: Dict[str, Any]) -> bool:
+        if not self._embedded_activity_coordinate(block):
+            return False
+        label_text = clean_title(
+            " ".join(
+                str(value or "")
+                for value in (
+                    block.get("location_label"),
+                    block.get("location"),
+                    (block.get("resolved_location") or {}).get("label") if isinstance(block.get("resolved_location"), dict) else None,
+                    (block.get("resolved_location") or {}).get("display_name") if isinstance(block.get("resolved_location"), dict) else None,
+                )
+            )
+        )
+        if re.search(r"\b(current location|current place|starting point|start location|default start)\b", label_text):
+            return False
+        policy = clean_title(block.get("location_policy") or "").replace(" ", "_").replace("-", "_")
+        source = clean_title(block.get("location_source") or "").replace(" ", "_").replace("-", "_")
+        kind = clean_title(block.get("location_kind") or "").replace(" ", "_").replace("-", "_")
+        return bool(
+            block.get("travel_required") is True
+            or policy == "exact_location_required"
+            or source in {"event_manual_location", "selected_geocode", "event_confirmed", "manual_edit"}
+            or kind in {"exact_named_place", "area_only", "unknown_physical"}
+            or block.get("explicit_user_location")
+        )
 
     def _location_flexible_selected_endpoint_requires_route(self, block: Dict[str, Any]) -> bool:
         if not bool(block.get("location_flexible") and block.get("travel_context_required")):
@@ -4969,6 +5007,18 @@ class TravelValidationMixin:
             or block.get("location")
         )
         block["location"] = block["location_label"]
+        block["location_resolution_status"] = "resolved"
+        if self._block_has_user_selected_physical_endpoint(block):
+            kind = clean_title(block.get("location_kind") or "").replace(" ", "_").replace("-", "_")
+            category = clean_title(block.get("location_category") or "").replace(" ", "_").replace("-", "_")
+            block["location_policy"] = "exact_location_required"
+            if kind in {"", "no_location_required", "online", "none", "no_location"}:
+                block["location_kind"] = "exact_named_place"
+            if category in {"", "home_or_online", "none", "no_location"}:
+                block["location_category"] = resolved_location.get("category") or "manual_place"
+            block["travel_required"] = True
+            block["location_flexible"] = False
+            block["can_be_done_at_current_location"] = False
         if resolved_location.get("saved_location_label"):
             block["saved_location_label"] = resolved_location.get("saved_location_label")
 
@@ -5015,6 +5065,25 @@ class TravelValidationMixin:
                 updated["location_source"] = block.get("location_source")
                 updated["location_label"] = block.get("location_label") or updated.get("location_label")
                 updated["location"] = updated["location_label"] or updated.get("location")
+                updated["location_resolution_status"] = block.get("location_resolution_status") or updated.get("location_resolution_status")
+                updated["location_policy"] = block.get("location_policy") or updated.get("location_policy")
+                updated["location_kind"] = block.get("location_kind") or updated.get("location_kind")
+                updated["location_category"] = block.get("location_category") or updated.get("location_category")
+                updated["travel_required"] = block.get("travel_required") if block.get("travel_required") is not None else updated.get("travel_required")
+                updated["location_flexible"] = bool(block.get("location_flexible", updated.get("location_flexible", False)))
+                updated["can_be_done_at_current_location"] = bool(block.get("can_be_done_at_current_location", updated.get("can_be_done_at_current_location", False)))
+                if self._block_has_user_selected_physical_endpoint(updated):
+                    kind = clean_title(updated.get("location_kind") or "").replace(" ", "_").replace("-", "_")
+                    category = clean_title(updated.get("location_category") or "").replace(" ", "_").replace("-", "_")
+                    updated["location_resolution_status"] = "resolved"
+                    updated["location_policy"] = "exact_location_required"
+                    if kind in {"", "no_location_required", "online", "none", "no_location"}:
+                        updated["location_kind"] = "exact_named_place"
+                    if category in {"", "home_or_online", "none", "no_location"}:
+                        updated["location_category"] = (updated.get("resolved_location") or {}).get("category") or "manual_place"
+                    updated["travel_required"] = True
+                    updated["location_flexible"] = False
+                    updated["can_be_done_at_current_location"] = False
                 if block.get("saved_location_label"):
                     updated["saved_location_label"] = block.get("saved_location_label")
                 synced.append(updated)
@@ -5022,11 +5091,78 @@ class TravelValidationMixin:
                 synced.append(activity)
         envelope["activities"] = synced
 
+    def _sync_activity_locations_to_schedule_blocks(self, envelope: Dict[str, Any]) -> None:
+        activities = [
+            activity for activity in envelope.get("activities") or []
+            if isinstance(activity, dict) and activity.get("resolved_location")
+        ]
+        blocks = envelope.get("schedule_blocks") or []
+        if not activities or not blocks:
+            return
+        by_id = {
+            str(activity.get("stable_activity_id") or activity.get("id")): activity
+            for activity in activities
+            if activity.get("stable_activity_id") or activity.get("id")
+        }
+        by_title = {
+            clean_title(activity.get("title") or ""): activity
+            for activity in activities
+            if activity.get("title")
+        }
+        updated_blocks: List[Dict[str, Any]] = []
+        for block in blocks:
+            if not isinstance(block, dict) or not self._is_activity_schedule_block(block):
+                updated_blocks.append(block)
+                continue
+            key = str(block.get("stable_activity_id") or block.get("id") or "")
+            activity = by_id.get(key) if key else None
+            if not activity:
+                activity = by_title.get(clean_title(block.get("title") or ""))
+            if not activity:
+                updated_blocks.append(block)
+                continue
+            updated = deepcopy(block)
+            fields = (
+                "resolved_location",
+                "location",
+                "location_label",
+                "location_status",
+                "location_source",
+                "location_resolution_status",
+                "location_policy",
+                "location_kind",
+                "location_category",
+                "saved_location_label",
+                "travel_required",
+                "location_flexible",
+                "can_be_done_at_current_location",
+                "explicit_user_location",
+            )
+            for field in fields:
+                if field in activity and activity.get(field) is not None:
+                    updated[field] = deepcopy(activity.get(field))
+            if self._block_has_user_selected_physical_endpoint(updated):
+                kind = clean_title(updated.get("location_kind") or "").replace(" ", "_").replace("-", "_")
+                category = clean_title(updated.get("location_category") or "").replace(" ", "_").replace("-", "_")
+                updated["location_status"] = "resolved"
+                updated["location_resolution_status"] = "resolved"
+                updated["location_policy"] = "exact_location_required"
+                if kind in {"", "no_location_required", "online", "none", "no_location"}:
+                    updated["location_kind"] = "exact_named_place"
+                if category in {"", "home_or_online", "none", "no_location"}:
+                    updated["location_category"] = (updated.get("resolved_location") or {}).get("category") or "manual_place"
+                updated["travel_required"] = True
+                updated["location_flexible"] = False
+                updated["can_be_done_at_current_location"] = False
+            updated_blocks.append(updated)
+        envelope["schedule_blocks"] = updated_blocks
+
     def _validate_routes_with_service(
         self,
         envelope: Dict[str, Any],
         saved_locations: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
+        self._sync_activity_locations_to_schedule_blocks(envelope)
         blocks = deepcopy(envelope.get("schedule_blocks") or [])
         preferences = envelope.get("preferences") or {}
         if hasattr(self, "_normalize_day_boundary_preferences"):

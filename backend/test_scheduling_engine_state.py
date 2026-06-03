@@ -9269,6 +9269,51 @@ def test_run_manual_scheduler_keeps_lunch_with_block_type_activity():
     assert any(item["title"] == "Lunch" for item in updated["activities"])
 
 
+def test_run_manual_scheduler_uses_shared_accurate_travel_pipeline(monkeypatch):
+    engine = SchedulingEngine(DummyClient())
+    calls = []
+
+    def shared_pipeline(envelope, saved_locations):
+        calls.append({
+            "titles": [item.get("title") for item in envelope.get("activities", [])],
+            "block_count": len(envelope.get("schedule_blocks") or []),
+            "accurate": envelope.get("accurate_travel_time"),
+        })
+        updated = deepcopy(envelope)
+        updated["travel_validation_status"] = "validated"
+        updated["updated_transition_count"] = 0
+        return updated
+
+    monkeypatch.setattr(engine, "_apply_accurate_travel_if_requested", shared_pipeline)
+    envelope = {
+        "date": "2026-05-26",
+        "version": 1,
+        "activities": [
+            {
+                "id": "focus",
+                "stable_activity_id": "focus",
+                "title": "Focused work",
+                "duration_minutes": 60,
+                "timing_mode": TimingMode.UNSPECIFIED,
+                "travel_required": False,
+                "location_resolution_status": "not_required",
+            },
+        ],
+        "schedule_blocks": [],
+        "preferences": {"accurate_travel_time": True},
+        "accurate_travel_time": True,
+        "needs_reschedule": True,
+    }
+
+    updated = engine.run_manual_scheduler(envelope, base_version=1, source="manual_button")
+
+    assert updated["travel_validation_status"] == "validated"
+    assert len(calls) == 1
+    assert calls[0]["accurate"] is True
+    assert calls[0]["titles"] == ["Focused work"]
+    assert calls[0]["block_count"] >= 1
+
+
 def test_run_manual_scheduler_stops_when_activity_disappears_before_module_c(monkeypatch):
     engine = SchedulingEngine(DummyClient())
     envelope = {
@@ -9393,6 +9438,170 @@ def test_run_manual_scheduler_preserves_manual_flexible_location():
     assert grocery["location_source"] == "manual_map_pin"
     assert grocery["resolved_location"]["display_name"] == "Damansara grocery"
     assert grocery["can_move_for_repair"] is True
+
+
+def test_run_manual_scheduler_promotes_manual_location_for_no_location_flex(capsys):
+    engine = SchedulingEngine(DummyClient())
+    quiet_place = {
+        "label": "Quiet workspace",
+        "display_name": "Quiet workspace",
+        "address": "Quiet workspace",
+        "latitude": 3.141,
+        "longitude": 101.707,
+        "source": "event_manual_location",
+        "confirmed_by_user": True,
+    }
+    envelope = {
+        "date": "2026-05-26",
+        "version": 1,
+        "activities": [
+            {
+                "id": "focus",
+                "stable_activity_id": "focus",
+                "title": "Focused work",
+                "duration_minutes": 120,
+                "timing_mode": TimingMode.UNSPECIFIED,
+                "location": "Quiet workspace",
+                "location_label": "Quiet workspace",
+                "location_status": "resolved",
+                "location_resolution_status": "not_required",
+                "location_policy": "no_location_required",
+                "location_source": "event_manual_location",
+                "resolved_location": quiet_place,
+                "travel_required": False,
+            },
+        ],
+        "schedule_blocks": [],
+        "preferences": {"accurate_travel_time": False},
+        "needs_reschedule": True,
+        "reschedule_reason": "location_changed",
+    }
+
+    updated = engine.run_manual_scheduler(envelope, base_version=1, source="manual_button")
+    focus = next(item for item in updated["activities"] if item["title"] == "Focused work")
+
+    assert focus["location"] == "Quiet workspace"
+    assert focus["location_status"] == "resolved"
+    assert focus["location_resolution_status"] == "resolved"
+    assert focus["location_policy"] == "exact_location_required"
+    assert focus["location_kind"] == "exact_named_place"
+    assert focus["travel_required"] is True
+    assert focus["can_move_for_repair"] is True
+    route_context = engine._build_route_context(updated, updated["activities"], [])
+    route_titles = {node.get("title") for node in (route_context.get("nodes") or {}).values()}
+    assert "Focused work" in route_titles
+    assert "[JPLAN][RUN_SCHEDULER][INPUT_LOCATION] title=Focused work travel_required=true location_status=resolved" in capsys.readouterr().out
+
+
+def test_activity_location_sync_promotes_stale_visual_block_for_route_context():
+    engine = SchedulingEngine(DummyClient())
+    focused_location = {
+        "label": "The Arc @ Cyberjaya",
+        "display_name": "The Arc @ Cyberjaya",
+        "address": "The Arc @ Cyberjaya",
+        "latitude": 2.9221,
+        "longitude": 101.6508,
+        "source": "event_manual_location",
+        "confirmed_by_user": True,
+    }
+    envelope = {
+        "date": "2026-05-26",
+        "activities": [
+            {
+                "id": "focus",
+                "stable_activity_id": "focus",
+                "title": "Focused work",
+                "duration_minutes": 120,
+                "location": "The Arc @ Cyberjaya",
+                "location_label": "The Arc @ Cyberjaya",
+                "location_status": "resolved",
+                "location_resolution_status": "resolved",
+                "location_policy": "exact_location_required",
+                "location_source": "event_manual_location",
+                "resolved_location": focused_location,
+                "travel_required": True,
+            }
+        ],
+        "schedule_blocks": [
+            {
+                "block_type": "activity",
+                "id": "focus",
+                "stable_activity_id": "focus",
+                "title": "Focused work",
+                "start": "02:51 PM",
+                "end": "04:51 PM",
+                "location": "The Arc @ Cyberjaya",
+                "location_label": "The Arc @ Cyberjaya",
+                "location_kind": "no_location_required",
+                "location_category": "home_or_online",
+                "location_resolution_status": "not_required",
+                "travel_required": False,
+            }
+        ],
+    }
+
+    engine._sync_activity_locations_to_schedule_blocks(envelope)
+    block = envelope["schedule_blocks"][0]
+
+    assert block["location_policy"] == "exact_location_required"
+    assert block["location_kind"] == "exact_named_place"
+    assert block["travel_required"] is True
+    assert engine._block_requires_travel_coordinate(block) is True
+
+
+def test_manual_home_location_still_counts_as_route_endpoint():
+    engine = SchedulingEngine(DummyClient())
+    home_location = {
+        "label": "home",
+        "display_name": "home",
+        "address": "home",
+        "latitude": 2.9221,
+        "longitude": 101.6508,
+        "source": "event_manual_location",
+        "confirmed_by_user": True,
+    }
+    envelope = {
+        "date": "2026-05-26",
+        "activities": [
+            {
+                "id": "focus",
+                "stable_activity_id": "focus",
+                "title": "Focused work",
+                "duration_minutes": 120,
+                "location": "home",
+                "location_label": "home",
+                "location_status": "resolved",
+                "location_resolution_status": "resolved",
+                "location_policy": "exact_location_required",
+                "location_source": "event_manual_location",
+                "resolved_location": home_location,
+                "travel_required": True,
+            }
+        ],
+        "schedule_blocks": [
+            {
+                "block_type": "activity",
+                "id": "focus",
+                "stable_activity_id": "focus",
+                "title": "Focused work",
+                "start": "01:30 PM",
+                "end": "03:30 PM",
+                "location": "home",
+                "location_label": "home",
+                "location_kind": "no_location_required",
+                "location_category": "home_or_online",
+                "location_resolution_status": "not_required",
+                "travel_required": False,
+            }
+        ],
+    }
+
+    engine._sync_activity_locations_to_schedule_blocks(envelope)
+    block = envelope["schedule_blocks"][0]
+
+    assert block["location_policy"] == "exact_location_required"
+    assert block["travel_required"] is True
+    assert engine._block_requires_travel_coordinate(block) is True
 
 
 def test_run_manual_scheduler_with_missing_accurate_location_returns_pending():

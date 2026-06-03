@@ -474,8 +474,75 @@ export function PlanningInputPage({
     location: event?.location || "",
     location_label: event?.location_label || "",
     location_source: event?.location_source || "",
-    resolved_location: event?.resolved_location || null,
+    location_status: event?.location_status || "",
+    location_resolution_status: event?.location_resolution_status || "",
+    location_policy: event?.location_policy || "",
+    travel_required: Boolean(event?.travel_required),
+    resolved_location: event?.resolved_location ? {
+      display_name: event.resolved_location.display_name || "",
+      address: event.resolved_location.address || "",
+      latitude: Number(event.resolved_location.latitude ?? 0),
+      longitude: Number(event.resolved_location.longitude ?? 0),
+      source: event.resolved_location.source || "",
+      saved_location_label: event.resolved_location.saved_location_label || "",
+    } : null,
   });
+
+  const activityEditFingerprint = (event?: Partial<ActivityBlock> | null) => JSON.stringify({
+    title: (event?.title || "").trim(),
+    startTime: event?.startTime || event?.start || "",
+    endTime: event?.endTime || event?.end || "",
+    duration_minutes: event?.duration_minutes ?? Math.max(
+      0,
+      timeToMinutes(event?.endTime || event?.end || "") - timeToMinutes(event?.startTime || event?.start || ""),
+    ),
+    priority: event?.priority || "",
+    isMandatory: event?.isMandatory ?? event?.is_mandatory ?? null,
+    timing_mode: event?.timing_mode || "",
+    original_timing_mode: event?.original_timing_mode || "",
+    fixed_start: event?.fixed_start ?? null,
+    fixed_end: event?.fixed_end ?? null,
+    user_fixed_start: event?.user_fixed_start ?? null,
+    is_user_fixed: Boolean(event?.is_user_fixed),
+    can_move_for_repair: event?.can_move_for_repair ?? null,
+    repair_protection: event?.repair_protection || "",
+    location: locationFingerprint(event),
+  });
+
+  const promoteManualLocationEdit = (original: ActivityBlock, updated: ActivityBlock): ActivityBlock => {
+    if (!updated.resolved_location) return updated;
+    const displayName = updated.resolved_location.display_name || updated.resolved_location.address || updated.location_label || updated.location;
+    const currentKind = String(updated.location_kind || "").toLowerCase().replace(/[\s-]+/g, "_");
+    const physicalKind = currentKind && !["no_location_required", "online", "none", "no_location"].includes(currentKind)
+      ? updated.location_kind
+      : "exact_named_place";
+    const currentCategory = String(updated.location_category || "").toLowerCase().replace(/[\s-]+/g, "_");
+    const originalCategory = String(original.location_category || "").toLowerCase().replace(/[\s-]+/g, "_");
+    const physicalCategory = currentCategory && !["home_or_online", "no_location", "none"].includes(currentCategory)
+      ? updated.location_category
+      : (updated.resolved_location.category || (!["home_or_online", "no_location", "none"].includes(originalCategory) ? original.location_category : undefined) || "manual_place");
+    return {
+      ...updated,
+      location: displayName || updated.location,
+      location_label: displayName || updated.location_label || updated.location,
+      location_kind: physicalKind,
+      location_category: physicalCategory,
+      location_status: "resolved",
+      location_resolution_status: "resolved",
+      location_policy: "exact_location_required",
+      location_source: updated.location_source || updated.resolved_location.source || "event_manual_location",
+      travel_required: true,
+      location_flexible: false,
+      can_be_done_at_current_location: false,
+      resolved_location: {
+        ...updated.resolved_location,
+        display_name: displayName || updated.resolved_location.display_name,
+        address: updated.resolved_location.address || displayName,
+        confirmed_by_user: updated.resolved_location.confirmed_by_user ?? true,
+        resolved_for_activity_id: updated.resolved_location.resolved_for_activity_id || updated.stable_activity_id || updated.id,
+      },
+    };
+  };
 
   const normalizeManualTimeEdit = (original: ActivityBlock, updated: ActivityBlock): ActivityBlock => {
     const start = timeToMinutes(updated.startTime);
@@ -604,8 +671,9 @@ export function PlanningInputPage({
       originalEvent.endTime !== updatedEvent.endTime
     );
     const locationChanged = locationFingerprint(originalEvent) !== locationFingerprint(updatedEvent);
-    const normalizedEvent = timeChanged ? normalizeManualTimeEdit(originalEvent, updatedEvent) : {
-      ...updatedEvent,
+    const locationPreparedEvent = locationChanged ? promoteManualLocationEdit(originalEvent, updatedEvent) : updatedEvent;
+    const normalizedEvent = timeChanged ? normalizeManualTimeEdit(originalEvent, locationPreparedEvent) : {
+      ...locationPreparedEvent,
       timing_mode: isFixedOrProtectedActivityBlock(originalEvent) ? (updatedEvent.timing_mode || originalEvent.timing_mode || "fixed") : updatedEvent.timing_mode,
       is_user_fixed: originalEvent.is_user_fixed,
       user_fixed_start: originalEvent.user_fixed_start,
@@ -614,6 +682,13 @@ export function PlanningInputPage({
       can_move_for_repair: originalEvent.can_move_for_repair,
       repair_protection: originalEvent.repair_protection,
     };
+    const hasMeaningfulChange = activityEditFingerprint(originalEvent) !== activityEditFingerprint(normalizedEvent);
+    if (!hasMeaningfulChange) {
+      console.debug(`[JPLAN][MANUAL_EDIT][NO_CHANGE] title=${originalEvent.title}`);
+      setEditingEvent(null);
+      setIsConflict(false);
+      return;
+    }
     const newStartTimeMins = timeToMinutes(updatedEvent.startTime);
     const endTimeStr = updatedEvent.endTime || calculateEndTime(updatedEvent.startTime, updatedEvent.duration || "1h");
     let newEndTimeMins = timeToMinutes(endTimeStr);
@@ -757,7 +832,8 @@ export function PlanningInputPage({
   const travelValidationStatus = String(previewSchedule?.travel_validation_status || previewSchedule?.preview_status || "");
   const isPartialFixedRouteConflict = travelValidationStatus === "partial_feasible_with_fixed_route_conflicts";
   const isLocationPending = Boolean(
-    !isPartialFixedRouteConflict
+    !isDirtySchedule
+    && !isPartialFixedRouteConflict
     && (
       previewSchedule?.schedule_status === "location_pending"
       || previewSchedule?.status === "location_pending"
@@ -1351,23 +1427,29 @@ export function PlanningInputPage({
 
   const handleRunScheduler = async () => {
     if (!previewSchedule || !user?.id) return;
+    const shouldRunAccurateTravel = Boolean(
+      accurateTravelTime
+      || isAccurateTravelEnabled(previewSchedule)
+      || previewSchedule.needs_travel_validation
+    );
     setIsRunningScheduler(true);
     setIsProcessing(true);
     setProgressSteps([
       "Running schedule optimizer...",
-      accurateTravelTime ? "Checking accurate travel routes..." : "Refreshing route-aware draft...",
+      shouldRunAccurateTravel ? "Checking accurate travel routes..." : "Refreshing route-aware draft...",
       "Preparing updated plan...",
     ]);
     setActiveProgressIndex(0);
     try {
       const scheduleWithPrefs = withPlanningPreferences(previewSchedule);
-      console.debug(`[JPLAN][RUN_SCHEDULER] source=manual_button accurate_travel_time=${Boolean(accurateTravelTime)}`);
+      console.debug(`[JPLAN][RUN_SCHEDULER] source=manual_button accurate_travel_time=${shouldRunAccurateTravel}`);
       const replanned = await runScheduler({
         ...scheduleWithPrefs,
-        accurate_travel_time: accurateTravelTime,
+        accurate_travel_time: shouldRunAccurateTravel,
         preferences: {
           ...(scheduleWithPrefs.preferences || {}),
-          accurate_travel_time: accurateTravelTime,
+          accurate_travel_time: shouldRunAccurateTravel,
+          travel_intent: shouldRunAccurateTravel || Boolean(scheduleWithPrefs.preferences?.travel_intent || scheduleWithPrefs.travel_intent),
         },
       }, user.id);
       applyReturnedSchedule(replanned);

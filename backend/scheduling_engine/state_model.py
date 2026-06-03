@@ -395,6 +395,7 @@ class StateModelMixin:
         location_confidence = raw.get("location_confidence")
         location_kind = clean_optional_text(raw.get("location_kind"))
         location_resolution_status = clean_optional_text(raw.get("location_resolution_status"))
+        location_policy = raw.get("location_policy") or raw.get("locationPolicy")
         resolved_location = deepcopy(raw.get("resolved_location")) if isinstance(raw.get("resolved_location"), dict) else None
         location_category_clean = clean_title(location_category or "")
         location_status_clean = clean_title(location_status or "")
@@ -412,6 +413,48 @@ class StateModelMixin:
             travel_required = travel_required_raw.strip().lower() not in {"0", "false", "no", "off"}
         else:
             travel_required = bool(travel_required_raw)
+        has_resolved_coordinates = False
+        if isinstance(resolved_location, dict):
+            try:
+                lat = float(resolved_location.get("latitude") if resolved_location.get("latitude") is not None else resolved_location.get("lat"))
+                lng = float(resolved_location.get("longitude") if resolved_location.get("longitude") is not None else resolved_location.get("lng"))
+                has_resolved_coordinates = -90 <= lat <= 90 and -180 <= lng <= 180
+            except (TypeError, ValueError):
+                has_resolved_coordinates = False
+        endpoint_text = clean_title(
+            " ".join(
+                str(value or "")
+                for value in (
+                    location,
+                    location_label,
+                    (resolved_location or {}).get("label") if isinstance(resolved_location, dict) else None,
+                    (resolved_location or {}).get("display_name") if isinstance(resolved_location, dict) else None,
+                )
+            )
+        )
+        policy_clean = clean_title(location_policy or "").replace(" ", "_").replace("-", "_")
+        source_clean = clean_title(location_source or "").replace(" ", "_").replace("-", "_")
+        user_selected_physical_endpoint = bool(
+            has_resolved_coordinates
+            and not re.search(r"\b(current location|current place|starting point|start location|default start)\b", endpoint_text)
+            and (
+                travel_required
+                or policy_clean == "exact_location_required"
+                or source_clean in {"event_manual_location", "selected_geocode", "event_confirmed", "manual_edit"}
+                or bool(raw.get("explicit_user_location", False))
+            )
+        )
+        if user_selected_physical_endpoint:
+            travel_required = True
+            location_status = "resolved"
+            location_resolution_status = "resolved"
+            location_policy = "exact_location_required"
+            if location_kind_clean in {"", "no_location_required", "online", "none", "no_location"}:
+                location_kind = "exact_named_place"
+                location_kind_clean = "exact_named_place"
+            if location_category_clean in {"", "home_or_online", "none", "no_location"}:
+                location_category = (resolved_location or {}).get("category") or "manual_place"
+                location_category_clean = clean_title(location_category or "")
         preferred_window_start = self._coerce_minutes(
             raw.get("preferred_window_start"),
             raw.get("preferredWindowStart"),
@@ -523,7 +566,7 @@ class StateModelMixin:
             "raw_location_text": raw.get("raw_location_text"),
             "location_kind": location_kind,
             "location_resolution_status": location_resolution_status,
-            "location_policy": raw.get("location_policy") or raw.get("locationPolicy"),
+            "location_policy": location_policy,
             "no_location_reason": raw.get("no_location_reason"),
             "semantic_confidence": raw.get("semantic_confidence"),
             "needs_clarification": bool(raw.get("needs_clarification", False)),
@@ -533,8 +576,8 @@ class StateModelMixin:
             "raw_llm_location": raw.get("raw_llm_location"),
             "explicit_user_location": bool(raw.get("explicit_user_location", False)),
             "location_warning": raw.get("location_warning"),
-            "location_flexible": bool(raw.get("location_flexible", False)),
-            "can_be_done_at_current_location": bool(raw.get("can_be_done_at_current_location", False)),
+            "location_flexible": False if user_selected_physical_endpoint else bool(raw.get("location_flexible", False)),
+            "can_be_done_at_current_location": False if user_selected_physical_endpoint else bool(raw.get("can_be_done_at_current_location", False)),
             "quiet_place_required": bool(raw.get("quiet_place_required", False)),
             "activity_role": raw.get("activity_role"),
             "travel_context_required": bool(raw.get("travel_context_required", False)),
