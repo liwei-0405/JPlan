@@ -25,8 +25,6 @@ export const LoginPage: React.FC = () => {
       if (error) {
         console.error("Login error in background:", error);
         toast.error(error.message);
-      } else if (data.session) {
-        console.log("Login success in background");
       }
     });
 

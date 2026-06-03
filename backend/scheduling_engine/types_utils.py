@@ -352,6 +352,39 @@ def preference_window_info(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     }
 
 
+def is_short_low_weight_flex_item(item: Dict[str, Any]) -> bool:
+    if item.get("timing_mode") == TimingMode.FIXED or item.get("fixed_start") is not None:
+        return False
+    duration = int(item.get("duration_minutes") or DEFAULT_DURATION)
+    priority = clean_title(item.get("priority") or "medium")
+    preference = preference_window_info(item) or {}
+    weight = clean_title(preference.get("weight") or item.get("preference_weight") or "")
+    legacy_title = clean_title(item.get("title") or "")
+    return bool(
+        duration <= 20
+        and (
+            priority == "low"
+            or weight in {"low", "optional"}
+            or not item.get("is_mandatory", item.get("isMandatory", True))
+            or item.get("optional_reason")
+            # Legacy fallback: older parsed coffee items may not carry preference metadata.
+            or (not preference and "coffee" in legacy_title)
+        )
+    )
+
+
+def should_skip_optional_preferred_item(item: Dict[str, Any], preferred_window_penalty: float) -> bool:
+    if preferred_window_penalty <= 0:
+        return False
+    if item.get("is_mandatory", item.get("isMandatory", True)):
+        return False
+    preference = preference_window_info(item) or {}
+    weight = clean_title(preference.get("weight") or item.get("preference_weight") or "")
+    if weight in {"low", "optional"}:
+        return True
+    return bool(item.get("optional_reason"))
+
+
 def preference_window_deviation(item: Dict[str, Any], start: Optional[int], end: Optional[int]) -> Dict[str, Any]:
     info = preference_window_info(item)
     if not info or start is None or end is None:

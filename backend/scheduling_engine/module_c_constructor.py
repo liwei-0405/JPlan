@@ -1321,22 +1321,7 @@ class ModuleCConstructorMixin:
         return -(route_delta * 4.0)
 
     def _short_low_weight_flex(self, item: Dict[str, Any]) -> bool:
-        if item.get("timing_mode") == TimingMode.FIXED or item.get("fixed_start") is not None:
-            return False
-        duration = int(item.get("duration_minutes") or DEFAULT_DURATION)
-        priority = clean_title(item.get("priority") or "medium")
-        preference = preference_window_info(item) or {}
-        weight = clean_title(preference.get("weight") or item.get("preference_weight") or "")
-        return bool(
-            duration <= 20
-            and (
-                priority == "low"
-                or weight in {"low", "optional"}
-                or not item.get("is_mandatory", item.get("isMandatory", True))
-                or item.get("optional_reason")
-                or "coffee" in clean_title(item.get("title") or "")
-            )
-        )
+        return is_short_low_weight_flex_item(item)
 
     def _optional_route_cost_adjustment(
         self,
@@ -1795,14 +1780,7 @@ class ModuleCConstructorMixin:
         item: Dict[str, Any],
         preferred_window_penalty: float,
     ) -> bool:
-        if preferred_window_penalty <= 0:
-            return False
-        if item.get("is_mandatory", item.get("isMandatory", True)):
-            return False
-        title = clean_title(item.get("title") or "")
-        if "coffee" in title:
-            return True
-        return bool(item.get("optional_reason"))
+        return should_skip_optional_preferred_item(item, preferred_window_penalty)
 
     def _nearest_travel_required_before(
         self,

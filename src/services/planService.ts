@@ -49,7 +49,6 @@ export async function chatWithLLM(
     accurateTravelTime: boolean = false,
 ): Promise<ChatResponse> {
     try {
-        console.log('[JPLAN][CHAT_FLAGS]', { allow_clash: allowClash, accurate_travel_time: accurateTravelTime });
         const response = await fetch(`${API_BASE_URL}/chat`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },

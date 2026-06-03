@@ -64,14 +64,12 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             .single();
 
           if (!error && data && mounted) {
-            console.log("[AuthContext] Profile synced from DB");
             setProfile(data as Profile);
           }
 
           // NEW: Capture Google Refresh Token for background calendar sync
           // Supabase provides this ONLY when offline access is requested and granted
           if (session.provider_refresh_token) {
-            console.log("[AuthContext] Found Google Refresh Token, updating profile...");
             await supabase
               .from('profiles')
               .update({ 
@@ -85,7 +83,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         }
       } else {
         if (mounted) {
-          console.log("[AuthContext] No session, clearing state");
           setProfile(null);
           setLoading(false);
         }

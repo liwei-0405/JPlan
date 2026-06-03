@@ -633,11 +633,7 @@ class ModuleDRefinementMixin:
         target = self._module_d_find_by_activity_id(candidate_timeline, move.get("activity_id")) if move.get("activity_id") else None
         if not target:
             return False, ""
-        short_low_weight = (
-            self._short_low_weight_flex(target)
-            if hasattr(self, "_short_low_weight_flex")
-            else self._module_d_short_low_weight_flex(target)
-        )
+        short_low_weight = is_short_low_weight_flex_item(target)
         if short_low_weight and route_delta > max(10, int(target.get("duration_minutes") or 0)):
             return True, "low_weight_total_route_worse"
         if route_delta > 30 and move.get("type") not in {"same_location_cluster"}:
@@ -656,24 +652,6 @@ class ModuleDRefinementMixin:
             if str(item.get("stable_activity_id") or item.get("id") or "") == target_key:
                 return item
         return None
-
-    def _module_d_short_low_weight_flex(self, item: Dict[str, Any]) -> bool:
-        if item.get("timing_mode") == TimingMode.FIXED or item.get("fixed_start") is not None:
-            return False
-        duration = int(item.get("duration_minutes") or DEFAULT_DURATION)
-        priority = clean_title(item.get("priority") or "medium")
-        preference = preference_window_info(item) or {}
-        weight = clean_title(preference.get("weight") or item.get("preference_weight") or "")
-        return bool(
-            duration <= 20
-            and (
-                priority == "low"
-                or weight in {"low", "optional"}
-                or not item.get("is_mandatory", item.get("isMandatory", True))
-                or item.get("optional_reason")
-                or "coffee" in clean_title(item.get("title") or "")
-            )
-        )
 
     def _module_d_generate_candidates(
         self,

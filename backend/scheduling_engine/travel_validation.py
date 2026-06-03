@@ -754,17 +754,6 @@ class TravelValidationMixin:
         matrix_cache[cache_key] = {"duration_minutes": int(route_minutes or 0), "source": source}
         return int(route_minutes or 0), source, source == "routing_service", distance_m
 
-    def _route_pair_debug_is_interesting(self, left_title: Any, right_title: Any) -> bool:
-        left = clean_title(str(left_title or ""))
-        right = clean_title(str(right_title or ""))
-        pair = f"{left}->{right}"
-        interesting = (
-            ("coffee" in pair and ("team stand" in pair or "stand-up" in pair or "standup" in pair))
-            or ("coffee" in pair and "client" in pair)
-            or (("team stand" in pair or "stand-up" in pair or "standup" in pair) and "client" in pair)
-        )
-        return bool(interesting)
-
     def _activity_pair_from_physical_pair(
         self,
         *,
@@ -968,10 +957,7 @@ class TravelValidationMixin:
                     f"source={pairs[pair_key].get('source')} "
                     f"distance_m={pairs[pair_key].get('distance_meters')}"
                 )
-                if self._route_pair_debug_is_interesting(left.get("title"), right.get("title")):
-                    jlog("ROUTE_PAIR_DEBUG", debug_message, None)
-                else:
-                    jlog_verbose("ROUTE_PAIR_DEBUG", debug_message, None)
+                jlog_verbose("ROUTE_PAIR_DEBUG", debug_message, None)
 
         parent = {key: key for key in nodes}
 

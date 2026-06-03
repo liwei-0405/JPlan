@@ -702,7 +702,6 @@ export function PlanningInputPage({
     setIsProcessing(true);
 
     try {
-      console.log("[JPLAN][CHAT_FLAGS]", { allow_clash: allowClash, accurate_travel_time: accurateTravelTime });
       const response = await fetch("http://127.0.0.1:8000/chat", {
         method: "POST",
         headers: {
@@ -766,11 +765,6 @@ export function PlanningInputPage({
       || previewSchedule?.needs_travel_validation
     )
   );
-  useEffect(() => {
-    if (isPartialFixedRouteConflict) {
-      console.log("[JPLAN][UI_STATE] status=partial_feasible_with_fixed_route_conflicts action=save_partial_plan");
-    }
-  }, [isPartialFixedRouteConflict]);
   const repairSuggestionHasChange = (suggestion: RepairSuggestion) => {
     if (suggestion.would_change === false) return false;
     const sameStart = String(suggestion.from || "") === String(suggestion.to || "");
@@ -1415,7 +1409,6 @@ export function PlanningInputPage({
       planning_mode: allowClash ? "clash_allowed" : "feasibility_first",
     };
     if (savingPartialFixedRouteConflict) {
-      console.log("[JPLAN][SAVE_PARTIAL] status=partial_feasible_with_fixed_route_conflicts warnings_preserved=true");
       setConversationHistory(prev => [...prev, {
         role: "assistant",
         message: "This plan was saved with fixed route conflicts. Fixed event times were kept, but some routes are not physically feasible.",

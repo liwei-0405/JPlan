@@ -91,7 +91,6 @@ export function TopNav({
       }
 
       const data = await response.json();
-      console.log("Synced events:", data.events);
 
       toast.success(`Successfully synced ${data.events.length} events!`, {
         id: syncToast,
@@ -223,4 +222,3 @@ export function TopNav({
     </div>
   );
 }
-
