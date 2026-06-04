@@ -8,6 +8,16 @@ from dotenv import load_dotenv
 from google import genai
 from typing import List, Dict, Any, Optional
 import database
+from calendar_import import (
+    apply_calendar_sync,
+    apply_replace_from_calendar,
+    cleanDirtySchedule,
+    import_selected_calendar_events,
+    prepare_schedule_for_save,
+    replace_from_calendar_preview,
+    upsert_sync_links_from_export,
+    validate_state_invariants,
+)
 from jplan_logging import jlog
 from scheduling_engine import SchedulingEngine, VersionMismatchError
 from travel_service import TravelService
@@ -44,6 +54,8 @@ class ScheduleItem(BaseModel):
     activity_type: Optional[str] = None
     block_type: Optional[str] = None # V3 support
     title: str
+    date: Optional[str] = None
+    category: Optional[str] = None
     normalized_title: Optional[str] = None
     startTime: Optional[str] = None  # Frontend compat
     endTime: Optional[str] = None    # Frontend compat
@@ -110,9 +122,19 @@ class ScheduleItem(BaseModel):
     prep_buffer: Optional[int] = None
     aliases: Optional[List[str]] = []
     notes: Optional[str] = None
+    description: Optional[str] = None
     explanation: Optional[str] = None
     trace: Optional[List[str]] = []
     source: Optional[str] = None
+    source_system: Optional[str] = None
+    block_id: Optional[str] = None
+    related_activity_id: Optional[str] = None
+    calendar_event_id: Optional[str] = None
+    google_event_id: Optional[str] = None
+    original_google_event_id: Optional[str] = None
+    maybe_support_block: Optional[bool] = False
+    read_only: Optional[bool] = False
+    jplan_metadata: Optional[Dict[str, Any]] = None
     isConflict: Optional[bool] = False
     is_conflicting: Optional[bool] = False
     conflict_ids: Optional[List[str]] = []
@@ -145,6 +167,11 @@ class ScheduleEnvelope(BaseModel):
     activities: List[ScheduleItem]
     schedule_blocks: Optional[List[ScheduleItem]] = [] # Explicit timeline
     committed_schedule_blocks: Optional[List[Dict[str, Any]]] = []
+    external_calendar_events: Optional[List[ScheduleItem]] = []
+    sync_links: Optional[List[Dict[str, Any]]] = []
+    active_view: Optional[str] = "jplan"
+    has_unsaved_draft: Optional[bool] = False
+    draft_dirty: Optional[bool] = False
     explanations: List[str] = []
     unscheduled_activities: List[UnscheduledActivity] = []
     conflict: Optional[Dict[str, Any]] = None
@@ -179,6 +206,7 @@ class ScheduleEnvelope(BaseModel):
     last_rescheduled_at: Optional[str] = None
     unmet_items: Optional[List[Dict[str, Any]]] = []
     validation_issues: Optional[List[str]] = []
+    export_warning: Optional[str] = None
 
 class SchedulePatchOperation(BaseModel):
     op: str # add, update, remove, move, replace, update_priority
@@ -230,6 +258,11 @@ class PlanRequest(BaseModel):
     activities: List[ScheduleItem]
     schedule_blocks: Optional[List[ScheduleItem]] = []
     committed_schedule_blocks: Optional[List[Dict[str, Any]]] = []
+    external_calendar_events: Optional[List[ScheduleItem]] = []
+    sync_links: Optional[List[Dict[str, Any]]] = []
+    active_view: Optional[str] = "jplan"
+    has_unsaved_draft: Optional[bool] = False
+    draft_dirty: Optional[bool] = False
     explanations: List[str] = []
     unscheduled_activities: List[UnscheduledActivity] = []
     user_id: str
@@ -281,6 +314,15 @@ class ExportRequest(BaseModel):
     user_id: str
     date: str
 
+class CalendarImportRequest(BaseModel):
+    user_id: str
+    event_ids: List[str] = []
+
+class CalendarReplaceRequest(BaseModel):
+    user_id: str
+    event_ids: Optional[List[str]] = None
+    confirm: Optional[bool] = False
+
 class LocationResolveRequest(BaseModel):
     user_id: str
     label: str
@@ -327,6 +369,38 @@ MANUAL_RESCHEDULE_REASONS = {
 
 def debug_log(message: str) -> None:
     jlog("API", message)
+
+
+def _preserve_calendar_state(envelope: Dict[str, Any], source: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Keep Google layer/link state around scheduler responses that rebuild drafts."""
+    if not source:
+        return envelope
+    updated = dict(envelope)
+    for key in ("external_calendar_events", "sync_links", "active_view"):
+        if key not in updated and source.get(key) is not None:
+            updated[key] = source.get(key)
+    if "committed_schedule_blocks" not in updated and source.get("committed_schedule_blocks"):
+        updated["committed_schedule_blocks"] = source.get("committed_schedule_blocks")
+    return updated
+
+
+def _mark_unsaved_draft(envelope: Dict[str, Any]) -> Dict[str, Any]:
+    updated = dict(envelope)
+    if updated.get("schedule_blocks"):
+        updated["has_unsaved_draft"] = True
+        updated["draft_dirty"] = True
+        updated["active_view"] = "jplan"
+    return updated
+
+
+def _has_jplan_export_source(plan: Optional[Dict[str, Any]]) -> bool:
+    if not plan:
+        return False
+    return bool(
+        plan.get("committed_schedule_blocks")
+        or plan.get("schedule_blocks")
+        or plan.get("activities")
+    )
 
 
 def _location_has_coordinates(location: Optional[Dict[str, Any]]) -> bool:
@@ -589,6 +663,7 @@ async def chat_with_llm(request: ChatRequest):
         current_envelope = request.current_schedule.model_dump() if request.current_schedule else None
         current_envelope = _merge_user_preferences_into_envelope(current_envelope, request.user_id)
         if current_envelope is not None:
+            current_envelope = cleanDirtySchedule(current_envelope)
             current_envelope["allow_clash"] = bool(request.allow_clash)
             current_envelope["accurate_travel_time"] = bool(request.accurate_travel_time)
             current_envelope.setdefault("preferences", {})
@@ -608,6 +683,7 @@ async def chat_with_llm(request: ChatRequest):
                     request.user_id or "",
                     (pending_repair.get("envelope") or current_envelope).get("date"),
                 )
+                envelope_dict = _mark_unsaved_draft(_preserve_calendar_state(envelope_dict, current_envelope))
                 full_envelope = ScheduleEnvelope(**envelope_dict)
                 log_total_timer()
                 return ChatResponse(
@@ -692,6 +768,7 @@ async def chat_with_llm(request: ChatRequest):
                 "START",
             )
             validated = scheduling_engine._apply_accurate_travel_if_requested(travel_envelope, saved_locations)
+            validated = _mark_unsaved_draft(_preserve_calendar_state(validated, current_envelope))
             pending_requests = validated.get("location_resolution_requests") or []
             if pending_requests:
                 missing = [
@@ -848,6 +925,9 @@ async def chat_with_llm(request: ChatRequest):
                     target_date_envelope=target_date_envelope,
                     saved_locations=saved_locations,
                 )
+                patch_result["envelope"] = _mark_unsaved_draft(
+                    cleanDirtySchedule(_preserve_calendar_state(patch_result["envelope"], current_envelope))
+                )
                 jlog("TIMER", f"apply_operations_seconds={elapsed_seconds(apply_started)}")
                 
                 module_8_started = time.perf_counter()
@@ -893,6 +973,9 @@ async def chat_with_llm(request: ChatRequest):
         
         schedule_dict = result.get("schedule_data")
         if schedule_dict:
+            schedule_dict = _mark_unsaved_draft(
+                cleanDirtySchedule(_preserve_calendar_state(schedule_dict, current_envelope))
+            )
             module_8_started = time.perf_counter()
             reply_meta = scheduling_engine.compose_result_reply(
                 latest_request=request.message,
@@ -955,56 +1038,8 @@ async def apply_operations_endpoint(scheduleId: str, request: SchedulePatchReque
         )
         
         updated_envelope = result["envelope"]
-        database.save_plan(
-            date=updated_envelope["date"],
-            activities=updated_envelope["activities"],
-            schedule_blocks=updated_envelope.get("schedule_blocks"),
-            committed_schedule_blocks=updated_envelope.get("committed_schedule_blocks"),
-            user_id=request.user_id,
-            explanations=updated_envelope["explanations"],
-            unscheduled_activities=updated_envelope["unscheduled_activities"],
-            version=updated_envelope["version"],
-            schedule_id=updated_envelope["scheduleId"],
-            preferences=updated_envelope.get("preferences"),
-            status=updated_envelope.get("status", "ok"),
-            conflict=updated_envelope.get("conflict"),
-            planning_mode=updated_envelope.get("planning_mode", "feasibility_first"),
-            allow_clash=bool(updated_envelope.get("allow_clash", False)),
-            conflicts=updated_envelope.get("conflicts"),
-            warnings=updated_envelope.get("warnings"),
-            schedule_status=updated_envelope.get("schedule_status"),
-            accurate_travel_time=bool(updated_envelope.get("accurate_travel_time", False)),
-            travel_validation_status=updated_envelope.get("travel_validation_status"),
-            location_resolution_requests=updated_envelope.get("location_resolution_requests"),
-            route_conflicts=updated_envelope.get("route_conflicts"),
-            pending_repair_suggestions=updated_envelope.get("pending_repair_suggestions"),
-            unfit_activities=updated_envelope.get("unfit_activities"),
-            optional_skipped=updated_envelope.get("optional_skipped"),
-            blocked_activities=updated_envelope.get("blocked_activities"),
-            route_repair_actions=updated_envelope.get("route_repair_actions"),
-            route_efficiency=updated_envelope.get("route_efficiency"),
-            route_total_before=updated_envelope.get("route_total_before"),
-            route_total_after=updated_envelope.get("route_total_after"),
-            route_minutes_saved=updated_envelope.get("route_minutes_saved"),
-            location_revisits_count=updated_envelope.get("location_revisits_count"),
-            same_location_split_penalty_before=updated_envelope.get("same_location_split_penalty_before"),
-            same_location_split_penalty_after=updated_envelope.get("same_location_split_penalty_after"),
-            revisit_penalty_before=updated_envelope.get("revisit_penalty_before"),
-            revisit_penalty_after=updated_envelope.get("revisit_penalty_after"),
-            start_route_summary=updated_envelope.get("start_route_summary"),
-            preview_id=updated_envelope.get("preview_id"),
-            preview_base_version=updated_envelope.get("preview_base_version"),
-            preview_status=updated_envelope.get("preview_status"),
-            preview_reason=updated_envelope.get("preview_reason"),
-            preview_schedule=updated_envelope.get("preview_schedule"),
-            failed_repair_attempt=updated_envelope.get("failed_repair_attempt"),
-            needs_reschedule=bool(updated_envelope.get("needs_reschedule", False)),
-            reschedule_reason=updated_envelope.get("reschedule_reason"),
-            needs_travel_validation=bool(updated_envelope.get("needs_travel_validation", False)),
-            last_rescheduled_at=updated_envelope.get("last_rescheduled_at"),
-            unmet_items=updated_envelope.get("unmet_items"),
-            validation_issues=updated_envelope.get("validation_issues"),
-        )
+        updated_envelope = _mark_unsaved_draft(cleanDirtySchedule(updated_envelope))
+        database.save_plan_from_envelope(updated_envelope, request.user_id)
         
         return SchedulePatchResponse(
             scheduleId=scheduleId,
@@ -1059,65 +1094,25 @@ async def get_plan_by_date(date: str, user_id: str):
 async def save_plan_endpoint(plan: PlanRequest):
     """Save or update a plan (Full-Save compatibility)"""
     try:
-        saved_plan = database.save_plan(
-            date=plan.date,
-            activities=[act.model_dump() for act in plan.activities],
-            schedule_blocks=[act.model_dump() for act in (plan.schedule_blocks or [])],
-            committed_schedule_blocks=plan.committed_schedule_blocks,
-            user_id=plan.user_id,
-            explanations=plan.explanations,
-            unscheduled_activities=[act.model_dump() for act in plan.unscheduled_activities],
-            version=plan.version,
-            schedule_id=plan.scheduleId,
-            preferences={
-                **(plan.preferences or {}),
-                "allow_clash": bool(plan.allow_clash),
-                "planning_mode": plan.planning_mode,
-                "accurate_travel_time": bool(plan.accurate_travel_time),
-                "travel_intent": bool(plan.travel_intent),
-                "schedule_constraints": plan.schedule_constraints or (plan.preferences or {}).get("schedule_constraints") or {},
-            },
-            status=plan.status or "ok",
-            schedule_status=plan.schedule_status or plan.status or "ok",
-            travel_validation_status=plan.travel_validation_status or "not_requested",
-            conflict=plan.conflict,
-            planning_mode=plan.planning_mode,
-            allow_clash=bool(plan.allow_clash),
-            accurate_travel_time=bool(plan.accurate_travel_time),
-            travel_intent=bool(plan.travel_intent),
-            schedule_constraints=plan.schedule_constraints,
-            conflicts=plan.conflicts,
-            warnings=plan.warnings,
-            location_resolution_requests=plan.location_resolution_requests,
-            route_conflicts=plan.route_conflicts,
-            pending_repair_suggestions=plan.pending_repair_suggestions,
-            unfit_activities=plan.unfit_activities,
-            optional_skipped=plan.optional_skipped,
-            blocked_activities=plan.blocked_activities,
-            route_repair_actions=plan.route_repair_actions,
-            route_efficiency=plan.route_efficiency,
-            route_total_before=plan.route_total_before,
-            route_total_after=plan.route_total_after,
-            route_minutes_saved=plan.route_minutes_saved,
-            location_revisits_count=plan.location_revisits_count,
-            same_location_split_penalty_before=plan.same_location_split_penalty_before,
-            same_location_split_penalty_after=plan.same_location_split_penalty_after,
-            revisit_penalty_before=plan.revisit_penalty_before,
-            revisit_penalty_after=plan.revisit_penalty_after,
-            start_route_summary=plan.start_route_summary,
-            preview_id=plan.preview_id,
-            preview_base_version=plan.preview_base_version,
-            preview_status=plan.preview_status,
-            preview_reason=plan.preview_reason,
-            preview_schedule=plan.preview_schedule,
-            failed_repair_attempt=plan.failed_repair_attempt,
-            needs_reschedule=bool(plan.needs_reschedule),
-            reschedule_reason=plan.reschedule_reason,
-            needs_travel_validation=bool(plan.needs_travel_validation),
-            last_rescheduled_at=plan.last_rescheduled_at,
-            unmet_items=plan.unmet_items,
-            validation_issues=plan.validation_issues,
-        )
+        incoming = plan.model_dump()
+        incoming["activities"] = [act.model_dump() for act in plan.activities]
+        incoming["schedule_blocks"] = [act.model_dump() for act in (plan.schedule_blocks or [])]
+        incoming["external_calendar_events"] = [
+            act.model_dump() for act in (plan.external_calendar_events or [])
+        ]
+        incoming["unscheduled_activities"] = [act.model_dump() for act in plan.unscheduled_activities]
+        incoming["preferences"] = {
+            **(plan.preferences or {}),
+            "allow_clash": bool(plan.allow_clash),
+            "planning_mode": plan.planning_mode,
+            "accurate_travel_time": bool(plan.accurate_travel_time),
+            "travel_intent": bool(plan.travel_intent),
+            "schedule_constraints": plan.schedule_constraints or (plan.preferences or {}).get("schedule_constraints") or {},
+        }
+        incoming["schedule_status"] = plan.schedule_status or plan.status or "ok"
+        incoming["travel_validation_status"] = plan.travel_validation_status or "not_requested"
+        prepared = prepare_schedule_for_save(incoming)
+        saved_plan = database.save_plan_from_envelope(prepared, plan.user_id)
         return ScheduleEnvelope(**saved_plan)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -1139,63 +1134,33 @@ async def sync_calendar(request: Dict[str, Any]):
 
         all_synced_days = []
         target_date_events = []
+        target_plan = None
 
         # 2. Process each date
         for event_date, google_events in grouped_events.items():
             # Get existing plan (envelope)
-            existing_plan = database.get_plan_by_date(event_date, user_id)
-            
-            # Map to JPlan format
-            new_activities = []
-            for ge in google_events:
-                new_activities.append({
-                    "id": ge.get("id"),
-                    "type": "activity",
-                    "title": ge.get("activity"),
-                    "startTime": ge.get("startTime"),
-                    "endTime": ge.get("endTime"),
-                    "category": "External",
-                    "source": "google_calendar"
-                })
-
-            final_activities = []
-            if existing_plan:
-                # Envelope uses 'activities'
-                existing_activities = existing_plan.get("activities", [])
-                
-                # Build fingerprints for existing activities: Title|Start|End
-                def get_fingerprint(a):
-                    title = str(a.get("title", "")).strip().lower()
-                    start = str(a.get("startTime", "")).strip().lower()
-                    end = str(a.get("endTime", "")).strip().lower()
-                    
-                    if start.startswith("0"): start = start[1:]
-                    if end.startswith("0"): end = end[1:]
-                    
-                    return f"{title}|{start}|{end}"
-                
-                existing_ids = {a.get("id") for a in existing_activities if a.get("id")}
-                existing_fingerprints = {get_fingerprint(a) for a in existing_activities}
-                
-                merged = list(existing_activities)
-                for na in new_activities:
-                    if na.get("id") not in existing_ids and get_fingerprint(na) not in existing_fingerprints:
-                        merged.append(na)
-                final_activities = merged
-            else:
-                final_activities = new_activities
-
-            # Save to DB
-            database.save_plan(event_date, final_activities, user_id)
+            existing_plan = database.get_plan_by_date(event_date, user_id) or {
+                "date": event_date,
+                "activities": [],
+                "schedule_blocks": [],
+                "committed_schedule_blocks": [],
+                "external_calendar_events": [],
+                "sync_links": [],
+                "active_view": "jplan",
+            }
+            updated_plan = apply_calendar_sync(existing_plan, google_events, date=event_date)
+            database.save_plan_from_envelope(updated_plan, user_id)
             all_synced_days.append(event_date)
             
             if event_date == date:
-                target_date_events = final_activities
+                target_plan = updated_plan
+                target_date_events = updated_plan.get("external_calendar_events") or []
 
         return {
             "synced_days": all_synced_days,
             "message": f"Successfully synced events for {len(all_synced_days)} days",
-            "events": target_date_events if date else []
+            "events": target_date_events if date else [],
+            "plan": target_plan,
         }
         
     except Exception as e:
@@ -1213,6 +1178,53 @@ async def sync_calendar(request: Dict[str, Any]):
         raise HTTPException(status_code=500, detail=error_msg)
 
 
+@app.post("/api/plans/{date}/import-calendar", response_model=ScheduleEnvelope)
+async def import_calendar_events(date: str, request: CalendarImportRequest):
+    if not request.user_id:
+        raise HTTPException(status_code=400, detail="user_id is required")
+    try:
+        plan = database.get_plan_by_date(date, request.user_id)
+        if plan is None:
+            raise HTTPException(status_code=404, detail=f"No plan found for {date}")
+        updated = import_selected_calendar_events(plan, request.event_ids)
+        saved = database.save_plan_from_envelope(updated, request.user_id)
+        return ScheduleEnvelope(**saved)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        jlog("API", f"Import calendar error: {exc}", "CALENDAR")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/plans/{date}/replace-from-calendar")
+async def replace_from_calendar(date: str, request: CalendarReplaceRequest):
+    if not request.user_id:
+        raise HTTPException(status_code=400, detail="user_id is required")
+    try:
+        plan = database.get_plan_by_date(date, request.user_id)
+        if plan is None:
+            raise HTTPException(status_code=404, detail=f"No plan found for {date}")
+
+        if not request.confirm:
+            return {
+                "preview": replace_from_calendar_preview(plan, request.event_ids),
+                "applied": False,
+            }
+
+        updated = apply_replace_from_calendar(plan, request.event_ids)
+        saved = database.save_plan_from_envelope(updated, request.user_id)
+        return {
+            "preview": replace_from_calendar_preview(plan, request.event_ids),
+            "applied": True,
+            "schedule": ScheduleEnvelope(**saved).model_dump(),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        jlog("API", f"Replace calendar error: {exc}", "CALENDAR")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 @app.post("/api/export-calendar")
 async def export_calendar(request: ExportRequest):
     if not request.user_id or not request.date:
@@ -1221,10 +1233,16 @@ async def export_calendar(request: ExportRequest):
     try:
         # Get existing plan (envelope)
         plan = database.get_plan_by_date(request.date, request.user_id)
-        if not plan or not plan.get("activities"):
-            raise HTTPException(status_code=404, detail="No activities found for this date")
+        if not _has_jplan_export_source(plan):
+            raise HTTPException(status_code=404, detail="No JPlan timeline found for this date")
             
+        prepared = prepare_schedule_for_save(plan)
+        if prepared != plan:
+            plan = database.save_plan_from_envelope(prepared, request.user_id)
         result = cal_service.export_schedule_to_google(request.user_id, request.date, plan)
+        if result.get("exported_events"):
+            linked = upsert_sync_links_from_export(plan, result.get("exported_events") or [])
+            database.save_plan_from_envelope(linked, request.user_id)
             
         return {"message": "Success", **result}
     except Exception as e:
@@ -1349,6 +1367,7 @@ async def resolve_location(request: LocationResolveRequest):
 @app.post("/api/travel/complete", response_model=ScheduleEnvelope)
 async def complete_travel_validation(request: TravelCompleteRequest):
     envelope = _merge_user_preferences_into_envelope(request.schedule.model_dump(), request.user_id) or request.schedule.model_dump()
+    envelope = cleanDirtySchedule(envelope)
     envelope["accurate_travel_time"] = True
     envelope.setdefault("preferences", {})
     envelope["preferences"]["accurate_travel_time"] = True
@@ -1364,16 +1383,9 @@ async def complete_travel_validation(request: TravelCompleteRequest):
     )
     saved_locations = database.get_user_locations(request.user_id)
     validated = scheduling_engine._apply_accurate_travel_if_requested(envelope, saved_locations)
+    validated = _mark_unsaved_draft(_preserve_calendar_state(validated, envelope))
     travel_status = validated.get("travel_validation_status")
-    validation_only_dirty = (
-        not envelope.get("needs_reschedule")
-        or str(envelope.get("reschedule_reason") or "") not in MANUAL_RESCHEDULE_REASONS
-    )
-    if (
-        travel_status in {"validated", "repaired_validated"}
-        and validation_only_dirty
-        and _travel_validation_accounted_for_all(envelope, validated)
-    ):
+    if travel_status in {"validated", "repaired_validated"} and not (validated.get("location_resolution_requests") or []):
         validated["needs_reschedule"] = False
         validated["reschedule_reason"] = None
         validated["needs_travel_validation"] = False
@@ -1401,6 +1413,7 @@ async def complete_travel_validation(request: TravelCompleteRequest):
 @app.post("/api/schedules/replan", response_model=ScheduleEnvelope)
 async def run_scheduler_endpoint(request: RunSchedulerRequest):
     envelope = _merge_user_preferences_into_envelope(request.schedule.model_dump(), request.user_id) or request.schedule.model_dump()
+    envelope = cleanDirtySchedule(envelope)
     saved_locations = database.get_user_locations(request.user_id)
     try:
         updated = scheduling_engine.run_manual_scheduler(
@@ -1409,6 +1422,8 @@ async def run_scheduler_endpoint(request: RunSchedulerRequest):
             base_version=request.schedule_version,
             source=request.source or "manual_button",
         )
+        updated = _mark_unsaved_draft(_preserve_calendar_state(updated, envelope))
+        validate_state_invariants(updated, context="replan")
         return ScheduleEnvelope(**updated)
     except VersionMismatchError as exc:
         raise HTTPException(status_code=409, detail=str(exc))

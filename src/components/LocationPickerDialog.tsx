@@ -166,6 +166,7 @@ export function LocationPickerDialog({
   const [isSearching, setIsSearching] = useState(false);
   const [showSavedLocations, setShowSavedLocations] = useState(false);
   const [showRecentLocations, setShowRecentLocations] = useState(false);
+  const [hasUserPickedLocation, setHasUserPickedLocation] = useState(false);
 
   useEffect(() => {
     if (!open) return;
@@ -182,6 +183,7 @@ export function LocationPickerDialog({
     setSearchResults(safeCandidates);
     setSearchQuery(initialSearchQuery);
     setNotice(null);
+    setHasUserPickedLocation(false);
     setShowSavedLocations(false);
     setShowRecentLocations(false);
   }, [safeCandidates, initialCenter, initialPin, initialSearchQuery, open, savedCandidates, recentCandidates]);
@@ -189,6 +191,7 @@ export function LocationPickerDialog({
   const handlePickPoint = (point: MapPoint) => {
     setPin(point);
     setSelectedCandidate(null);
+    setHasUserPickedLocation(true);
     setNotice(referenceLabel ? `Pin selected near ${referenceLabel}.` : (label ? `Pin selected for ${label}.` : "Pin selected on the map."));
   };
 
@@ -214,6 +217,7 @@ export function LocationPickerDialog({
           longitude: point.lng,
           source: "device_location_pin",
         });
+        setHasUserPickedLocation(true);
         setReferenceLabel("your current location");
         setNotice("Centered on your current location. Adjust the pin if needed before confirming.");
       },
@@ -240,6 +244,7 @@ export function LocationPickerDialog({
           setPin(point);
           setSelectedCandidate(candidate);
           setReferenceLabel(candidate.display_name || candidate.address || null);
+          setHasUserPickedLocation(true);
         }
       }
       const warning = result.warnings?.join(" ") || result.warning;
@@ -262,11 +267,16 @@ export function LocationPickerDialog({
     setPin(point);
     setSelectedCandidate(candidate);
     setReferenceLabel(candidate.display_name || candidate.address || null);
+    setHasUserPickedLocation(true);
     setNotice(`Pin moved to ${candidate.display_name || candidate.address || "the selected result"}.`);
   };
 
   const handleConfirm = async () => {
     if (!pin) return;
+    if (!hasUserPickedLocation) {
+      setNotice("Choose a search result, saved place, current location, or click the exact point on the map before saving.");
+      return;
+    }
     const confirmed = selectedCandidate
       ? {
           ...selectedCandidate,
@@ -479,7 +489,7 @@ export function LocationPickerDialog({
           <Button
             className="rounded-xl"
             onClick={handleConfirm}
-            disabled={!pin || saving}
+            disabled={!pin || !hasUserPickedLocation || saving}
           >
             {saving ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Check className="mr-2 h-4 w-4" />}
             {confirmLabel}

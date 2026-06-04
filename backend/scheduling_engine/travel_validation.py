@@ -17,6 +17,24 @@ from .types_utils import _normalize_location
 NEAR_LOCATION_THRESHOLD_METERS = 300
 
 class TravelValidationMixin:
+    def _valid_start_route_summary(
+        self,
+        summary: Optional[Dict[str, Any]],
+        unfit_activities: Optional[List[Dict[str, Any]]] = None,
+        unscheduled_activities: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        if not summary:
+            return None
+        first_event = clean_title(summary.get("first_physical_event") or "")
+        invalid_titles = {
+            clean_title(item.get("title") or item.get("activity_title") or item.get("name") or "")
+            for item in (unfit_activities or []) + (unscheduled_activities or [])
+        }
+        invalid_titles.discard("")
+        if first_event and first_event in invalid_titles:
+            return None
+        return summary
+
     def _reset_travel_perf(self) -> None:
         self._travel_perf_timers = {
             "geocoding_seconds": 0.0,
@@ -1276,7 +1294,11 @@ class TravelValidationMixin:
             "route_efficiency": route_efficiency,
             "repaired_envelope": repaired,
             "repaired_validation": validation,
-            "start_route_summary": validation.get("start_route_summary"),
+            "start_route_summary": self._valid_start_route_summary(
+                validation.get("start_route_summary"),
+                unfit,
+                repaired.get("unscheduled_activities") or [],
+            ),
         }
         elapsed = time.perf_counter() - route_refit_started
         self._add_travel_perf_time("route_aware_refit_seconds", elapsed)
@@ -4367,7 +4389,11 @@ class TravelValidationMixin:
             for item in unfit
         ]
         candidate["updated_transition_count"] = int(validation.get("updated_transition_count") or 0)
-        candidate["start_route_summary"] = validation.get("start_route_summary")
+        candidate["start_route_summary"] = self._valid_start_route_summary(
+            validation.get("start_route_summary"),
+            unfit,
+            candidate.get("unscheduled_activities") or [],
+        )
         candidate["schedule_blocks"] = validation.get("schedule_blocks") or candidate["schedule_blocks"]
         if candidate["travel_validation_status"] == "partial_feasible_with_unfit":
             candidate["status"] = "partial"

@@ -5,6 +5,11 @@ from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime, timedelta
 from supabase import Client
 
+from calendar_import import (
+    JPLAN_META_MARKER,
+    extract_jplan_metadata,
+    materialize_committed_blocks,
+)
 from jplan_logging import jlog
 
 CALENDAR_VERBOSE_LOGS = os.getenv("JPLAN_CALENDAR_DEBUG", "").lower() in {"1", "true", "yes", "on"}
@@ -177,6 +182,9 @@ def _start_route_export_event(plan: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             f"Travel time: {duration} min",
         ]),
         "jplan_export_type": "travel",
+        "block_id": "start-route",
+        "block_type": "travel",
+        "is_travel_block": True,
     }
 
 
@@ -188,7 +196,7 @@ def build_google_export_events(plan: Dict[str, Any], date_str: str) -> Dict[str,
         for activity in activities
         if isinstance(activity, dict)
     }
-    blocks = plan.get("schedule_blocks") or []
+    blocks = plan.get("committed_schedule_blocks") or plan.get("schedule_blocks") or []
     export_source = blocks if blocks else activities
 
     events: List[Dict[str, Any]] = []
@@ -198,6 +206,19 @@ def build_google_export_events(plan: Dict[str, Any], date_str: str) -> Dict[str,
 
     start_route_event = _start_route_export_event(plan)
     if start_route_event:
+        metadata = {
+            "source_system": "jplan",
+            "jplan_schedule_id": plan.get("scheduleId") or plan.get("schedule_id") or "",
+            "stable_activity_id": "",
+            "block_id": start_route_event.get("block_id") or "start-route",
+            "block_type": "travel",
+            "is_travel_block": "true",
+        }
+        start_route_event["jplan_metadata"] = metadata
+        start_route_event["description"] = "\n".join([
+            start_route_event.get("description") or JPLAN_EXPORT_MARKER,
+            f"{JPLAN_META_MARKER} {json.dumps(metadata, separators=(',', ':'))}",
+        ])
         events.append(start_route_event)
         travel_count += 1
 
@@ -246,12 +267,36 @@ def build_google_export_events(plan: Dict[str, Any], date_str: str) -> Dict[str,
             travel_count += 1
 
         location = _best_location_label(item)
+        block_type = "activity" if is_activity else "travel"
+        block_id = str(
+            item.get("block_id")
+            or item.get("stable_activity_id")
+            or item.get("id")
+            or f"{block_type}-{len(events)}"
+        )
+        stable_activity_id = item.get("stable_activity_id") if is_activity else item.get("related_activity_id")
+        metadata = {
+            "source_system": "jplan",
+            "jplan_schedule_id": plan.get("scheduleId") or plan.get("schedule_id") or "",
+            "stable_activity_id": stable_activity_id or "",
+            "block_id": block_id,
+            "block_type": block_type,
+            "is_travel_block": "true" if is_travel else "false",
+        }
+        description = "\n".join([
+            description,
+            f"{JPLAN_META_MARKER} {json.dumps(metadata, separators=(',', ':'))}",
+        ])
         event = {
             "summary": summary,
             "startTime": start_time,
             "endTime": end_time,
             "description": description,
-            "jplan_export_type": "activity" if is_activity else "travel",
+            "jplan_export_type": block_type,
+            "block_id": block_id,
+            "stable_activity_id": stable_activity_id,
+            "calendar_event_id": item.get("calendar_event_id"),
+            "jplan_metadata": metadata,
         }
         if location:
             event["location"] = location
@@ -277,7 +322,27 @@ class CalendarService:
 
     @staticmethod
     def _empty_export_result() -> Dict[str, int]:
-        return {"exported_count": 0, "activity_count": 0, "travel_count": 0, "skipped_count": 0}
+        return {
+            "exported_count": 0,
+            "activity_count": 0,
+            "travel_count": 0,
+            "skipped_count": 0,
+            "updated_count": 0,
+            "created_count": 0,
+            "exported_events": [],
+        }
+
+    def _get_refresh_token(self, user_id: str) -> Optional[str]:
+        res = self.supabase.table("profiles").select("google_refresh_token").eq("id", user_id).execute()
+        if not res.data or len(res.data) == 0:
+            return None
+        return res.data[0].get("google_refresh_token")
+
+    def has_refresh_token(self, user_id: str) -> bool:
+        try:
+            return bool(self._get_refresh_token(user_id))
+        except Exception:
+            return False
 
     def list_calendars(self, access_token: str) -> List[Dict[str, Any]]:
         """List all calendars available to the user"""
@@ -431,11 +496,15 @@ class CalendarService:
 
                 formatted_activities.append({
                     "id": event.get("id"),
+                    "original_google_event_id": event.get("id"),
+                    "google_event_id": event.get("id"),
                     "startTime": start_time,
                     "endTime": end_time,
                     "activity": summary,
+                    "title": summary,
                     "category": "External",
-                    "source": "google_calendar"
+                    "source_system": "google_calendar",
+                    "read_only": True,
                 })
 
             return formatted_activities
@@ -495,29 +564,7 @@ class CalendarService:
                 if event_date not in grouped_data:
                     grouped_data[event_date] = []
                 
-                # Format times
-                if "T" in start_raw:
-                    try:
-                        dt_start = datetime.fromisoformat(start_raw.replace("Z", "+00:00"))
-                        start_time = dt_start.strftime("%I:%M %p")
-                        
-                        dt_end = datetime.fromisoformat(end_raw.replace("Z", "+00:00"))
-                        end_time = dt_end.strftime("%I:%M %p")
-                    except Exception:
-                        start_time = start_raw[11:16]
-                        end_time = end_raw[11:16]
-                else:
-                    start_time = "All Day"
-                    end_time = "All Day"
-
-                grouped_data[event_date].append({
-                    "id": event.get("id"),
-                    "startTime": start_time,
-                    "endTime": end_time,
-                    "activity": summary,
-                    "category": "External",
-                    "source": "google_calendar"
-                })
+                grouped_data[event_date].append(event)
 
             return grouped_data
 
@@ -533,14 +580,9 @@ class CalendarService:
         """
         try:
             # 1. Get refresh token
-            res = self.supabase.table("profiles").select("google_refresh_token").eq("id", user_id).execute()
-            if not res.data or len(res.data) == 0:
-                _calendar_log(f"No profile found for user {user_id}", "ERROR")
-                raise Exception("TOKEN_EXPIRED")
-            
-            refresh_token = res.data[0].get("google_refresh_token")
+            refresh_token = self._get_refresh_token(user_id)
             if not refresh_token:
-                _calendar_log(f"No Google refresh token found for user {user_id}", "ERROR")
+                _calendar_log(f"No profile found for user {user_id}", "ERROR")
                 raise Exception("TOKEN_EXPIRED")
 
             # 2. Get access token
@@ -568,45 +610,35 @@ class CalendarService:
                     _calendar_log(f"Time parse error for '{t_str}': {parse_err}", "ERROR")
                     return None
 
-            # 3. Cleanup existing JPlan events in Google for this date
-            _calendar_debug(f"Cleaning up previous JPlan events for {date_str}")
-            # Use a slightly wider range to be sure (target date +/- 12 hours)
+            # 3. Fetch existing JPlan-created events for idempotent updates.
             target_date_dt = datetime.fromisoformat(date_str)
             clean_min = (target_date_dt - timedelta(hours=14)).isoformat() + "Z"
             clean_max = (target_date_dt + timedelta(hours=38)).isoformat() + "Z"
-            
             existing_google_events = self.get_calendar_events(access_token, clean_min, clean_max)
-            deleted_count = 0
+            existing_by_block_id: Dict[str, str] = {}
             for gev in existing_google_events:
-                # Proper cleanup: Check if event overlaps with the target date
-                start_obj = gev.get("start", {})
-                end_obj = gev.get("end", {})
-                
-                start_raw = start_obj.get("dateTime") or start_obj.get("date", "")
-                end_raw = end_obj.get("dateTime") or end_obj.get("date", "")
-                
-                # We target events that involve the local date_str
-                # If any of the start or end dates contain the date_str, we delete it
-                should_delete = False
-                if date_str in start_raw or date_str in end_raw:
-                    should_delete = True
-                
-                if should_delete:
-                    try:
-                        del_url = f"https://www.googleapis.com/calendar/v3/calendars/primary/events/{gev.get('id')}"
-                        del_resp = requests.delete(del_url, headers=headers)
-                        del_resp.raise_for_status()
-                        deleted_count += 1
-                        _calendar_debug(f"Deleted existing event for full sync reset: {gev.get('summary')} ({start_raw})")
-                    except Exception as del_err:
-                        _calendar_log(f"Failed to delete event {gev.get('id')}: {del_err}", "ERROR")
-            
-            _calendar_debug(f"Cleanup finished; deleted={deleted_count}")
+                metadata = extract_jplan_metadata(gev)
+                if str(metadata.get("source_system") or "").lower() != "jplan":
+                    continue
+                block_id = metadata.get("block_id")
+                if block_id and gev.get("id"):
+                    existing_by_block_id[str(block_id)] = str(gev["id"])
+
+            sync_by_block_id = {
+                str(link.get("block_id")): str(link.get("calendar_event_id") or link.get("google_event_id"))
+                for link in (plan.get("sync_links") or [])
+                if link.get("block_id") and (link.get("calendar_event_id") or link.get("google_event_id"))
+            }
 
             # 4. Push each exportable timeline item
+            if not plan.get("committed_schedule_blocks"):
+                plan = {**plan, "committed_schedule_blocks": materialize_committed_blocks(plan)}
             export_payload = build_google_export_events(plan, date_str)
             export_events = export_payload["events"]
             exported_count = 0
+            updated_count = 0
+            created_count = 0
+            exported_event_links: List[Dict[str, Any]] = []
             _calendar_debug(f"Starting export user={user_id} date={date_str} items={len(export_events)}")
             for event_item in export_events:
                 _calendar_debug(f"Processing export item='{event_item.get('summary')}' type={event_item.get('jplan_export_type')}")
@@ -625,21 +657,44 @@ class CalendarService:
 
                 start_payload = {"dateTime": start_dt.strftime("%Y-%m-%dT%H:%M:%S") + "+08:00"}
                 end_payload = {"dateTime": end_dt.strftime("%Y-%m-%dT%H:%M:%S") + "+08:00"}
+                metadata = event_item.get("jplan_metadata") or {
+                    "source_system": "jplan",
+                    "jplan_schedule_id": plan.get("scheduleId") or "",
+                    "stable_activity_id": event_item.get("stable_activity_id") or "",
+                    "block_id": event_item.get("block_id") or "",
+                    "block_type": event_item.get("jplan_export_type") or "",
+                    "is_travel_block": "true" if event_item.get("jplan_export_type") == "travel" else "false",
+                }
 
                 event = {
                     "summary": event_item.get("summary", "JPlan Activity"),
                     "description": event_item.get("description") or JPLAN_EXPORT_MARKER,
                     "start": start_payload,
                     "end": end_payload,
-                    "reminders": {"useDefault": True}
+                    "reminders": {"useDefault": True},
+                    "extendedProperties": {
+                        "private": metadata,
+                    },
                 }
                 if event_item.get("location"):
                     event["location"] = event_item["location"]
                 
                 _calendar_debug(f"Sending event payload to Google: {json.dumps(event)}")
 
-                url = "https://www.googleapis.com/calendar/v3/calendars/primary/events"
-                resp = requests.post(url, headers=headers, json=event)
+                block_id = str(event_item.get("block_id") or metadata.get("block_id") or "")
+                existing_event_id = (
+                    event_item.get("calendar_event_id")
+                    or sync_by_block_id.get(block_id)
+                    or existing_by_block_id.get(block_id)
+                )
+                if existing_event_id:
+                    url = f"https://www.googleapis.com/calendar/v3/calendars/primary/events/{existing_event_id}"
+                    resp = requests.patch(url, headers=headers, json=event)
+                    updated_count += 1
+                else:
+                    url = "https://www.googleapis.com/calendar/v3/calendars/primary/events"
+                    resp = requests.post(url, headers=headers, json=event)
+                    created_count += 1
                 
                 if resp.status_code == 403:
                     _calendar_log(f"403 Forbidden - likely missing scopes: {resp.text}", "ERROR")
@@ -647,10 +702,24 @@ class CalendarService:
                 
                 resp.raise_for_status()
                 exported_count += 1
+                response_payload = {}
+                try:
+                    response_payload = resp.json()
+                except Exception:
+                    response_payload = {}
+                calendar_event_id = response_payload.get("id") or existing_event_id
+                exported_event_links.append({
+                    "calendar_event_id": calendar_event_id,
+                    "google_event_id": calendar_event_id,
+                    "block_id": block_id,
+                    "stable_activity_id": event_item.get("stable_activity_id"),
+                    "block_type": event_item.get("jplan_export_type"),
+                })
 
             _calendar_log(
                 f"Successfully exported {exported_count} timeline items to Google "
-                f"(activities={export_payload['activity_count']} travel={export_payload['travel_count']})",
+                f"(activities={export_payload['activity_count']} travel={export_payload['travel_count']} "
+                f"created={created_count} updated={updated_count})",
                 "EXPORT",
             )
             return {
@@ -658,6 +727,9 @@ class CalendarService:
                 "activity_count": export_payload["activity_count"],
                 "travel_count": export_payload["travel_count"],
                 "skipped_count": export_payload["skipped_count"],
+                "updated_count": updated_count,
+                "created_count": created_count,
+                "exported_events": exported_event_links,
             }
 
         except Exception as e:

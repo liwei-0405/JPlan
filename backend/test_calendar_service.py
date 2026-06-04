@@ -44,6 +44,9 @@ class FakeGoogleResponse:
     def raise_for_status(self):
         return None
 
+    def json(self):
+        return {"id": "created-event"}
+
 
 def test_google_export_uses_schedule_blocks_and_best_activity_location():
     plan = {
@@ -81,6 +84,47 @@ def test_google_export_uses_schedule_blocks_and_best_activity_location():
     assert event["startTime"] == "12:30 PM"
     assert event["endTime"] == "01:30 PM"
     assert event["location"] == "Selected Tamarind Square"
+
+
+def test_google_export_prefers_committed_schedule_blocks_over_draft_blocks():
+    plan = {
+        "activities": [
+            {
+                "id": "act-lunch",
+                "stable_activity_id": "act-lunch",
+                "type": "activity",
+                "title": "Lunch",
+                "startTime": "12:00 PM",
+                "endTime": "01:00 PM",
+            }
+        ],
+        "schedule_blocks": [
+            {
+                "id": "act-lunch",
+                "block_type": "activity",
+                "title": "Draft lunch",
+                "startTime": "12:30 PM",
+                "endTime": "01:30 PM",
+            }
+        ],
+        "committed_schedule_blocks": [
+            {
+                "id": "act-lunch",
+                "stable_activity_id": "act-lunch",
+                "block_id": "act-lunch",
+                "block_type": "activity",
+                "title": "Committed lunch",
+                "startTime": "01:00 PM",
+                "endTime": "02:00 PM",
+            }
+        ],
+    }
+
+    result = build_google_export_events(plan, "2026-05-26")
+
+    assert result["events"][0]["summary"] == "Committed lunch"
+    assert result["events"][0]["startTime"] == "01:00 PM"
+    assert result["events"][0]["jplan_metadata"]["source_system"] == "jplan"
 
 
 def test_google_export_includes_real_travel_blocks_and_skips_display_rows():
@@ -268,6 +312,57 @@ def test_google_export_posts_activity_and_travel_payloads(monkeypatch):
     ]
     assert posted_events[0]["location"] == "Tamarind Square"
     assert posted_events[1]["location"] == "Tamarind Square"
+    assert posted_events[0]["extendedProperties"]["private"]["source_system"] == "jplan"
+
+
+def test_google_export_updates_linked_event_instead_of_posting_duplicate(monkeypatch):
+    service = CalendarService(FakeSupabase())
+    monkeypatch.setattr(service, "refresh_access_token", lambda _token: "access-token")
+    monkeypatch.setattr(service, "get_calendar_events", lambda *_args, **_kwargs: [])
+
+    posted_events = []
+    patched_events = []
+
+    def fake_post(_url, headers=None, json=None, **_kwargs):
+        posted_events.append(json)
+        return FakeGoogleResponse()
+
+    def fake_patch(url, headers=None, json=None, **_kwargs):
+        patched_events.append((url, json))
+        return FakeGoogleResponse()
+
+    monkeypatch.setattr(calendar_service.requests, "post", fake_post)
+    monkeypatch.setattr(calendar_service.requests, "patch", fake_patch)
+
+    result = service.export_schedule_to_google(
+        "user-1",
+        "2026-05-26",
+        {
+            "scheduleId": "schedule-1",
+            "activities": [],
+            "committed_schedule_blocks": [
+                {
+                    "id": "act-grocery",
+                    "stable_activity_id": "act-grocery",
+                    "block_id": "block-grocery",
+                    "calendar_event_id": "google-existing",
+                    "block_type": "activity",
+                    "title": "Grocery shopping",
+                    "startTime": "02:00 PM",
+                    "endTime": "03:00 PM",
+                }
+            ],
+            "sync_links": [
+                {"block_id": "block-grocery", "calendar_event_id": "google-existing"}
+            ],
+        },
+    )
+
+    assert result["exported_count"] == 1
+    assert result["updated_count"] == 1
+    assert posted_events == []
+    assert patched_events[0][0].endswith("/google-existing")
+    assert patched_events[0][1]["extendedProperties"]["private"]["block_id"] == "block-grocery"
 
 
 def test_google_export_missing_refresh_token_raises_token_expired():

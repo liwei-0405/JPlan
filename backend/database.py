@@ -8,6 +8,7 @@ from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Dict, Any
 from supabase import create_client, Client
 from dotenv import load_dotenv
+from calendar_import import cleanDirtySchedule
 from jplan_logging import jlog
 
 # Robust .env loading
@@ -25,7 +26,7 @@ supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY
 if supabase_key: supabase_key = supabase_key.strip('"').strip("'")
 
 supabase: Optional[Client] = None
-SCHEDULE_PAYLOAD_VERSION = 4
+SCHEDULE_PAYLOAD_VERSION = 5
 
 DEFAULT_USER_PREFERENCES = {
     "day_start_time": "08:00",
@@ -109,6 +110,11 @@ def _parse_schedule_payload(payload: Any, user_id: str = "", date: str = "") -> 
         "activities": [],
         "schedule_blocks": [],
         "committed_schedule_blocks": [],
+        "external_calendar_events": [],
+        "sync_links": [],
+        "active_view": "jplan",
+        "has_unsaved_draft": False,
+        "draft_dirty": False,
         "explanations": [],
         "unscheduled_activities": [],
         "conflict": None,
@@ -156,7 +162,7 @@ def _parse_schedule_payload(payload: Any, user_id: str = "", date: str = "") -> 
 
     # If it's already an envelope (schema_version >= 3)
     if isinstance(payload, dict) and payload.get("schema_version", 0) >= 3:
-        return {
+        envelope = {
             "schema_version": payload.get("schema_version", SCHEDULE_PAYLOAD_VERSION),
             "scheduleId": payload.get("scheduleId") or _generate_schedule_id(user_id, date),
             "date": payload.get("date") or date,
@@ -173,6 +179,11 @@ def _parse_schedule_payload(payload: Any, user_id: str = "", date: str = "") -> 
             "activities": payload.get("activities") or payload.get("items") or [],
             "schedule_blocks": payload.get("schedule_blocks") or [],
             "committed_schedule_blocks": payload.get("committed_schedule_blocks") or [],
+            "external_calendar_events": payload.get("external_calendar_events") or [],
+            "sync_links": payload.get("sync_links") or [],
+            "active_view": payload.get("active_view") or "jplan",
+            "has_unsaved_draft": bool(payload.get("has_unsaved_draft", False)),
+            "draft_dirty": bool(payload.get("draft_dirty", False)),
             "explanations": payload.get("explanations") or [],
             "unscheduled_activities": payload.get("unscheduled_activities") or [],
             "conflict": payload.get("conflict"),
@@ -208,19 +219,20 @@ def _parse_schedule_payload(payload: Any, user_id: str = "", date: str = "") -> 
             "unmet_items": payload.get("unmet_items") or [],
             "validation_issues": payload.get("validation_issues") or [],
         }
+        return cleanDirtySchedule(envelope)
 
     # Backward compatibility
     if isinstance(payload, list):
         res = default_envelope.copy()
         res["activities"] = payload
         res["schema_version"] = 1
-        return res
+        return cleanDirtySchedule(res)
 
     if isinstance(payload, dict):
         activities = payload.get("activities") or payload.get("items")
         explanations = payload.get("explanations")
         unscheduled = payload.get("unscheduled_activities")
-        return {
+        envelope = {
             "schema_version": payload.get("schema_version", 2),
             "scheduleId": payload.get("scheduleId") or _generate_schedule_id(user_id, date),
             "date": payload.get("date") or date,
@@ -237,6 +249,11 @@ def _parse_schedule_payload(payload: Any, user_id: str = "", date: str = "") -> 
             "activities": activities if isinstance(activities, list) else [],
             "schedule_blocks": payload.get("schedule_blocks") or [],
             "committed_schedule_blocks": payload.get("committed_schedule_blocks") or [],
+            "external_calendar_events": payload.get("external_calendar_events") or [],
+            "sync_links": payload.get("sync_links") or [],
+            "active_view": payload.get("active_view") or "jplan",
+            "has_unsaved_draft": bool(payload.get("has_unsaved_draft", False)),
+            "draft_dirty": bool(payload.get("draft_dirty", False)),
             "explanations": explanations if isinstance(explanations, list) else [],
             "unscheduled_activities": unscheduled if isinstance(unscheduled, list) else [],
             "conflict": payload.get("conflict"),
@@ -272,6 +289,7 @@ def _parse_schedule_payload(payload: Any, user_id: str = "", date: str = "") -> 
             "unmet_items": payload.get("unmet_items") or [],
             "validation_issues": payload.get("validation_issues") or [],
         }
+        return cleanDirtySchedule(envelope)
 
     return default_envelope
 
@@ -304,6 +322,11 @@ def save_plan(
     user_id: str,
     schedule_blocks: Optional[List[Dict[str, Any]]] = None,
     committed_schedule_blocks: Optional[List[Dict[str, Any]]] = None,
+    external_calendar_events: Optional[List[Dict[str, Any]]] = None,
+    sync_links: Optional[List[Dict[str, Any]]] = None,
+    active_view: str = "jplan",
+    has_unsaved_draft: bool = False,
+    draft_dirty: bool = False,
     explanations: Optional[List[str]] = None,
     unscheduled_activities: Optional[List[Dict[str, Any]]] = None,
     version: int = 1,
@@ -380,6 +403,11 @@ def save_plan(
         'activities': activities,
         'schedule_blocks': schedule_blocks or [],
         'committed_schedule_blocks': committed_schedule_blocks or [],
+        'external_calendar_events': external_calendar_events or [],
+        'sync_links': sync_links or [],
+        'active_view': active_view or 'jplan',
+        'has_unsaved_draft': bool(has_unsaved_draft),
+        'draft_dirty': bool(draft_dirty),
         'explanations': explanations or [],
         'unscheduled_activities': unscheduled_activities or [],
         'conflict': conflict,
@@ -415,6 +443,10 @@ def save_plan(
         'unmet_items': unmet_items or [],
         'validation_issues': validation_issues or [],
     }
+    # The database column is named daily_plans.activities for legacy reasons.
+    # The JSON envelope inside it keeps canonical activities, committed timeline,
+    # and external Google Calendar events separated.
+    envelope = cleanDirtySchedule(envelope)
     
     try:
         response = supabase.table('daily_plans').upsert({
@@ -431,6 +463,66 @@ def save_plan(
     except Exception as e:
         jlog("DB", f"Error saving plan: {e}", "ERROR")
         raise
+
+def save_plan_from_envelope(envelope: Dict[str, Any], user_id: str) -> Dict[str, Any]:
+    """Persist a normalized schedule envelope without losing extended fields."""
+    return save_plan(
+        date=envelope.get("date"),
+        activities=envelope.get("activities") or [],
+        user_id=user_id,
+        schedule_blocks=envelope.get("schedule_blocks") or [],
+        committed_schedule_blocks=envelope.get("committed_schedule_blocks") or [],
+        external_calendar_events=envelope.get("external_calendar_events") or [],
+        sync_links=envelope.get("sync_links") or [],
+        active_view=envelope.get("active_view") or "jplan",
+        has_unsaved_draft=bool(envelope.get("has_unsaved_draft", False)),
+        draft_dirty=bool(envelope.get("draft_dirty", False)),
+        explanations=envelope.get("explanations") or [],
+        unscheduled_activities=envelope.get("unscheduled_activities") or [],
+        version=int(envelope.get("version") or 1),
+        schedule_id=envelope.get("scheduleId"),
+        preferences=envelope.get("preferences") or {},
+        status=envelope.get("status", "ok"),
+        schedule_status=envelope.get("schedule_status"),
+        travel_validation_status=envelope.get("travel_validation_status") or "not_requested",
+        conflict=envelope.get("conflict"),
+        planning_mode=envelope.get("planning_mode", "feasibility_first"),
+        allow_clash=bool(envelope.get("allow_clash", False)),
+        accurate_travel_time=bool(envelope.get("accurate_travel_time", False)),
+        travel_intent=bool(envelope.get("travel_intent", False)),
+        schedule_constraints=envelope.get("schedule_constraints") or {},
+        conflicts=envelope.get("conflicts") or [],
+        warnings=envelope.get("warnings") or [],
+        location_resolution_requests=envelope.get("location_resolution_requests") or [],
+        route_conflicts=envelope.get("route_conflicts") or [],
+        pending_repair_suggestions=envelope.get("pending_repair_suggestions") or [],
+        unfit_activities=envelope.get("unfit_activities") or [],
+        optional_skipped=envelope.get("optional_skipped") or [],
+        blocked_activities=envelope.get("blocked_activities") or [],
+        route_repair_actions=envelope.get("route_repair_actions") or [],
+        route_efficiency=envelope.get("route_efficiency") or {},
+        route_total_before=envelope.get("route_total_before"),
+        route_total_after=envelope.get("route_total_after"),
+        route_minutes_saved=envelope.get("route_minutes_saved"),
+        location_revisits_count=envelope.get("location_revisits_count"),
+        same_location_split_penalty_before=envelope.get("same_location_split_penalty_before"),
+        same_location_split_penalty_after=envelope.get("same_location_split_penalty_after"),
+        revisit_penalty_before=envelope.get("revisit_penalty_before"),
+        revisit_penalty_after=envelope.get("revisit_penalty_after"),
+        start_route_summary=envelope.get("start_route_summary"),
+        preview_id=envelope.get("preview_id"),
+        preview_base_version=envelope.get("preview_base_version"),
+        preview_status=envelope.get("preview_status"),
+        preview_reason=envelope.get("preview_reason"),
+        preview_schedule=envelope.get("preview_schedule"),
+        failed_repair_attempt=envelope.get("failed_repair_attempt"),
+        needs_reschedule=bool(envelope.get("needs_reschedule", False)),
+        reschedule_reason=envelope.get("reschedule_reason"),
+        needs_travel_validation=bool(envelope.get("needs_travel_validation", False)),
+        last_rescheduled_at=envelope.get("last_rescheduled_at"),
+        unmet_items=envelope.get("unmet_items") or [],
+        validation_issues=envelope.get("validation_issues") or [],
+    )
 
 def get_user_locations(user_id: str) -> List[Dict[str, Any]]:
     """Fetch all saved locations for a specific user."""

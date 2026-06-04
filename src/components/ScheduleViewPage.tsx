@@ -4,9 +4,20 @@ import type { DailySchedule, ActivityBlock } from "../App";
 import { useAuth } from "../context/AuthContext";
 import { toast } from "sonner";
 import { useState } from "react";
-import { exportPlanToGoogle } from "../services/planService";
+import {
+  exportPlanToGoogle,
+  importCalendarEvents,
+  replacePlanFromCalendar,
+  type CalendarReplacePreview,
+} from "../services/planService";
 import { supabase } from "../lib/supabase";
 import { TimelineGrid } from "./TimelineGrid";
+import {
+  calendarEventKey,
+  getBlocksForView,
+  hasGoogleCalendarLayer,
+  type ScheduleViewMode,
+} from "../utils/scheduleDisplayUtils";
 
 type ScheduleViewPageProps = {
   schedule: DailySchedule;
@@ -31,7 +42,21 @@ export function ScheduleViewPage({
 }: ScheduleViewPageProps) {
   const { user, isGoogleLinked } = useAuth();
   const [isExporting, setIsExporting] = useState(false);
+  const [isCalendarActionBusy, setIsCalendarActionBusy] = useState(false);
   const [showConfirmDialog, setShowConfirmDialog] = useState(false);
+  const [replacePreview, setReplacePreview] = useState<CalendarReplacePreview | null>(null);
+  const [activeView, setActiveView] = useState<ScheduleViewMode>(
+    schedule.active_view === "google_calendar" && hasGoogleCalendarLayer(schedule) ? "google_calendar" : "jplan"
+  );
+  const [selectedGoogleEventIds, setSelectedGoogleEventIds] = useState<string[]>(() =>
+    (schedule.external_calendar_events || [])
+      .filter(event => !event.maybe_support_block)
+      .map(calendarEventKey)
+      .filter(Boolean)
+  );
+  const googleEvents = schedule.external_calendar_events || [];
+  const hasGoogleEvents = hasGoogleCalendarLayer(schedule);
+  const timelineBlocks = getBlocksForView(schedule, activeView);
 
   const handleExportToGoogle = async () => {
     if (!user) return;
@@ -87,9 +112,63 @@ export function ScheduleViewPage({
   const isPastDate = scheduleDate < today;
 
   const handleEventClick = (event: ActivityBlock) => {
+    if (activeView === "google_calendar") return;
     const bType = event.block_type || event.type;
     if (bType === "activity") {
       onModify();
+    }
+  };
+
+  const toggleGoogleEventSelection = (eventId: string) => {
+    setSelectedGoogleEventIds(prev =>
+      prev.includes(eventId) ? prev.filter(id => id !== eventId) : [...prev, eventId]
+    );
+  };
+
+  const handleImportSelected = async () => {
+    if (!user || selectedGoogleEventIds.length === 0) return;
+    setIsCalendarActionBusy(true);
+    try {
+      const result = await importCalendarEvents(schedule.date, user.id, selectedGoogleEventIds);
+      if (!result.success || !result.schedule) throw new Error(result.error || "Import failed");
+      onUpdateSchedule(result.schedule);
+      setActiveView("jplan");
+      toast.success("Imported selected Google Calendar events into JPlan.");
+    } catch (err: any) {
+      toast.error(err.message || "Failed to import Google Calendar events");
+    } finally {
+      setIsCalendarActionBusy(false);
+    }
+  };
+
+  const handleReplacePreview = async () => {
+    if (!user || selectedGoogleEventIds.length === 0) return;
+    setIsCalendarActionBusy(true);
+    try {
+      const result = await replacePlanFromCalendar(schedule.date, user.id, selectedGoogleEventIds, false);
+      if (!result.success || !result.preview) throw new Error(result.error || "Preview failed");
+      setReplacePreview(result.preview);
+    } catch (err: any) {
+      toast.error(err.message || "Failed to prepare replacement preview");
+    } finally {
+      setIsCalendarActionBusy(false);
+    }
+  };
+
+  const handleConfirmReplace = async () => {
+    if (!user || !replacePreview) return;
+    setIsCalendarActionBusy(true);
+    try {
+      const result = await replacePlanFromCalendar(schedule.date, user.id, selectedGoogleEventIds, true);
+      if (!result.success || !result.schedule) throw new Error(result.error || "Replace failed");
+      onUpdateSchedule(result.schedule);
+      setReplacePreview(null);
+      setActiveView("jplan");
+      toast.success("Replaced JPlan with selected Google Calendar events.");
+    } catch (err: any) {
+      toast.error(err.message || "Failed to replace JPlan");
+    } finally {
+      setIsCalendarActionBusy(false);
     }
   };
 
@@ -176,6 +255,84 @@ export function ScheduleViewPage({
           )}
         </div>
 
+        {hasGoogleEvents && (
+          <div className="mb-6 flex flex-wrap items-center gap-2">
+            <Button
+              variant={activeView === "jplan" ? "default" : "outline"}
+              size="sm"
+              onClick={() => setActiveView("jplan")}
+              className="rounded-xl"
+            >
+              JPlan
+            </Button>
+            <Button
+              variant={activeView === "google_calendar" ? "default" : "outline"}
+              size="sm"
+              onClick={() => setActiveView("google_calendar")}
+              className="rounded-xl"
+            >
+              Google Calendar
+            </Button>
+          </div>
+        )}
+
+        {activeView === "google_calendar" && (
+          <div className="mb-6 rounded-2xl border border-border bg-card p-4 shadow-sm">
+            <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <p className="text-sm font-medium">Google Calendar layer</p>
+                <p className="text-xs text-muted-foreground">Read-only until imported or replaced.</p>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleImportSelected}
+                  disabled={isCalendarActionBusy || selectedGoogleEventIds.length === 0}
+                  className="rounded-xl"
+                >
+                  Import Selected
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleReplacePreview}
+                  disabled={isCalendarActionBusy || selectedGoogleEventIds.length === 0}
+                  className="rounded-xl border-destructive/30 text-destructive hover:bg-destructive/5"
+                >
+                  Replace JPlan...
+                </Button>
+              </div>
+            </div>
+            <div className="grid gap-2">
+              {googleEvents.map(event => {
+                const key = calendarEventKey(event);
+                return (
+                  <label key={key} className="flex items-center gap-3 rounded-xl border border-border/60 px-3 py-2 text-sm">
+                    <input
+                      type="checkbox"
+                      checked={selectedGoogleEventIds.includes(key)}
+                      onChange={() => toggleGoogleEventSelection(key)}
+                      disabled={Boolean(event.maybe_support_block)}
+                    />
+                    <span className="flex-1">
+                      {event.title}
+                      <span className="ml-2 text-xs text-muted-foreground">
+                        {event.startTime || event.start} - {event.endTime || event.end}
+                      </span>
+                    </span>
+                    {event.maybe_support_block && (
+                      <span className="rounded-full bg-amber-100 px-2 py-0.5 text-xs text-amber-800">
+                        support-like
+                      </span>
+                    )}
+                  </label>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
         {/* Confirmation Dialog Overlay */}
         {showConfirmDialog && (
           <div style={{
@@ -230,8 +387,8 @@ export function ScheduleViewPage({
                 <p className="text-muted-foreground leading-relaxed mb-10 text-base px-2">
                   Ready to refresh your Google Calendar?
                   <br /><br />
-                  This will perform a <span className="font-extrabold" style={{ color: '#dc2626', fontWeight: 'bold' }}>Total Reset</span> for <span className="font-bold text-foreground" style={{ fontWeight: 'bold' }}>{schedule.date}</span>.
-                  All existing events in Google Calendar for this day will be replaced by your current JPlan schedule.
+                  JPlan will update linked calendar events for <span className="font-bold text-foreground" style={{ fontWeight: 'bold' }}>{schedule.date}</span> and create missing JPlan events.
+                  External Google Calendar events will not be deleted.
                 </p>
 
                 <div className="flex flex-col sm:flex-row gap-4 w-full">
@@ -251,7 +408,7 @@ export function ScheduleViewPage({
                     style={{ borderRadius: '16px' }}
                     className="flex-1 h-14 bg-primary hover:bg-primary/90 text-white shadow-xl shadow-primary/20 font-bold transition-all active:scale-95"
                   >
-                    Confirm & Sync
+                    Confirm & Push
                   </Button>
                 </div>
               </div>
@@ -259,15 +416,47 @@ export function ScheduleViewPage({
           </div>
         )}
 
+        {replacePreview && (
+          <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/60 p-6">
+            <div className="w-full max-w-lg rounded-2xl border border-border bg-card p-6 shadow-xl">
+              <h3 className="mb-2 text-xl font-semibold">Replace JPlan with Google Calendar?</h3>
+              <p className="mb-4 text-sm text-muted-foreground">
+                This will import {replacePreview.import_count} selected event{replacePreview.import_count === 1 ? "" : "s"},
+                replace {replacePreview.replace_count} JPlan activit{replacePreview.replace_count === 1 ? "y" : "ies"},
+                and clear {replacePreview.clear_support_count} timeline block{replacePreview.clear_support_count === 1 ? "" : "s"}.
+              </p>
+              <div className="mb-5 max-h-48 overflow-y-auto rounded-xl border border-border/60 p-3 text-sm">
+                {replacePreview.events_to_import.map(event => (
+                  <div key={calendarEventKey(event)} className="py-1">
+                    {event.title} <span className="text-muted-foreground">{event.startTime} - {event.endTime}</span>
+                  </div>
+                ))}
+              </div>
+              <div className="flex justify-end gap-3">
+                <Button variant="outline" className="rounded-xl" onClick={() => setReplacePreview(null)}>
+                  Cancel
+                </Button>
+                <Button
+                  className="rounded-xl"
+                  onClick={handleConfirmReplace}
+                  disabled={isCalendarActionBusy}
+                >
+                  Confirm Replace
+                </Button>
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* Timeline */}
         <TimelineGrid
-          activities={schedule.schedule_blocks || schedule.activities}
-          interactive={!isPastDate}
+          activities={timelineBlocks}
+          interactive={!isPastDate && activeView === "jplan"}
           onActivityClick={(act) => handleEventClick(act)}
-          showEditIcon={!isPastDate}
+          showEditIcon={!isPastDate && activeView === "jplan"}
         />
 
-        {schedule.activities.length === 0 && (
+        {timelineBlocks.length === 0 && (
           <div className="text-center py-12 bg-card rounded-2xl border border-dashed border-border">
             <p className="text-muted-foreground">
               No schedule has been created for this day.

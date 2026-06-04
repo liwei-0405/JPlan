@@ -5,6 +5,7 @@ import { Clock, MapPin, Sparkles, Calendar as CalendarIcon } from "lucide-react"
 import type { DailySchedule } from "../App";
 import { useState } from "react";
 import { TimelineGrid } from "./TimelineGrid";
+import { getBlocksForView } from "../utils/scheduleDisplayUtils";
 
 type EntryPageProps = {
   onStartPlanning: (date: Date) => void;
@@ -114,7 +115,7 @@ export function EntryPage({
               {hasSelectedPlan ? (
                 <div className="flex-1 overflow-y-auto pr-2 mb-4 -mr-2 custom-scrollbar">
                   <TimelineGrid
-                    activities={selectedSchedule.activities}
+                    activities={getBlocksForView(selectedSchedule, "jplan")}
                     compact={true}
                   />
                 </div>

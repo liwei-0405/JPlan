@@ -123,6 +123,11 @@ export async function savePlan(schedule: DailySchedule, userId: string): Promise
                 activities: schedule.activities,
                 schedule_blocks: schedule.schedule_blocks || [],
                 committed_schedule_blocks: schedule.committed_schedule_blocks || [],
+                external_calendar_events: schedule.external_calendar_events || [],
+                sync_links: schedule.sync_links || [],
+                active_view: schedule.active_view || "jplan",
+                has_unsaved_draft: Boolean(schedule.has_unsaved_draft),
+                draft_dirty: Boolean(schedule.draft_dirty),
                 explanations: schedule.explanations || [],
                 unscheduled_activities: schedule.unscheduled_activities || [],
                 user_id: userId,
@@ -448,6 +453,66 @@ export async function exportPlanToGoogle(date: string, userId: string): Promise<
             skippedCount: data.skipped_count,
         };
     } catch (err) {
+        return { success: false, error: 'Connection failed' };
+    }
+}
+
+export async function importCalendarEvents(
+    date: string,
+    userId: string,
+    eventIds: string[],
+): Promise<{ success: boolean; schedule?: DailySchedule; error?: string }> {
+    try {
+        const response = await fetch(`${API_BASE_URL}/api/plans/${date}/import-calendar`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ user_id: userId, event_ids: eventIds }),
+        });
+        if (!response.ok) {
+            const error = await response.json().catch(() => ({ detail: 'Import failed' }));
+            return { success: false, error: error.detail || 'Import failed' };
+        }
+        return { success: true, schedule: await response.json() };
+    } catch {
+        return { success: false, error: 'Connection failed' };
+    }
+}
+
+export type CalendarReplacePreview = {
+    date?: string;
+    events_to_import: ActivityBlock[];
+    jplan_activities_to_replace: ActivityBlock[];
+    support_blocks_to_clear: ActivityBlock[];
+    import_count: number;
+    replace_count: number;
+    clear_support_count: number;
+    requires_confirmation: boolean;
+};
+
+export async function replacePlanFromCalendar(
+    date: string,
+    userId: string,
+    eventIds: string[],
+    confirm: boolean = false,
+): Promise<{ success: boolean; preview?: CalendarReplacePreview; schedule?: DailySchedule; applied?: boolean; error?: string }> {
+    try {
+        const response = await fetch(`${API_BASE_URL}/api/plans/${date}/replace-from-calendar`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ user_id: userId, event_ids: eventIds, confirm }),
+        });
+        if (!response.ok) {
+            const error = await response.json().catch(() => ({ detail: 'Replace failed' }));
+            return { success: false, error: error.detail || 'Replace failed' };
+        }
+        const data = await response.json();
+        return {
+            success: true,
+            preview: data.preview,
+            schedule: data.schedule,
+            applied: Boolean(data.applied),
+        };
+    } catch {
         return { success: false, error: 'Connection failed' };
     }
 }

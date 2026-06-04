@@ -245,6 +245,8 @@ class StateOperationsMixin:
         message = clean_title(operation.get("_user_message") or operation.get("_source_text") or "")
         if re.search(r"\b(?:another|new|second|additional)\b", message):
             return True
+        if re.search(r"\b(?:add|create|schedule|plan|book|put\s+in|set\s+up)\b", message):
+            return True
         return False
 
     def _message_mentions_duration(self, message: str) -> bool:

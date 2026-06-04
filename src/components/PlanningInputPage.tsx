@@ -57,7 +57,24 @@ import {
   type PlanningLocation,
   type RecentLocation,
 } from "../utils/planningPreferences";
+import {
+  getBlocksForView,
+  hasGoogleCalendarLayer,
+  type ScheduleViewMode,
+} from "../utils/scheduleDisplayUtils";
 
+const CHAT_INPUT_MAX_LENGTH = 500;
+
+function isSchedulableEventBlock(block?: Partial<ActivityBlock> | null): boolean {
+  if (!block) return false;
+  const kind = String(block.block_type || block.type || "").toLowerCase();
+  const title = String(block.title || "").trim().toLowerCase();
+  if (kind && !["activity", "event", "task"].includes(kind)) return false;
+  if (title.startsWith("travel to") || title.includes("free time") || title.includes("buffer") || title.includes("prep")) {
+    return false;
+  }
+  return Boolean(title);
+}
 
 type PlanningInputPageProps = {
   onScheduleGenerated: (schedule: DailySchedule) => void;
@@ -89,6 +106,23 @@ type LocationResolutionRequest = {
     to_location?: string;
   }>;
 };
+
+function locationRequestStillApplies(request: LocationResolutionRequest, items: Partial<ActivityBlock>[]): boolean {
+  const schedulableItems = items.filter(isSchedulableEventBlock);
+  if (request.request_type === "start_location") return schedulableItems.length > 0;
+
+  const requestId = String(request.activity_id || "");
+  const relatedIds = (request.related_activity_ids || []).map(String).filter(Boolean);
+  const requestTitle = String(request.title || "").trim().toLowerCase();
+
+  return schedulableItems.some((item) => {
+    const itemId = String(item.stable_activity_id || item.id || "");
+    const itemTitle = String(item.title || "").trim().toLowerCase();
+    if (requestId && itemId && requestId === itemId) return true;
+    if (itemId && relatedIds.includes(itemId)) return true;
+    return Boolean(requestTitle && itemTitle && requestTitle === itemTitle);
+  });
+}
 
 type ResolvedLocationSnapshot = NonNullable<ActivityBlock["resolved_location"]>;
 
@@ -206,6 +240,7 @@ export function PlanningInputPage({
     date: isoDateStr,
     activities: []
   });
+  const [calendarView, setCalendarView] = useState<ScheduleViewMode>("jplan");
   const [allowClash, setAllowClash] = useState<boolean>(Boolean(initialSchedule?.allow_clash));
   const [accurateTravelTime, setAccurateTravelTime] = useState<boolean>(isAccurateTravelEnabled(initialSchedule));
   const [locationInputs, setLocationInputs] = useState<Record<string, string>>({});
@@ -273,6 +308,7 @@ export function PlanningInputPage({
     const scheduleWithPrefs = materializeAutoRoutePreview(withPlanningPreferences(schedule));
     const nextAccurateTravelTime = isAccurateTravelEnabled(scheduleWithPrefs);
     setAccurateTravelTime(nextAccurateTravelTime);
+    setCalendarView("jplan");
     setPreviewSchedule({
       ...scheduleWithPrefs,
       allow_clash: allowClash,
@@ -479,6 +515,9 @@ export function PlanningInputPage({
       needs_reschedule: true,
       reschedule_reason: reason,
       needs_travel_validation: accurateTravelTime ? true : Boolean(baseDraft.needs_travel_validation),
+      has_unsaved_draft: true,
+      draft_dirty: true,
+      active_view: "jplan",
     };
   };
 
@@ -672,6 +711,7 @@ export function PlanningInputPage({
   };
 
   const handleEventClick = (event: ActivityBlock) => {
+    if (calendarView === "google_calendar") return;
     if (isScheduleBusy) return;
     setEditingEvent(event);
   };
@@ -739,6 +779,11 @@ export function PlanningInputPage({
         ? baseDraft.activities.map(a => a.id === updatedEvent.id ? normalizedEvent : a)
         : [...baseDraft.activities, normalizedEvent]
     ).sort((a, b) => timeToMinutes(a.startTime) - timeToMinutes(b.startTime));
+    const updatedScheduleBlocks = syncActivityBlocks(baseDraft.schedule_blocks, updatedActivities);
+    const remainingLocationRequests = locationChanged
+      ? ((baseDraft.location_resolution_requests || []) as LocationResolutionRequest[])
+        .filter(request => !locationRequestResolvedByEvent(request, normalizedEvent))
+      : ((baseDraft.location_resolution_requests || []) as LocationResolutionRequest[]);
 
     const reason = timeChanged ? "time_changed" : (locationChanged ? "location_changed" : "manual_edit");
     if (locationChanged) {
@@ -749,9 +794,16 @@ export function PlanningInputPage({
     setPreviewSchedule(markDirtySchedule({
       ...baseDraft,
       activities: updatedActivities,
-      schedule_blocks: syncActivityBlocks(baseDraft.schedule_blocks, updatedActivities),
+      schedule_blocks: updatedScheduleBlocks,
+      location_resolution_requests: remainingLocationRequests,
       travel_validation_status: baseDraft.travel_validation_status,
     }, reason, normalizedEvent.title));
+    if (locationChanged) {
+      syncLocationConfirmationMessage(remainingLocationRequests, [
+        ...updatedActivities,
+        ...(updatedScheduleBlocks || []),
+      ]);
+    }
     setSaveWithoutRerunNotice(false);
     setEditingEvent(null);
     setIsConflict(false);
@@ -761,13 +813,37 @@ export function PlanningInputPage({
     if (isScheduleBusy) return;
     if (!editingEvent || !previewSchedule) return;
     const baseDraft = clearRouteRepairPreview(previewSchedule);
-    const updatedActivities = baseDraft.activities.filter(a => a.id !== editingEvent.id);
-    setPreviewSchedule(markDirtySchedule({
+    const deleteKeys = activityDeleteKeys(editingEvent);
+    const updatedActivities = baseDraft.activities.filter(activity => !blockMatchesDeletedActivity(activity, deleteKeys));
+    const updatedScheduleBlocks = removeDeletedActivityBlock(baseDraft.schedule_blocks, deleteKeys);
+    const remainingItems = [...updatedActivities, ...updatedScheduleBlocks];
+    const remainingLocationRequests = ((baseDraft.location_resolution_requests || []) as LocationResolutionRequest[])
+      .filter(request => locationRequestStillApplies(request, remainingItems));
+    const hasRemainingSchedulableItems = remainingItems.some(isSchedulableEventBlock);
+    const nextSchedule = {
       ...baseDraft,
       activities: updatedActivities,
-      schedule_blocks: removeDeletedActivityBlock(baseDraft.schedule_blocks, editingEvent.id),
+      schedule_blocks: updatedScheduleBlocks,
+      location_resolution_requests: remainingLocationRequests,
       travel_validation_status: previewSchedule.travel_validation_status,
-    }, "event_deleted", editingEvent.title));
+    };
+    setPreviewSchedule(hasRemainingSchedulableItems
+      ? markDirtySchedule(nextSchedule, "event_deleted", editingEvent.title)
+      : {
+        ...nextSchedule,
+        location_resolution_requests: [],
+        pending_repair_suggestions: [],
+        route_conflicts: [],
+        unfit_activities: [],
+        blocked_activities: [],
+        needs_travel_validation: false,
+        travel_validation_status: "not_requested",
+        needs_reschedule: false,
+        reschedule_reason: null,
+        draft_dirty: false,
+        has_unsaved_draft: false,
+      });
+    syncLocationConfirmationMessage(remainingLocationRequests, remainingItems);
     setSaveWithoutRerunNotice(false);
     setEditingEvent(null);
   };
@@ -840,7 +916,20 @@ export function PlanningInputPage({
   const hasPendingRoutePreview = hasRouteRepairPreview(previewSchedule);
   const activeDisplaySchedule = previewSchedule ? displayScheduleForTimeline(previewSchedule) : null;
   const isDirtySchedule = Boolean(previewSchedule?.needs_reschedule);
+  const hasSchedulableItems = Boolean(
+    (previewSchedule?.activities || []).some(isSchedulableEventBlock)
+    || (previewSchedule?.schedule_blocks || []).some(isSchedulableEventBlock)
+  );
   const pendingLocationRequests = (previewSchedule?.location_resolution_requests || []) as LocationResolutionRequest[];
+  const currentLocationRequestItems = [
+    ...(previewSchedule?.activities || []),
+    ...(previewSchedule?.schedule_blocks || []),
+  ];
+  const visiblePendingLocationRequests = accurateTravelTime
+    ? pendingLocationRequests.filter(request => locationRequestStillApplies(request, currentLocationRequestItems))
+    : [];
+  const hasVisiblePendingLocationRequests = visiblePendingLocationRequests.length > 0;
+  const showDirtyRerunState = isDirtySchedule && hasSchedulableItems;
   const pendingRepairSuggestions = (activeDisplaySchedule?.pending_repair_suggestions || previewSchedule?.pending_repair_suggestions || []) as RepairSuggestion[];
   const routeUnfitActivities = (activeDisplaySchedule?.unfit_activities || previewSchedule?.unfit_activities || []) as Array<Record<string, unknown>>;
   const routeBlockedActivities = (activeDisplaySchedule?.blocked_activities || previewSchedule?.blocked_activities || []) as Array<Record<string, unknown>>;
@@ -848,9 +937,12 @@ export function PlanningInputPage({
     .filter(conflict => String(conflict.reason_code || "") === "fixed_to_fixed_infeasible");
   const travelValidationStatus = String(previewSchedule?.travel_validation_status || previewSchedule?.preview_status || "");
   const isPartialFixedRouteConflict = travelValidationStatus === "partial_feasible_with_fixed_route_conflicts";
-  const isLocationPending = Boolean(
-    !isDirtySchedule
-    && !isPartialFixedRouteConflict
+  const showCompleteTravelValidationButton = Boolean(
+    accurateTravelTime
+    && hasSchedulableItems
+    && !hasVisiblePendingLocationRequests
+    &&
+    !isPartialFixedRouteConflict
     && (
       previewSchedule?.schedule_status === "location_pending"
       || previewSchedule?.status === "location_pending"
@@ -858,6 +950,7 @@ export function PlanningInputPage({
       || previewSchedule?.needs_travel_validation
     )
   );
+  const showRunSchedulerButton = showDirtyRerunState;
   const repairSuggestionHasChange = (suggestion: RepairSuggestion) => {
     if (suggestion.would_change === false) return false;
     const sameStart = String(suggestion.from || "") === String(suggestion.to || "");
@@ -892,6 +985,19 @@ export function PlanningInputPage({
       return false;
     }
     return normalizeLocationTarget(item.title) === normalizeLocationTarget(request.title);
+  };
+
+  const locationRequestResolvedByEvent = (request: LocationResolutionRequest, event: Partial<ActivityBlock>) => {
+    if (request.request_type === "start_location") return false;
+    if (!event.resolved_location && event.location_status !== "resolved" && event.location_resolution_status !== "resolved") return false;
+    if (matchesLocationRequest(event, request)) return true;
+    const eventTitle = normalizeLocationTarget(event.title);
+    if (!eventTitle) return false;
+    const requestTitles = [
+      request.title,
+      ...(request.related_titles || []),
+    ].map(normalizeLocationTarget).filter(Boolean);
+    return requestTitles.includes(eventTitle);
   };
 
   const remainingLocationRequestsAfterConfirm = (
@@ -943,6 +1049,43 @@ export function PlanningInputPage({
       }
       return [...next, entry];
     });
+  };
+
+  const removeLocationConfirmationMessage = () => {
+    setConversationHistory(prev => prev.filter(item => !(
+      item.role === "assistant" &&
+      (
+        item.message.startsWith("Locations confirmed:") ||
+        item.message.startsWith("All locations confirmed.")
+      )
+    )));
+  };
+
+  const syncLocationConfirmationMessage = (
+    remainingRequests: LocationResolutionRequest[],
+    currentItems: Partial<ActivityBlock>[],
+  ) => {
+    const validRemainingRequests = remainingRequests.filter(request => locationRequestStillApplies(request, currentItems));
+    if (validRemainingRequests.length > 0) {
+      if (locationConfirmationTitlesRef.current.length > 0) {
+        upsertLocationConfirmationMessage(
+          `Locations confirmed: ${shortTitleList(locationConfirmationTitlesRef.current)}. ${validRemainingRequests.length} left.`,
+          "location_pending",
+        );
+      }
+      return validRemainingRequests;
+    }
+
+    if (currentItems.some(isSchedulableEventBlock) && locationConfirmationTitlesRef.current.length > 0) {
+      upsertLocationConfirmationMessage(
+        "All locations confirmed. Complete travel validation when ready.",
+        "success",
+      );
+    } else {
+      removeLocationConfirmationMessage();
+    }
+    locationConfirmationTitlesRef.current = [];
+    return validRemainingRequests;
   };
 
   const travelValidationMessage = (schedule: DailySchedule) => {
@@ -1227,18 +1370,10 @@ export function PlanningInputPage({
         ...locationConfirmationTitlesRef.current,
         request.title,
       ].filter(Boolean)));
-      if (remainingRequests.length > 0) {
-        upsertLocationConfirmationMessage(
-          `Locations confirmed: ${shortTitleList(locationConfirmationTitlesRef.current)}. ${remainingRequests.length} left.`,
-          "location_pending",
-        );
-      } else {
-        upsertLocationConfirmationMessage(
-          "All locations confirmed. Complete travel validation when ready.",
-          "success",
-        );
-        locationConfirmationTitlesRef.current = [];
-      }
+      syncLocationConfirmationMessage(remainingRequests, [
+        ...(previewSchedule?.activities || []),
+        ...(previewSchedule?.schedule_blocks || []),
+      ]);
     } catch (error) {
       setConversationHistory(prev => [...prev, {
         role: "assistant",
@@ -1311,8 +1446,9 @@ export function PlanningInputPage({
           accurate_travel_time: true,
         },
       }, user.id, source);
-      applyReturnedSchedule(validated);
-      const reply = travelValidationMessage(validated);
+      const completed = normalizeCompletedTravelValidation(validated);
+      applyReturnedSchedule(completed);
+      const reply = travelValidationMessage(completed);
       setConversationHistory(prev => [...prev, {
         role: "assistant",
         message: reply.message,
@@ -1440,6 +1576,20 @@ export function PlanningInputPage({
     };
   };
 
+  const normalizeCompletedTravelValidation = (schedule: DailySchedule): DailySchedule => {
+    const status = String(schedule.travel_validation_status || schedule.status || "");
+    const hasPendingLocations = Boolean((schedule.location_resolution_requests || []).length);
+    if (!["validated", "repaired_validated"].includes(status) || hasPendingLocations) return schedule;
+    return {
+      ...schedule,
+      needs_reschedule: false,
+      reschedule_reason: null,
+      needs_travel_validation: false,
+      draft_dirty: false,
+      has_unsaved_draft: false,
+    };
+  };
+
   const handleCompleteTravelValidation = async () => {
     if (isScheduleBusy) return;
     await runTravelValidation("manual");
@@ -1448,11 +1598,7 @@ export function PlanningInputPage({
   const handleRunScheduler = async () => {
     if (isScheduleBusy) return;
     if (!previewSchedule || !user?.id) return;
-    const shouldRunAccurateTravel = Boolean(
-      accurateTravelTime
-      || isAccurateTravelEnabled(previewSchedule)
-      || previewSchedule.needs_travel_validation
-    );
+    const shouldRunAccurateTravel = Boolean(accurateTravelTime);
     setIsRunningScheduler(true);
     setIsProcessing(true);
     setProgressSteps([
@@ -1470,8 +1616,11 @@ export function PlanningInputPage({
         preferences: {
           ...(scheduleWithPrefs.preferences || {}),
           accurate_travel_time: shouldRunAccurateTravel,
-          travel_intent: shouldRunAccurateTravel || Boolean(scheduleWithPrefs.preferences?.travel_intent || scheduleWithPrefs.travel_intent),
+          travel_intent: shouldRunAccurateTravel,
         },
+        travel_intent: shouldRunAccurateTravel,
+        needs_travel_validation: shouldRunAccurateTravel ? scheduleWithPrefs.needs_travel_validation : false,
+        location_resolution_requests: shouldRunAccurateTravel ? scheduleWithPrefs.location_resolution_requests : [],
       }, user.id);
       applyReturnedSchedule(replanned);
       setSaveWithoutRerunNotice(false);
@@ -1529,7 +1678,23 @@ export function PlanningInputPage({
     if (isScheduleBusy) return;
     if (!checked) {
       setAccurateTravelTime(false);
-      setPreviewSchedule(prev => prev ? clearRouteRepairPreview(prev) : prev);
+      setPreviewSchedule(prev => {
+        if (!prev) return prev;
+        const next = clearRouteRepairPreview(prev);
+        return {
+          ...next,
+          accurate_travel_time: false,
+          travel_intent: false,
+          needs_travel_validation: false,
+          travel_validation_status: "not_requested",
+          location_resolution_requests: [],
+          preferences: {
+            ...(next.preferences || {}),
+            accurate_travel_time: false,
+            travel_intent: false,
+          },
+        };
+      });
       return;
     }
     setAccurateTravelTime(true);
@@ -1692,7 +1857,8 @@ export function PlanningInputPage({
     setIsEditingPlanSettings(false);
   };
 
-  const timelineActivities = activeDisplaySchedule ? withDisplayOnlyStartRouteRow(activeDisplaySchedule) : [];
+  const hasGoogleEvents = hasGoogleCalendarLayer(activeDisplaySchedule);
+  const timelineActivities = activeDisplaySchedule ? withDisplayOnlyStartRouteRow(activeDisplaySchedule, calendarView) : [];
 
   return (
     <div className="min-h-screen bg-gradient-to-b from-background to-secondary/10">
@@ -1735,17 +1901,17 @@ export function PlanningInputPage({
           </div>
         )}
 
-        <div className="grid gap-6 lg:grid-cols-2 items-stretch">
+        <div className="grid min-h-0 gap-6 lg:grid-cols-2 items-start">
           {/* Left: Live Schedule Preview */}
           <div
-            className="flex flex-col overflow-hidden rounded-2xl border border-border bg-card shadow-sm"
-            style={{ height: "550px" }}
+            className="flex min-h-0 flex-col overflow-hidden rounded-2xl border border-border bg-card shadow-sm"
+            style={{ height: "550px", maxHeight: "550px" }}
           >
             <div className="p-5 border-b bg-secondary/10 flex justify-between items-start gap-4">
               <div className="min-w-0 flex-1">
                 <div className="flex flex-wrap items-center gap-2">
                   <h3 className="text-lg font-bold">Live Schedule</h3>
-                  {isDirtySchedule && (
+                  {showDirtyRerunState && (
                     <span className="inline-flex items-center gap-1 rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[11px] font-medium text-amber-800">
                       <AlertTriangle className="h-3 w-3" />
                       Not re-optimized
@@ -1754,7 +1920,7 @@ export function PlanningInputPage({
                 </div>
                 <p className="text-xs text-muted-foreground">
                   {previewSchedule?.date || "No activities yet"}
-                  {saveWithoutRerunNotice ? " · Saved, but not re-optimized" : ""}
+                  {saveWithoutRerunNotice && showDirtyRerunState ? " · Saved, but not re-optimized" : ""}
                 </p>
                 <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
                   <span className="inline-flex items-center gap-1 text-muted-foreground">
@@ -1826,7 +1992,7 @@ export function PlanningInputPage({
                 </div>
               </div>
               <div className="flex shrink-0 flex-col items-end gap-2">
-                {isDirtySchedule && (
+                {showRunSchedulerButton && (
                   <Button
                     type="button"
                     size="sm"
@@ -1837,6 +2003,30 @@ export function PlanningInputPage({
                     {isRunningScheduler ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
                     Run scheduler
                   </Button>
+                )}
+                {hasGoogleEvents && (
+                  <div className="flex rounded-xl border border-border bg-background p-0.5">
+                    <Button
+                      type="button"
+                      variant={calendarView === "jplan" ? "default" : "ghost"}
+                      size="sm"
+                      className="h-7 rounded-lg px-2 text-xs"
+                      onClick={() => setCalendarView("jplan")}
+                      disabled={isScheduleBusy}
+                    >
+                      JPlan
+                    </Button>
+                    <Button
+                      type="button"
+                      variant={calendarView === "google_calendar" ? "default" : "ghost"}
+                      size="sm"
+                      className="h-7 rounded-lg px-2 text-xs"
+                      onClick={() => setCalendarView("google_calendar")}
+                      disabled={isScheduleBusy}
+                    >
+                      Google
+                    </Button>
+                  </div>
                 )}
                 <Button
                   variant="outline"
@@ -1849,13 +2039,13 @@ export function PlanningInputPage({
               </div>
             </div>
 
-            <div className="flex-1 overflow-y-auto p-6 bg-secondary/5">
-              {previewSchedule && (previewSchedule.schedule_blocks?.length || previewSchedule.activities.length > 0) ? (
+            <div className="min-h-0 flex-1 overflow-y-auto p-6 bg-secondary/5">
+              {previewSchedule && timelineActivities.length > 0 ? (
                 <TimelineGrid
                   activities={timelineActivities}
-                  interactive={!hasPendingRoutePreview && !isScheduleBusy}
+                  interactive={calendarView === "jplan" && !hasPendingRoutePreview && !isScheduleBusy}
                   onActivityClick={handleEventClick}
-                  showEditIcon={!hasPendingRoutePreview && !isScheduleBusy}
+                  showEditIcon={calendarView === "jplan" && !hasPendingRoutePreview && !isScheduleBusy}
                 />
               ) : (
                 <div className="h-full flex flex-col items-center justify-center text-muted-foreground opacity-30 italic">
@@ -1868,8 +2058,8 @@ export function PlanningInputPage({
 
           {/* RIGHT: Control Panel (5 Columns) */}
           <div
-            className="flex min-h-0 flex-col gap-3 overflow-hidden"
-            style={{ height: "550px" }}
+            className="grid min-h-0 gap-3 overflow-hidden"
+            style={{ height: "550px", maxHeight: "550px", gridTemplateRows: "auto minmax(0, 1fr)" }}
           >
 
             {/* Mode Switcher */}
@@ -1912,11 +2102,11 @@ export function PlanningInputPage({
             </div>
 
             {/* Dynamic Content Area */}
-            <div className="min-h-0 flex-1 bg-card rounded-2xl border border-border shadow-sm flex flex-col overflow-hidden">
+            <div className="min-h-0 overflow-hidden rounded-2xl border border-border bg-card shadow-sm" style={{ minHeight: 0 }}>
               {activeMode === "assistant" ? (
                 /* Assistant UI */
-                <>
-                  <div className="flex-1 overflow-y-auto p-4 space-y-4">
+                <div className="grid h-full min-h-0 overflow-hidden" style={{ gridTemplateRows: "minmax(0, 1fr) auto" }}>
+                  <div className="min-h-0 overflow-y-auto p-4 space-y-4" style={{ minHeight: 0 }}>
                     {conversationHistory.map((msg, i) => (
                       <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                         <div className={`max-w-[85%] p-3 rounded-2xl text-sm ${msg.role === 'user' ? 'bg-primary text-primary-foreground' : msg.status === 'conflict' ? 'bg-destructive/10 text-destructive border border-destructive/20' : msg.status === 'partial' || msg.status === 'warning' || msg.status === 'location_pending' || msg.status === 'clarification_needed' || msg.status === 'not_applied' ? 'bg-yellow-50 text-yellow-900 border border-yellow-200' : 'bg-secondary'
@@ -2048,9 +2238,9 @@ export function PlanningInputPage({
                         </div>
                       </div>
                     )}
-                    {pendingLocationRequests.length > 0 && (
+                    {visiblePendingLocationRequests.length > 0 && (
                       <div className="space-y-3">
-                        {pendingLocationRequests.map((request) => {
+                        {visiblePendingLocationRequests.map((request) => {
                           return (
                             <div key={request.activity_id} className="rounded-2xl border border-yellow-200 bg-yellow-50 p-3 text-sm text-yellow-950">
                               <div className="flex items-start gap-2">
@@ -2080,19 +2270,19 @@ export function PlanningInputPage({
                         <Button
                           variant="default"
                           className="w-full rounded-xl"
-                          disabled={isScheduleBusy || pendingLocationRequests.length > 0}
+                          disabled={isScheduleBusy || visiblePendingLocationRequests.length > 0}
                           onClick={handleCompleteTravelValidation}
                         >
                           Complete travel validation
                         </Button>
-                        {pendingLocationRequests.length > 0 && (
+                        {visiblePendingLocationRequests.length > 0 && (
                           <p className="text-xs text-muted-foreground">
                             Confirm all pending locations first, then complete accurate travel validation.
                           </p>
                         )}
                       </div>
                     )}
-                    {isLocationPending && pendingLocationRequests.length === 0 && (
+                    {showCompleteTravelValidationButton && (
                       <Button
                         variant="default"
                         className="w-full rounded-xl"
@@ -2127,28 +2317,33 @@ export function PlanningInputPage({
                     )}
                     <div ref={chatEndRef} />
                   </div>
-                  <div className="p-4 border-t bg-secondary/5">
-                    <div className="mb-3 flex flex-wrap items-center gap-2">
-                      <CompactPlanningToggle
-                        label="Accurate travel"
-                        checked={accurateTravelTime}
-                        disabled={isScheduleBusy}
-                        onCheckedChange={handleAccurateTravelToggle}
-                        tooltip={accurateTravelTime
-                          ? "Uses exact locations and route validation before finalizing travel blocks."
-                          : "Uses fast heuristic travel estimates until accurate travel is enabled."}
-                        ariaLabel="Accurate travel time"
-                      />
-                      <CompactPlanningToggle
-                        label="Allow clash"
-                        checked={allowClash}
-                        disabled={isScheduleBusy}
-                        onCheckedChange={setAllowClash}
-                        tooltip={allowClash
-                          ? "Keeps user-requested overlaps and marks them clearly instead of blocking the draft."
-                          : "Only feasible schedules will be committed unless you allow clashes."}
-                        ariaLabel="Allow conflicting schedules"
-                      />
+                  <div className="shrink-0 border-t bg-secondary/5 p-4">
+                    <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <CompactPlanningToggle
+                          label="Accurate travel"
+                          checked={accurateTravelTime}
+                          disabled={isScheduleBusy}
+                          onCheckedChange={handleAccurateTravelToggle}
+                          tooltip={accurateTravelTime
+                            ? "Uses exact locations and route validation before finalizing travel blocks."
+                            : "Uses fast heuristic travel estimates until accurate travel is enabled."}
+                          ariaLabel="Accurate travel time"
+                        />
+                        <CompactPlanningToggle
+                          label="Allow clash"
+                          checked={allowClash}
+                          disabled={isScheduleBusy}
+                          onCheckedChange={setAllowClash}
+                          tooltip={allowClash
+                            ? "Keeps user-requested overlaps and marks them clearly instead of blocking the draft."
+                            : "Only feasible schedules will be committed unless you allow clashes."}
+                          ariaLabel="Allow conflicting schedules"
+                        />
+                      </div>
+                      <span className="text-[11px] text-muted-foreground">
+                        {chatInput.length}/{CHAT_INPUT_MAX_LENGTH}
+                      </span>
                     </div>
                     <div className="flex gap-2 items-end">
                       <Button
@@ -2160,14 +2355,17 @@ export function PlanningInputPage({
                       >
                         <Mic size={20} className={isRecording ? "text-white" : "text-muted-foreground"} />
                       </Button>
-                      <Textarea
-                        value={chatInput}
-                        onChange={(e) => setChatInput(e.target.value)}
-                        placeholder={isRecording ? "Listening..." : "e.g. Move lunch to 1pm..."}
-                        className="min-h-[80px] rounded-xl resize-none"
-                        disabled={isScheduleBusy}
-                        onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSendMessage(); } }}
-                      />
+                      <div className="min-w-0 flex-1">
+                        <Textarea
+                          value={chatInput}
+                          onChange={(e) => setChatInput(e.target.value)}
+                          maxLength={CHAT_INPUT_MAX_LENGTH}
+                          placeholder={isRecording ? "Listening..." : "e.g. Move lunch to 1pm..."}
+                          className="min-h-[80px] rounded-xl resize-none"
+                          disabled={isScheduleBusy}
+                          onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSendMessage(); } }}
+                        />
+                      </div>
                       <Button
                         id="chat-send-button"
                         onClick={handleSendMessage}
@@ -2178,10 +2376,10 @@ export function PlanningInputPage({
                       </Button>
                     </div>
                   </div>
-                </>
+                </div>
               ) : (
                 /* Manual Planning UI */
-                <div className={`flex-1 overflow-y-auto p-6 space-y-4 transition-colors ${isConflict ? "bg-destructive/5" : ""}`}>
+                <div className={`h-full min-h-0 overflow-y-auto p-6 space-y-4 transition-colors ${isConflict ? "bg-destructive/5" : ""}`} style={{ minHeight: 0 }}>
                   <h3 className={`font-bold mb-2 flex items-center justify-between ${isConflict ? "text-destructive" : ""}`}>
                     {isConflict ? "Conflict Detected!" : "Add Activity Manually"}
                   </h3>
@@ -2344,11 +2542,11 @@ export function PlanningInputPage({
               ) : (
                 <>
                   <CheckCircle className="mr-2 h-5 w-5" />
-                  {isPartialFixedRouteConflict ? "Save Partial Plan" : (isDirtySchedule ? "Save without rerun" : "Save & Implement Plan")}
+                  {isPartialFixedRouteConflict ? "Save Partial Plan" : (showDirtyRerunState ? "Save without rerun" : "Save & Implement Plan")}
                 </>
               )}
             </Button>
-            {isDirtySchedule && (
+            {showDirtyRerunState && (
               <p className="text-center text-xs text-muted-foreground">
                 Saving now keeps the badge: Saved, but not re-optimized.
               </p>
@@ -2550,8 +2748,9 @@ function calculateEndTime(startTime: string, durationStr: string): string {
   return formatTo12Hour(`${h}:${m}`);
 }
 
-function withDisplayOnlyStartRouteRow(schedule: DailySchedule): ActivityBlock[] {
-  const baseBlocks = [...(schedule.schedule_blocks || schedule.activities || [])];
+function withDisplayOnlyStartRouteRow(schedule: DailySchedule, activeView: ScheduleViewMode = "jplan"): ActivityBlock[] {
+  const baseBlocks = getBlocksForView(schedule, activeView, { preferDraft: true });
+  if (activeView === "google_calendar") return baseBlocks;
   const blocksWithRouteWarnings = withDisplayOnlyFixedRouteConflictRows(baseBlocks, schedule);
   const summary = (schedule.start_route_summary || {}) as Record<string, unknown>;
   const hasUnresolvedStartRouteConflict = (schedule.route_conflicts || []).some((conflict) => {
@@ -2578,6 +2777,14 @@ function withDisplayOnlyStartRouteRow(schedule: DailySchedule): ActivityBlock[] 
   const leaveBy = String(summary.leave_by || "").trim();
   const duration = Number(summary.travel_duration_minutes || 0);
   if (!startLocation || !destinationLocation || !leaveBy || !duration) {
+    return blocksWithRouteWarnings;
+  }
+  const invalidStartRouteTargets = [
+    ...(schedule.unfit_activities || []),
+    ...(schedule.unscheduled_activities || []),
+  ].map(item => String(item.title || item.activity_title || item.name || "").trim().toLowerCase()).filter(Boolean);
+  const firstEventKey = firstEvent.toLowerCase();
+  if (firstEventKey && invalidStartRouteTargets.includes(firstEventKey)) {
     return blocksWithRouteWarnings;
   }
 
@@ -2704,10 +2911,10 @@ function syncActivityBlocks(
 
 function removeDeletedActivityBlock(
   existingBlocks: ActivityBlock[] | undefined,
-  deletedId: string,
+  deleteKeys: Set<string>,
 ): ActivityBlock[] | undefined {
   if (!existingBlocks) return existingBlocks;
-  const deletedIndex = existingBlocks.findIndex((block) => blockMatchesDeletedActivity(block, deletedId));
+  const deletedIndex = existingBlocks.findIndex((block) => blockMatchesDeletedActivity(block, deleteKeys));
   const fallbackSupportIndexes = new Set<number>();
 
   if (deletedIndex >= 0) {
@@ -2724,16 +2931,32 @@ function removeDeletedActivityBlock(
   }
 
   return existingBlocks.filter((block, index) => {
-    if (blockMatchesDeletedActivity(block, deletedId)) return false;
+    if (blockMatchesDeletedActivity(block, deleteKeys)) return false;
     if (isDisplayOnlyStartRouteBlock(block)) return true;
-    if (isSupportLinkedToDeletedActivity(block, deletedId)) return false;
+    if (isSupportLinkedToDeletedActivity(block, deleteKeys)) return false;
     if (fallbackSupportIndexes.has(index)) return false;
     return true;
   });
 }
 
-function blockMatchesDeletedActivity(block: ActivityBlock, deletedId: string): boolean {
-  return String(block.id || "") === deletedId || String(block.stable_activity_id || "") === deletedId;
+function activityDeleteKeys(block: Partial<ActivityBlock>): Set<string> {
+  const keys = [
+    block.id,
+    block.stable_activity_id,
+    block.activity_id,
+    block.related_activity_id,
+  ].map((value) => String(value || "").trim()).filter(Boolean);
+  const title = String(block.title || "").trim().toLowerCase();
+  if (title) keys.push(`title:${title}`);
+  return new Set(keys);
+}
+
+function blockMatchesDeletedActivity(block: Partial<ActivityBlock>, deleteKeys: Set<string>): boolean {
+  const blockKeys = activityDeleteKeys(block);
+  for (const key of blockKeys) {
+    if (deleteKeys.has(key)) return true;
+  }
+  return false;
 }
 
 function isDisplayOnlyStartRouteBlock(block: ActivityBlock): boolean {
@@ -2750,15 +2973,15 @@ function isSupportCleanupBlock(block: ActivityBlock): boolean {
     || title.includes("buffer");
 }
 
-function isSupportLinkedToDeletedActivity(block: ActivityBlock, deletedId: string): boolean {
+function isSupportLinkedToDeletedActivity(block: ActivityBlock, deleteKeys: Set<string>): boolean {
   if (!isSupportCleanupBlock(block)) return false;
   const relatedIds = [
     block.source_activity_id,
     block.destination_activity_id,
     ...(Array.isArray(block.related_activity_ids) ? block.related_activity_ids : []),
   ].map((value) => String(value || "")).filter(Boolean);
-  if (relatedIds.includes(deletedId)) return true;
-  return Boolean(block.id && String(block.id).includes(deletedId));
+  if (relatedIds.some((id) => deleteKeys.has(id))) return true;
+  return Boolean(block.id && relatedIds.some((id) => String(block.id).includes(id)));
 }
 
 function minutesTo12Hour(totalMinutes: number): string {

@@ -7361,7 +7361,7 @@ def test_travel_complete_clears_validation_only_dirty_state(monkeypatch):
     assert payload["last_rescheduled_at"] == "2026-06-01T00:00:00+00:00"
 
 
-def test_travel_complete_does_not_clear_manual_dirty_reason(monkeypatch):
+def test_travel_complete_clears_dirty_flags_after_successful_validation(monkeypatch):
     from fastapi.testclient import TestClient
     import main as backend_main
 
@@ -7408,8 +7408,9 @@ def test_travel_complete_does_not_clear_manual_dirty_reason(monkeypatch):
     assert response.status_code == 200
     payload = response.json()
     assert payload["travel_validation_status"] == "repaired_validated"
-    assert payload["needs_reschedule"] is True
-    assert payload["reschedule_reason"] == "location_changed"
+    assert payload["needs_reschedule"] is False
+    assert payload["reschedule_reason"] is None
+    assert payload["needs_travel_validation"] is False
 
 
 def test_persisted_preferences_fill_missing_schedule_preferences(monkeypatch):
@@ -8450,6 +8451,20 @@ def test_route_transition_minutes_handles_none_prep_buffer():
     assert minutes >= 0
 
 
+def test_start_route_summary_dropped_when_first_event_is_unfit():
+    engine = SchedulingEngine(DummyClient())
+    summary = {
+        "start_location": "Home",
+        "first_physical_event": "Gym",
+        "first_physical_event_location": "Gym map point",
+        "leave_by": "08:55 AM",
+        "travel_duration_minutes": 5,
+    }
+
+    assert engine._valid_start_route_summary(summary, [{"title": "Gym"}], []) is None
+    assert engine._valid_start_route_summary(summary, [{"title": "Lunch"}], []) == summary
+
+
 def test_duplicate_guard_ambiguous_existing_match_clarifies_without_adding():
     engine = SchedulingEngine(DummyClient())
     envelope = _custom_envelope([
@@ -8491,6 +8506,43 @@ def test_duplicate_guard_ambiguous_existing_match_clarifies_without_adding():
     assert _count_title(result["envelope"], "grocery") == 0
     assert _count_title(result["envelope"], "Grocery Run") == 1
     assert _count_title(result["envelope"], "Grocery Shopping") == 1
+
+
+def test_duplicate_guard_explicit_add_with_relative_anchor_adds_new_activity():
+    engine = SchedulingEngine(DummyClient())
+    envelope = _custom_envelope([
+        {
+            "op": "add",
+            "title": "Dinner with family",
+            "timing_mode": TimingMode.FIXED,
+            "fixed_start": "19:00",
+            "duration_minutes": 60,
+        },
+        {
+            "op": "add",
+            "title": "Lunch meeting",
+            "timing_mode": TimingMode.FIXED,
+            "fixed_start": "12:00",
+            "duration_minutes": 60,
+        },
+    ])
+
+    result = engine.apply_operations(
+        envelope=envelope,
+        operations=[{
+            "op": "add",
+            "title": "Meeting with client",
+            "timing_mode": TimingMode.RELATIVE,
+            "anchor_relation": {"kind": "after", "target_title": "Dinner with family"},
+            "duration_minutes": 60,
+            "_user_message": "add a meeting with client after dinner",
+        }],
+        base_version=envelope["version"],
+    )
+
+    assert result["status"] == "success"
+    assert not result.get("ignored_operations")
+    assert _count_title(result["envelope"], "Meeting with client") == 1
 
 
 def test_deterministic_fast_path_arrange_duration_cleans_title():

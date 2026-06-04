@@ -26,7 +26,17 @@ export type ActivityBlock = {
   id: string;
   stable_activity_id?: string;
   type?: "activity" | "travel" | "buffer" | "transition" | "idle" | "start_route" | "route_conflict";
-  block_type?: "activity" | "transition" | "travel" | "buffer" | "idle" | "start_route" | "route_conflict";
+  block_type?: "activity" | "transition" | "travel" | "buffer" | "idle" | "start_route" | "route_conflict" | "prep_buffer" | "free_time";
+  block_id?: string;
+  related_activity_id?: string;
+  calendar_event_id?: string;
+  google_event_id?: string;
+  original_google_event_id?: string;
+  source_system?: string;
+  maybe_support_block?: boolean;
+  read_only?: boolean;
+  category?: string;
+  date?: string;
   title: string;
   startTime: string;
   endTime: string;
@@ -99,9 +109,11 @@ export type ActivityBlock = {
   can_move_for_repair?: boolean;
   repair_protection?: "fixed" | "protected_social" | "flexible" | "optional" | string;
   notes?: string;
+  description?: string;
   explanation?: string | null;
   trace?: string[];
   source?: string;
+  jplan_metadata?: Record<string, unknown>;
   isConflict?: boolean;
   is_conflicting?: boolean;
   conflict_ids?: string[];
@@ -128,6 +140,12 @@ export type DailySchedule = {
   activities: ActivityBlock[];
   schedule_blocks?: ActivityBlock[];
   committed_schedule_blocks?: ActivityBlock[];
+  external_calendar_events?: ActivityBlock[];
+  sync_links?: Array<Record<string, unknown>>;
+  active_view?: "jplan" | "google_calendar" | string;
+  has_unsaved_draft?: boolean;
+  draft_dirty?: boolean;
+  export_warning?: string | null;
   explanations?: string[];
   conflicts?: Array<{
     conflict_id: string;
@@ -392,6 +410,13 @@ export default function App() {
                   onViewPreferences={() => navigate("/preferences")}
                   onUpdateSchedule={(updatedSchedule) => {
                     setCurrentSchedule(updatedSchedule);
+                    setScheduleHistory(prev => {
+                      const index = prev.findIndex(item => item.date === updatedSchedule.date);
+                      if (index < 0) return [...prev, updatedSchedule];
+                      const next = [...prev];
+                      next[index] = updatedSchedule;
+                      return next;
+                    });
                   }}
                 />
               ) : (
