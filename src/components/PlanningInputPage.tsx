@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from "react";
-import { useParams } from "react-router-dom";
+import { useNavigate, useParams } from "react-router-dom";
 import {
   addRecentLocationRemote,
   completeTravelValidation,
@@ -226,6 +226,7 @@ export function PlanningInputPage({
   onUpdateSchedule,
 }: PlanningInputPageProps) {
   const { user } = useAuth();
+  const navigate = useNavigate();
   const params = useParams<{ date: string }>();
   const routeDateStr = params.date;
   
@@ -309,6 +310,9 @@ export function PlanningInputPage({
 
   const applyReturnedSchedule = (schedule: DailySchedule) => {
     const scheduleWithPrefs = materializeAutoRoutePreview(withPlanningPreferences(schedule));
+    if (scheduleWithPrefs.date && scheduleWithPrefs.date !== isoDateStr) {
+      navigate(`/planning/${scheduleWithPrefs.date}`, { replace: true });
+    }
     const nextAccurateTravelTime = isAccurateTravelEnabled(scheduleWithPrefs);
     setAccurateTravelTime(nextAccurateTravelTime);
     setCalendarView("jplan");

@@ -348,7 +348,7 @@ export default function App() {
                   navigate("/schedule");
                 }}
                 onReplanToday={() => {
-                  const dateStr = new Date().toISOString().split('T')[0];
+                  const dateStr = formatToISODate(new Date());
                   if (todaySchedule) {
                     setPlanningSchedule(todaySchedule);
                     setPlanningDate(new Date());
@@ -385,7 +385,7 @@ export default function App() {
           }
         />
         {/* Fallback for planning without date */}
-        <Route path="/planning" element={<Navigate to={`/planning/${new Date().toISOString().split('T')[0]}`} replace />} />
+        <Route path="/planning" element={<Navigate to={`/planning/${formatToISODate(new Date())}`} replace />} />
 
         <Route
           path="/schedule"

@@ -21,6 +21,13 @@ type TopNavProps = {
   syncDate?: string;
 };
 
+const formatLocalDate = (date: Date) => {
+  const yyyy = date.getFullYear();
+  const mm = String(date.getMonth() + 1).padStart(2, "0");
+  const dd = String(date.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+};
+
 export function TopNav({ 
   onSettingsClick, 
   showSyncButton = true, 
@@ -59,7 +66,7 @@ export function TopNav({
     if (!profile?.id) return;
 
     // Get target date
-    const todayStr = new Date().toISOString().split('T')[0];
+    const todayStr = formatLocalDate(new Date());
     const targetDate = syncDate || todayStr;
 
     const syncToast = toast.loading(`Syncing calendar for ${targetDate}...`);
