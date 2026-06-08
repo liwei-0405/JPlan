@@ -194,6 +194,7 @@ class SchedulingEngine(
             )
 
         active_set = [item for item in canonical_activities if item.get("status") == "active"]
+        self._apply_default_prep_buffer(active_set, preferences)
         for item in active_set:
             if (
                 item.get("stable_activity_id") in existing_active_ids
@@ -312,6 +313,7 @@ class SchedulingEngine(
             for item in loaded_canonical
             if item.get("status") == "active"
         ]
+        self._apply_default_prep_buffer(active_set, preferences)
         for item in active_set:
             if item.get("resolved_location") or item.get("location_status") == "resolved":
                 jlog(

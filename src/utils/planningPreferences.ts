@@ -17,6 +17,7 @@ export type PlanningPreferences = {
   day_end_time: string;
   use_day_boundary_preferences?: boolean;
   default_start_location?: PlanningLocation | null;
+  default_buffer_minutes?: number;
 };
 
 export type RecentLocation = PlanningLocation & {
@@ -30,6 +31,7 @@ const DEFAULT_PREFERENCES: PlanningPreferences = {
   day_end_time: "22:00",
   use_day_boundary_preferences: true,
   default_start_location: null,
+  default_buffer_minutes: 5,
 };
 
 const preferenceKey = (userId?: string) => `jplan.preferences.${userId || "anonymous"}`;
@@ -70,6 +72,12 @@ export function hasLocationCoordinates(location?: PlanningLocation | null): bool
   return Number.isFinite(lat) && Number.isFinite(lng);
 }
 
+export function normalizeBufferMinutes(value?: unknown, fallback: number = DEFAULT_PREFERENCES.default_buffer_minutes || 5): number {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return fallback;
+  return Math.max(0, Math.min(60, Math.round(numeric)));
+}
+
 export function savedLocationToPlanningLocation(location: SavedLocation): PlanningLocation {
   return {
     label: location.label,
@@ -107,6 +115,7 @@ export function loadPlanningPreferences(userId?: string): PlanningPreferences {
       day_end_time: toCanonicalTime(parsed.day_end_time) || DEFAULT_PREFERENCES.day_end_time,
       use_day_boundary_preferences: parsed.use_day_boundary_preferences ?? DEFAULT_PREFERENCES.use_day_boundary_preferences,
       default_start_location: parsed.default_start_location || null,
+      default_buffer_minutes: normalizeBufferMinutes(parsed.default_buffer_minutes),
     };
   } catch {
     return DEFAULT_PREFERENCES;
@@ -119,6 +128,7 @@ export function normalizePlanningPreferences(preferences?: Partial<PlanningPrefe
     day_end_time: toCanonicalTime(preferences?.day_end_time) || DEFAULT_PREFERENCES.day_end_time,
     use_day_boundary_preferences: preferences?.use_day_boundary_preferences ?? DEFAULT_PREFERENCES.use_day_boundary_preferences,
     default_start_location: preferences?.default_start_location || null,
+    default_buffer_minutes: normalizeBufferMinutes(preferences?.default_buffer_minutes),
   };
 }
 
@@ -132,6 +142,7 @@ export function savePlanningPreferences(userId: string | undefined, preferences:
       day_end_time: normalized.day_end_time,
       use_day_boundary_preferences: normalized.use_day_boundary_preferences,
       default_start_location: normalized.default_start_location,
+      default_buffer_minutes: normalized.default_buffer_minutes,
     }),
   );
 }
@@ -147,6 +158,9 @@ export function mergePlanningPreferences(
   const dayEndTime = String(existing.day_end_time || prefs.day_end_time);
   const useDayBoundaries = existing.use_day_boundary_preferences ?? prefs.use_day_boundary_preferences;
   const defaultStart = (existing.default_start_location as PlanningLocation | undefined) || prefs.default_start_location || null;
+  const defaultBufferMinutes = normalizeBufferMinutes(
+    existing.default_buffer_minutes ?? existing.prep_buffer ?? prefs.default_buffer_minutes,
+  );
   return {
     ...schedule,
     preferences: {
@@ -159,6 +173,8 @@ export function mergePlanningPreferences(
         day_end: existing.day_end || dayEndTime,
       }),
       default_start_location: defaultStart,
+      default_buffer_minutes: defaultBufferMinutes,
+      prep_buffer: normalizeBufferMinutes(existing.prep_buffer ?? defaultBufferMinutes),
       ...(existing.day_start_location_override ? { day_start_location_override: existing.day_start_location_override } : {}),
     },
   };

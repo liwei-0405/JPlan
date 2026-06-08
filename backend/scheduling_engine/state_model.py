@@ -96,6 +96,32 @@ class StateModelMixin:
                 return int(text)
         return None
 
+    def _normalize_default_prep_buffer(self, preferences: Optional[Dict[str, Any]] = None) -> int:
+        source = preferences or {}
+        raw = source.get("prep_buffer")
+        if raw is None:
+            raw = source.get("default_buffer_minutes")
+        try:
+            minutes = int(float(raw))
+        except (TypeError, ValueError):
+            minutes = DEFAULT_PREP_BUFFER
+        return max(0, min(60, minutes))
+
+    def _apply_default_prep_buffer(
+        self,
+        activities: List[Dict[str, Any]],
+        preferences: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        default_buffer = self._normalize_default_prep_buffer(preferences)
+        if preferences is not None:
+            preferences["default_buffer_minutes"] = default_buffer
+            preferences["prep_buffer"] = default_buffer
+        for item in activities or []:
+            if not isinstance(item, dict):
+                continue
+            item["prep_buffer"] = default_buffer
+        return activities
+
     def _infer_timing_mode(
         self,
         raw: Dict[str, Any],

@@ -34,6 +34,7 @@ DEFAULT_USER_PREFERENCES = {
     "use_day_boundary_preferences": True,
     "default_start_location": None,
     "default_start_location_label": None,
+    "default_buffer_minutes": 5,
 }
 
 if not supabase_url or not supabase_key:
@@ -57,6 +58,13 @@ def _normalize_time_string(value: Any, fallback: str) -> str:
     if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
         return f"{parts[0].zfill(2)}:{parts[1].zfill(2)}"
     return fallback
+
+def _normalize_buffer_minutes(value: Any, fallback: int = 5) -> int:
+    try:
+        numeric = int(float(value))
+    except (TypeError, ValueError):
+        numeric = fallback
+    return max(0, min(60, numeric))
 
 def _has_coordinates(location: Optional[Dict[str, Any]]) -> bool:
     if not isinstance(location, dict):
@@ -89,6 +97,10 @@ def _normalize_preference_row(row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     prefs["default_start_location_label"] = row.get("default_start_location_label")
     default_start = row.get("default_start_location")
     prefs["default_start_location"] = default_start if isinstance(default_start, dict) else None
+    prefs["default_buffer_minutes"] = _normalize_buffer_minutes(
+        row.get("default_buffer_minutes"),
+        DEFAULT_USER_PREFERENCES["default_buffer_minutes"],
+    )
     return prefs
 
 def _parse_schedule_payload(payload: Any, user_id: str = "", date: str = "") -> Dict[str, Any]:
@@ -605,6 +617,7 @@ def save_user_preferences(
     day_end_time: Optional[str] = None,
     use_day_boundary_preferences: bool = True,
     default_start_location: Optional[Dict[str, Any]] = None,
+    default_buffer_minutes: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Create or update planning preferences for a user."""
     if not supabase:
@@ -614,6 +627,7 @@ def save_user_preferences(
 
     normalized_start = _normalize_time_string(day_start_time, DEFAULT_USER_PREFERENCES["day_start_time"])
     normalized_end = _normalize_time_string(day_end_time, DEFAULT_USER_PREFERENCES["day_end_time"])
+    normalized_buffer = _normalize_buffer_minutes(default_buffer_minutes, DEFAULT_USER_PREFERENCES["default_buffer_minutes"])
     payload = {
         "user_id": user_id,
         "day_start_time": normalized_start,
@@ -621,6 +635,7 @@ def save_user_preferences(
         "use_day_boundary_preferences": bool(use_day_boundary_preferences),
         "default_start_location_label": (default_start_location or {}).get("label") if default_start_location else None,
         "default_start_location": default_start_location,
+        "default_buffer_minutes": normalized_buffer,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     try:
@@ -628,8 +643,18 @@ def save_user_preferences(
         row = (response.data or [payload])[0]
         return _normalize_preference_row(row)
     except Exception as e:
-        jlog("DB", f"Error saving user preferences: {e}", "ERROR")
-        raise
+        if "default_buffer_minutes" not in str(e):
+            jlog("DB", f"Error saving user preferences: {e}", "ERROR")
+            raise
+        legacy_payload = dict(payload)
+        legacy_payload.pop("default_buffer_minutes", None)
+        response = supabase.table('user_preferences').upsert(legacy_payload, on_conflict='user_id').execute()
+        row = {
+            **(response.data or [legacy_payload])[0],
+            "default_buffer_minutes": normalized_buffer,
+        }
+        jlog("DB", "Saved preferences without remote default_buffer_minutes column; run Supabase setup migration.", "PREFERENCES")
+        return _normalize_preference_row(row)
 
 def get_user_recent_locations(user_id: str, limit: int = 5) -> List[Dict[str, Any]]:
     """Fetch recently confirmed locations, newest first."""

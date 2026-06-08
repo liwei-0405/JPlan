@@ -351,6 +351,7 @@ class UserPreferencesRequest(BaseModel):
     day_end_time: Optional[str] = "22:00"
     use_day_boundary_preferences: Optional[bool] = True
     default_start_location: Optional[Dict[str, Any]] = None
+    default_buffer_minutes: Optional[int] = 5
 
 class RecentLocationRequest(BaseModel):
     user_id: str
@@ -503,6 +504,10 @@ def _merge_user_preferences_into_envelope(
     for key in ("day_start_time", "day_end_time"):
         if not prefs.get(key) and persisted.get(key):
             prefs[key] = persisted[key]
+    if "default_buffer_minutes" not in prefs and persisted.get("default_buffer_minutes") is not None:
+        prefs["default_buffer_minutes"] = persisted.get("default_buffer_minutes")
+    if not prefs.get("prep_buffer") and prefs.get("default_buffer_minutes") is not None:
+        prefs["prep_buffer"] = prefs.get("default_buffer_minutes")
 
     if use_boundaries:
         if not prefs.get("day_start") and prefs.get("day_start_time"):
@@ -835,9 +840,11 @@ async def chat_with_llm(request: ChatRequest):
         jlog("TIMER", f"module_a_total_seconds={elapsed_seconds(module_a_started)}")
         parsed.setdefault("preferences", {})
         persisted_preferences = database.get_user_preferences(request.user_id) if request.user_id else {}
-        for key in ("day_start_time", "day_end_time", "use_day_boundary_preferences", "default_start_location"):
+        for key in ("day_start_time", "day_end_time", "use_day_boundary_preferences", "default_start_location", "default_buffer_minutes"):
             if persisted_preferences.get(key) is not None and key not in parsed["preferences"]:
                 parsed["preferences"][key] = persisted_preferences.get(key)
+        if "prep_buffer" not in parsed["preferences"] and parsed["preferences"].get("default_buffer_minutes") is not None:
+            parsed["preferences"]["prep_buffer"] = parsed["preferences"].get("default_buffer_minutes")
         if parsed["preferences"].get("use_day_boundary_preferences", True):
             if not parsed["preferences"].get("day_start") and parsed["preferences"].get("day_start_time"):
                 parsed["preferences"]["day_start"] = parsed["preferences"]["day_start_time"]
@@ -1280,6 +1287,7 @@ async def save_preferences(request: UserPreferencesRequest):
             day_end_time=request.day_end_time,
             use_day_boundary_preferences=bool(request.use_day_boundary_preferences),
             default_start_location=request.default_start_location,
+            default_buffer_minutes=request.default_buffer_minutes,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))

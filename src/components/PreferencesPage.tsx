@@ -27,6 +27,7 @@ import {
   savePlanningPreferences,
   saveRecentLocations,
   savedLocationToPlanningLocation,
+  normalizeBufferMinutes,
   toCanonicalTime,
   toDisplayTime,
   type PlanningLocation,
@@ -41,11 +42,13 @@ function preferenceSnapshot(
   dayEnd: string,
   useDayBoundaries: boolean,
   defaultStartLocation: PlanningLocation | null,
+  defaultBufferMinutes: number,
 ) {
   return JSON.stringify({
     day_start_time: toCanonicalTime(dayStart) || "08:00",
     day_end_time: toCanonicalTime(dayEnd) || "22:00",
     use_day_boundary_preferences: useDayBoundaries,
+    default_buffer_minutes: normalizeBufferMinutes(defaultBufferMinutes),
     default_start_location: defaultStartLocation
       ? {
           label: defaultStartLocation.label,
@@ -70,6 +73,7 @@ export function PreferencesPage({ onBack }: PreferencesPageProps) {
   const [reminderBefore, setReminderBefore] = useState(true);
   const [calendarConnected, setCalendarConnected] = useState(true);
   const [defaultStartLocation, setDefaultStartLocation] = useState<PlanningLocation | null>(null);
+  const [defaultBufferMinutes, setDefaultBufferMinutes] = useState(5);
 
   // --- Location Management State ---
   const [savedLocations, setSavedLocations] = useState<SavedLocation[]>([]);
@@ -95,11 +99,13 @@ export function PreferencesPage({ onBack }: PreferencesPageProps) {
       setDayEnd(toDisplayTime(prefs.day_end_time) || "10:00 PM");
       setUseDayBoundaries(prefs.use_day_boundary_preferences ?? true);
       setDefaultStartLocation(prefs.default_start_location || null);
+      setDefaultBufferMinutes(normalizeBufferMinutes(prefs.default_buffer_minutes));
       setOriginalPreferencesJson(preferenceSnapshot(
         toDisplayTime(prefs.day_start_time) || "8:00 AM",
         toDisplayTime(prefs.day_end_time) || "10:00 PM",
         prefs.use_day_boundary_preferences ?? true,
         prefs.default_start_location || null,
+        normalizeBufferMinutes(prefs.default_buffer_minutes),
       ));
       fetchLocations();
       getPlanningPreferences(user.id)
@@ -111,11 +117,13 @@ export function PreferencesPage({ onBack }: PreferencesPageProps) {
           setDayEnd(toDisplayTime(normalized.day_end_time) || "10:00 PM");
           setUseDayBoundaries(normalized.use_day_boundary_preferences ?? true);
           setDefaultStartLocation(normalized.default_start_location || null);
+          setDefaultBufferMinutes(normalizeBufferMinutes(normalized.default_buffer_minutes));
           setOriginalPreferencesJson(preferenceSnapshot(
             toDisplayTime(normalized.day_start_time) || "8:00 AM",
             toDisplayTime(normalized.day_end_time) || "10:00 PM",
             normalized.use_day_boundary_preferences ?? true,
             normalized.default_start_location || null,
+            normalizeBufferMinutes(normalized.default_buffer_minutes),
           ));
         })
         .catch((error) => console.error("Failed to fetch planning preferences:", error));
@@ -270,6 +278,7 @@ export function PreferencesPage({ onBack }: PreferencesPageProps) {
       day_end_time: toCanonicalTime(dayEnd) || "22:00",
       use_day_boundary_preferences: useDayBoundaries,
       default_start_location: defaultStartLocation,
+      default_buffer_minutes: normalizeBufferMinutes(defaultBufferMinutes),
     };
     setIsSavingPreferences(true);
     savePlanningPreferences(user?.id, nextPreferences);
@@ -283,6 +292,7 @@ export function PreferencesPage({ onBack }: PreferencesPageProps) {
           toDisplayTime(normalized.day_end_time) || "10:00 PM",
           normalized.use_day_boundary_preferences ?? true,
           normalized.default_start_location || null,
+          normalizeBufferMinutes(normalized.default_buffer_minutes),
         ));
       } catch (error) {
         console.error("Failed to save planning preferences:", error);
@@ -296,7 +306,7 @@ export function PreferencesPage({ onBack }: PreferencesPageProps) {
   };
 
   const hasUnsavedPreferenceChanges = () => {
-    const current = preferenceSnapshot(dayStart, dayEnd, useDayBoundaries, defaultStartLocation);
+    const current = preferenceSnapshot(dayStart, dayEnd, useDayBoundaries, defaultStartLocation, defaultBufferMinutes);
     return Boolean(originalPreferencesJson && current !== originalPreferencesJson);
   };
 
@@ -484,6 +494,32 @@ export function PreferencesPage({ onBack }: PreferencesPageProps) {
                   <option>10:00 PM</option>
                   <option>11:00 PM</option>
                 </select>
+              </div>
+            </div>
+
+            <div className="mt-4 rounded-2xl border border-border/60 bg-background/70 p-3">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <Label htmlFor="default-buffer-minutes" className="text-sm">
+                    Default buffer time
+                  </Label>
+                  <p className="text-xs text-muted-foreground mt-1">
+                    Used between travel-linked activities unless a plan overrides it.
+                  </p>
+                </div>
+                <div className="flex items-center gap-2">
+                <input
+                  id="default-buffer-minutes"
+                  type="number"
+                  min={0}
+                  max={60}
+                  step={1}
+                  value={defaultBufferMinutes}
+                  onChange={(event) => setDefaultBufferMinutes(normalizeBufferMinutes(event.target.value))}
+                  className="h-9 w-20 rounded-xl border border-border bg-background px-3 text-sm"
+                />
+                <span className="text-xs text-muted-foreground">min</span>
+                </div>
               </div>
             </div>
           </div>

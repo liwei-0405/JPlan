@@ -91,12 +91,17 @@ CREATE TABLE IF NOT EXISTS public.user_preferences (
   day_start_time TIME NOT NULL DEFAULT TIME '08:00',
   day_end_time TIME NOT NULL DEFAULT TIME '22:00',
   use_day_boundary_preferences BOOLEAN NOT NULL DEFAULT true,
+  default_buffer_minutes INTEGER NOT NULL DEFAULT 5 CHECK (default_buffer_minutes >= 0 AND default_buffer_minutes <= 60),
   default_start_location_label TEXT,
   default_start_location JSONB,
   created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT timezone('utc'::text, now()),
   updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT timezone('utc'::text, now()),
   CONSTRAINT user_preferences_day_boundary_check CHECK (day_start_time < day_end_time)
 );
+
+ALTER TABLE public.user_preferences
+  ADD COLUMN IF NOT EXISTS default_buffer_minutes INTEGER NOT NULL DEFAULT 5
+  CHECK (default_buffer_minutes >= 0 AND default_buffer_minutes <= 60);
 
 -- Cross-device recent confirmed locations. This is user history, not the
 -- provider result cache below. The app keeps only the newest five per user.

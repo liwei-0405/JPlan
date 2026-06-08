@@ -227,6 +227,7 @@ export type PlanningPreferencesPayload = {
     day_end_time: string;
     use_day_boundary_preferences?: boolean;
     default_start_location?: PlanningLocationPayload | null;
+    default_buffer_minutes?: number;
 };
 
 export type RecentLocationPayload = PlanningLocationPayload & {

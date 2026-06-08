@@ -49,6 +49,7 @@ import {
   loadRecentLocations,
   mergePlanningPreferences,
   normalizePlanningPreferences,
+  normalizeBufferMinutes,
   savePlanningPreferences,
   saveRecentLocations,
   savedLocationToPlanningLocation,
@@ -256,6 +257,7 @@ export function PlanningInputPage({
   const [draftDayStart, setDraftDayStart] = useState("08:00");
   const [draftDayEnd, setDraftDayEnd] = useState("22:00");
   const [draftStartLocationKey, setDraftStartLocationKey] = useState("__default__");
+  const [draftBufferMinutes, setDraftBufferMinutes] = useState(5);
 
   // Auto-load data on mount/refresh if missing
   useEffect(() => {
@@ -1791,6 +1793,11 @@ export function PlanningInputPage({
     : null;
   const activeDayStart = String((previewSchedule?.preferences || {}).day_start_time || planningPreferences.day_start_time || "08:00");
   const activeDayEnd = String((previewSchedule?.preferences || {}).day_end_time || planningPreferences.day_end_time || "22:00");
+  const activeBufferMinutes = normalizeBufferMinutes(
+    (previewSchedule?.preferences || {}).prep_buffer
+      ?? (previewSchedule?.preferences || {}).default_buffer_minutes
+      ?? planningPreferences.default_buffer_minutes,
+  );
   const baseTimeOptions = ["06:00", "07:00", "08:00", "09:00", "10:00", "20:00", "21:00", "22:00", "23:00"];
   const timeOptions = Array.from(new Set([
     ...baseTimeOptions,
@@ -1813,6 +1820,7 @@ export function PlanningInputPage({
   const displayedDayStart = isEditingPlanSettings ? draftDayStart : (toCanonicalTime(activeDayStart) || "08:00");
   const displayedDayEnd = isEditingPlanSettings ? draftDayEnd : (toCanonicalTime(activeDayEnd) || "22:00");
   const displayedStartLocationKey = isEditingPlanSettings ? draftStartLocationKey : activeStartLocationKey;
+  const displayedBufferMinutes = isEditingPlanSettings ? draftBufferMinutes : activeBufferMinutes;
   const planSettingControlClass = `h-8 rounded-xl border border-border px-2 text-xs transition ${
     isEditingPlanSettings
       ? "bg-background text-foreground"
@@ -1822,6 +1830,7 @@ export function PlanningInputPage({
     if (isScheduleBusy) return;
     setDraftDayStart(toCanonicalTime(activeDayStart) || "08:00");
     setDraftDayEnd(toCanonicalTime(activeDayEnd) || "22:00");
+    setDraftBufferMinutes(activeBufferMinutes);
     setDraftStartLocationKey(
       (previewSchedule?.preferences || {}).day_start_location_override
         ? locationOptionKey((previewSchedule?.preferences || {}).day_start_location_override as PlanningLocation)
@@ -1841,6 +1850,8 @@ export function PlanningInputPage({
         day_end_time: draftDayEnd,
         day_start: draftDayStart,
         day_end: draftDayEnd,
+        default_buffer_minutes: normalizeBufferMinutes(draftBufferMinutes),
+        prep_buffer: normalizeBufferMinutes(draftBufferMinutes),
       };
       if (draftStartLocationKey === "__default__") {
         delete (nextPreferences as Record<string, unknown>).day_start_location_override;
@@ -1974,6 +1985,19 @@ export function PlanningInputPage({
                       <option key={`end-${time}`} value={time}>{toDisplayTime(time)}</option>
                     ))}
                   </select>
+                  <span className="text-muted-foreground">Buffer</span>
+                  <input
+                    type="number"
+                    min={0}
+                    max={60}
+                    step={1}
+                    value={displayedBufferMinutes}
+                    onChange={(event) => setDraftBufferMinutes(normalizeBufferMinutes(event.target.value))}
+                    disabled={!isEditingPlanSettings || isScheduleBusy}
+                    className={`${planSettingControlClass} w-16`}
+                    aria-label="Plan buffer time"
+                  />
+                  <span className="text-muted-foreground">min</span>
                   <Button
                     type="button"
                     variant={isEditingPlanSettings ? "default" : "ghost"}

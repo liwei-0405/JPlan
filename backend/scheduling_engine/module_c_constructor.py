@@ -293,7 +293,10 @@ class ModuleCConstructorMixin:
                 
                 # Calculate required overhead
                 route_entry = self._route_context_entry(last_activity, act) if last_activity and current_loc else None
-                buffer_dur = DEFAULT_PREP_BUFFER if last_loc is not None and current_loc is not None else 0
+                buffer_dur = max(
+                    int((last_activity or {}).get("prep_buffer", DEFAULT_PREP_BUFFER) or 0),
+                    int(act.get("prep_buffer", DEFAULT_PREP_BUFFER) or 0),
+                ) if last_loc is not None and current_loc is not None else 0
                 travel_time = 0
                 travel_source = "heuristic"
                 route_status = "not_requested"

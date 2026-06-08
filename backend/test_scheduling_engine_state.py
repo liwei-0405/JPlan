@@ -5674,6 +5674,54 @@ def test_accurate_route_duration_retimes_transition_and_creates_idle_slack():
     assert all(activity.get("location_status") == "resolved" for activity in envelope["activities"])
 
 
+def test_manual_scheduler_uses_plan_default_buffer_minutes():
+    engine = SchedulingEngine(DummyClient())
+    envelope = {
+        "date": "2026-06-09",
+        "version": 1,
+        "preferences": {
+            "day_start_time": "08:00",
+            "day_end_time": "13:00",
+            "default_buffer_minutes": 15,
+            "prep_buffer": 15,
+        },
+        "activities": [
+            {
+                "id": "office",
+                "stable_activity_id": "office",
+                "title": "Office work",
+                "duration_minutes": 60,
+                "timing_mode": "fixed",
+                "fixed_start": 9 * 60,
+                "fixed_end": 10 * 60,
+                "location": "office",
+                "location_label": "office",
+                "travel_required": True,
+            },
+            {
+                "id": "library",
+                "stable_activity_id": "library",
+                "title": "Library session",
+                "duration_minutes": 60,
+                "timing_mode": "fixed",
+                "fixed_start": 11 * 60,
+                "fixed_end": 12 * 60,
+                "location": "library",
+                "location_label": "library",
+                "travel_required": True,
+            },
+        ],
+    }
+
+    replanned = engine.run_manual_scheduler(envelope, base_version=1)
+    buffers = [block for block in replanned["schedule_blocks"] if block.get("block_type") == "buffer"]
+
+    assert replanned["preferences"]["default_buffer_minutes"] == 15
+    assert replanned["preferences"]["prep_buffer"] == 15
+    assert buffers
+    assert buffers[0]["duration_minutes"] == 15
+
+
 def test_accurate_route_longer_duration_replaces_stale_support_segment():
     fake_travel = FakeTravelService(route_minutes=30)
     engine = SchedulingEngine(DummyClient(), travel_service=fake_travel)

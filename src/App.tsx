@@ -95,6 +95,7 @@ export type ActivityBlock = {
   to_coordinate?: { latitude: number; longitude: number };
   duration?: string;
   duration_minutes?: number;
+  prep_buffer?: number | null;
   priority?: "low" | "medium" | "high";
   isMandatory?: boolean;
   is_mandatory?: boolean;
