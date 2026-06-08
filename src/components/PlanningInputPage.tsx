@@ -12,6 +12,7 @@ import {
   type GeocodeCandidate,
   type SavedLocation,
 } from "../services/planService";
+import { apiUrl } from "../services/apiConfig";
 import { Button } from "./ui/button";
 import { Textarea } from "./ui/textarea";
 import { Input } from "./ui/input";
@@ -872,7 +873,7 @@ export function PlanningInputPage({
     setIsProcessing(true);
 
     try {
-      const response = await fetch("http://127.0.0.1:8000/chat", {
+      const response = await fetch(apiUrl("/chat"), {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -1478,7 +1479,7 @@ export function PlanningInputPage({
     setProgressSteps(message === "yes" ? ["Applying repair suggestion...", "Rechecking accurate travel time..."] : ["Keeping current schedule..."]);
     setActiveProgressIndex(0);
     try {
-      const response = await fetch("http://127.0.0.1:8000/chat", {
+      const response = await fetch(apiUrl("/chat"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

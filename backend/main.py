@@ -25,6 +25,19 @@ from travel_service import TravelService
 # load environment variables from .env file
 load_dotenv()
 
+def _parse_allowed_origins() -> List[str]:
+    raw = os.getenv("ALLOWED_ORIGINS", "")
+    configured = [origin.strip().rstrip("/") for origin in raw.split(",") if origin.strip()]
+    if not configured:
+        return ["http://localhost:3000", "http://127.0.0.1:3000"]
+    origins = []
+    for origin in configured:
+        if origin == "*":
+            jlog("API", "Ignoring wildcard ALLOWED_ORIGINS entry for deployment safety.", "CORS")
+            continue
+        origins.append(origin)
+    return origins or ["http://localhost:3000", "http://127.0.0.1:3000"]
+
 # Gemini API
 client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
 travel_service = TravelService()
@@ -35,14 +48,29 @@ import calendar_service
 cal_service = calendar_service.CalendarService(database.supabase)
 
 app = FastAPI()
+ALLOWED_ORIGINS = _parse_allowed_origins()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "configured": {
+            "supabase": bool(database.supabase),
+            "google_api": bool(os.getenv("GOOGLE_API_KEY")),
+            "google_oauth": bool(os.getenv("GOOGLE_CLIENT_ID") and os.getenv("GOOGLE_CLIENT_SECRET")),
+            "ors": bool(os.getenv("OPENROUTESERVICE_API_KEY") or os.getenv("ORS_API_KEY")),
+            "calendar_service": bool(cal_service),
+            "allowed_origins": bool(ALLOWED_ORIGINS),
+        },
+    }
 
 # --- Models ---
 

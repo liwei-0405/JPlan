@@ -12,6 +12,7 @@ import {
 import { Avatar, AvatarFallback, AvatarImage } from "./ui/avatar";
 import { toast } from "sonner";
 import { supabase } from "../lib/supabase";
+import { apiUrl } from "../services/apiConfig";
 
 type TopNavProps = {
   onSettingsClick?: () => void;
@@ -64,7 +65,7 @@ export function TopNav({
     const syncToast = toast.loading(`Syncing calendar for ${targetDate}...`);
 
     try {
-      const response = await fetch('http://localhost:8000/api/sync-calendar', {
+      const response = await fetch(apiUrl('/api/sync-calendar'), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

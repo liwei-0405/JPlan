@@ -64,12 +64,23 @@ export function CalendarWidget({ scheduleDates, onDateSelect, selectedDate }: Ca
     return date.getTime() === selectedDate.getTime();
   };
 
+  const moveToMonth = (targetMonth: Date) => {
+    const targetYear = targetMonth.getFullYear();
+    const targetMonthIndex = targetMonth.getMonth();
+    const firstOfMonth = new Date(targetYear, targetMonthIndex, 1);
+    const selectedDay = targetYear === today.getFullYear() && targetMonthIndex === today.getMonth()
+      ? new Date(today)
+      : firstOfMonth;
+    setCurrentMonth(firstOfMonth);
+    onDateSelect(selectedDay);
+  };
+
   const handlePrevMonth = () => {
-    setCurrentMonth(new Date(year, month - 1, 1));
+    moveToMonth(new Date(year, month - 1, 1));
   };
 
   const handleNextMonth = () => {
-    setCurrentMonth(new Date(year, month + 1, 1));
+    moveToMonth(new Date(year, month + 1, 1));
   };
 
   const handleDayClick = (day: number) => {
