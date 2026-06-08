@@ -282,7 +282,7 @@ export function EventEditModal({
         </div>
 
         {/* Footer */}
-        <div className="p-5 border-t border-border flex gap-3">
+        <div className="p-5 border-t border-border flex flex-wrap gap-3">
           {onDelete && (
             <Button
               onClick={onDelete}
@@ -302,7 +302,7 @@ export function EventEditModal({
           </Button>
           <Button
             onClick={handleSave}
-            className={`rounded-xl px-8 ${isConflict ? "bg-destructive hover:bg-destructive/90" : ""}`}
+            className={`min-w-[124px] rounded-xl px-4 whitespace-nowrap ${isConflict ? "bg-destructive hover:bg-destructive/90" : ""}`}
             disabled={!formData.title.trim() || !formData.startTime || !formData.endTime}
           >
             {isConflict ? "Save Anyway" : "Save Changes"}

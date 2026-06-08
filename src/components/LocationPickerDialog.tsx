@@ -128,6 +128,23 @@ function firstCandidatePoint(candidates: GeocodeCandidate[] = []): MapPoint | nu
   return null;
 }
 
+function candidateTitle(candidate?: GeocodeCandidate | null): string {
+  return candidate?.label || candidate?.display_name || candidate?.address || "Pinned map point";
+}
+
+function candidateSubtitle(candidate?: GeocodeCandidate | null): string {
+  if (!candidate) return "Choose from saved/recent places, search, or click the map.";
+  return candidate.address && candidate.address !== candidate.display_name
+    ? candidate.address
+    : candidate.display_name || "Exact map point selected";
+}
+
+function selectedLocationSubtitle(hasSelection: boolean, candidate?: GeocodeCandidate | null): string {
+  if (!hasSelection) return candidateSubtitle(null);
+  if (!candidate) return "Manual map pin selected.";
+  return candidateSubtitle(candidate);
+}
+
 export function LocationPickerDialog({
   open,
   onOpenChange,
@@ -183,7 +200,7 @@ export function LocationPickerDialog({
     setSearchResults(safeCandidates);
     setSearchQuery(initialSearchQuery);
     setNotice(null);
-    setHasUserPickedLocation(false);
+    setHasUserPickedLocation(Boolean(initialCandidate || initialPin));
     setShowSavedLocations(false);
     setShowRecentLocations(false);
   }, [safeCandidates, initialCenter, initialPin, initialSearchQuery, open, savedCandidates, recentCandidates]);
@@ -192,6 +209,8 @@ export function LocationPickerDialog({
     setPin(point);
     setSelectedCandidate(null);
     setHasUserPickedLocation(true);
+    setShowSavedLocations(false);
+    setShowRecentLocations(false);
     setNotice(referenceLabel ? `Pin selected near ${referenceLabel}.` : (label ? `Pin selected for ${label}.` : "Pin selected on the map."));
   };
 
@@ -218,6 +237,8 @@ export function LocationPickerDialog({
           source: "device_location_pin",
         });
         setHasUserPickedLocation(true);
+        setShowSavedLocations(false);
+        setShowRecentLocations(false);
         setReferenceLabel("your current location");
         setNotice("Centered on your current location. Adjust the pin if needed before confirming.");
       },
@@ -268,6 +289,8 @@ export function LocationPickerDialog({
     setSelectedCandidate(candidate);
     setReferenceLabel(candidate.display_name || candidate.address || null);
     setHasUserPickedLocation(true);
+    setShowSavedLocations(false);
+    setShowRecentLocations(false);
     setNotice(`Pin moved to ${candidate.display_name || candidate.address || "the selected result"}.`);
   };
 
@@ -297,7 +320,7 @@ export function LocationPickerDialog({
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
-        className="max-w-3xl rounded-3xl"
+        className="max-w-3xl rounded-2xl overflow-visible"
         hideCloseButton
         style={{
           position: "fixed",
@@ -306,88 +329,117 @@ export function LocationPickerDialog({
           transform: "translate(-50%, -50%)",
           zIndex: 80,
           maxHeight: "92vh",
-          overflowY: "auto",
         }}
       >
-        <DialogHeader>
+        <DialogHeader className="space-y-1">
           <DialogTitle>{title}</DialogTitle>
           <DialogDescription>
             {description || `Search nearby, use your current location, or click the exact place for ${label || "this location"}.`}
           </DialogDescription>
         </DialogHeader>
 
-        {savedCandidates.length > 0 && (
-          <div className="rounded-2xl border border-border bg-secondary/10">
-            <button
-              type="button"
-              className="flex w-full items-center justify-between gap-2 px-3 py-2 text-left text-xs font-medium"
-              onClick={() => setShowSavedLocations(value => !value)}
-            >
-              <span>Saved locations ({savedCandidates.length})</span>
-              <ChevronDown className={`h-4 w-4 transition-transform ${showSavedLocations ? "rotate-180" : ""}`} />
-            </button>
-            {showSavedLocations && (
-              <div className="max-h-32 space-y-1 overflow-y-auto border-t border-border/70 p-2">
-                {savedCandidates.map((candidate, index) => (
-                  <button
-                    type="button"
-                    key={`${candidate.label || candidate.display_name}-${candidate.latitude}-${candidate.longitude}-${index}`}
-                    className="flex w-full items-start gap-2 rounded-xl px-2 py-1.5 text-left text-xs hover:bg-background"
-                    onClick={() => handleSelectCandidate(candidate)}
+        <div className="rounded-2xl border border-border bg-background px-4 py-3">
+          <p className="mb-2 text-sm font-semibold text-primary">Selected location</p>
+          <div className="flex min-w-0 items-start gap-3">
+            <MapPin className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
+            <div className="min-w-0">
+              <p className="truncate text-sm font-semibold text-foreground">
+                {hasUserPickedLocation ? candidateTitle(selectedCandidate) : "No exact location selected"}
+              </p>
+              <p className="truncate text-xs text-muted-foreground">
+                {selectedLocationSubtitle(hasUserPickedLocation, selectedCandidate)}
+              </p>
+            </div>
+          </div>
+        </div>
+
+        {(savedCandidates.length > 0 || recentCandidates.length > 0) && (
+          <div className="relative z-[900] grid h-9 grid-cols-2 gap-2 overflow-visible" style={{ zIndex: 9000 }}>
+            {savedCandidates.length > 0 && (
+              <div>
+                <button
+                  type="button"
+                  className="flex h-9 w-full items-center justify-between gap-2 rounded-xl border border-border bg-secondary/10 px-3 text-left text-xs font-medium"
+                  onClick={() => {
+                    setShowSavedLocations(value => !value);
+                    setShowRecentLocations(false);
+                  }}
+                >
+                  <span className="truncate">Saved locations ({savedCandidates.length})</span>
+                  <ChevronDown className={`h-4 w-4 shrink-0 transition-transform ${showSavedLocations ? "rotate-180" : ""}`} />
+                </button>
+                {showSavedLocations && (
+                  <div
+                    className="absolute left-0 top-[calc(100%+6px)] z-[1000] max-h-52 w-[calc(50%-0.25rem)] space-y-1 overflow-y-auto rounded-2xl border border-border bg-card p-2 shadow-2xl"
+                    style={{ zIndex: 10000 }}
                   >
-                    <MapPin className="mt-0.5 h-3.5 w-3.5 shrink-0 text-primary" />
-                    <span className="min-w-0">
-                      <span className="block truncate font-medium text-foreground">
-                        {candidate.label || candidate.display_name || "Saved location"}
-                      </span>
-                      <span className="block truncate text-muted-foreground">
-                        {candidate.address || candidate.display_name || "Confirmed saved place"}
-                      </span>
-                    </span>
-                  </button>
-                ))}
+                    {savedCandidates.map((candidate, index) => (
+                      <button
+                        type="button"
+                        key={`${candidate.label || candidate.display_name}-${candidate.latitude}-${candidate.longitude}-${index}`}
+                        className="flex w-full items-start gap-2 rounded-xl px-2 py-1.5 text-left text-xs hover:bg-secondary"
+                        onClick={() => handleSelectCandidate(candidate)}
+                      >
+                        <MapPin className="mt-0.5 h-3.5 w-3.5 shrink-0 text-primary" />
+                        <span className="min-w-0">
+                          <span className="block truncate font-medium text-foreground">
+                            {candidate.label || candidate.display_name || "Saved location"}
+                          </span>
+                          <span className="block truncate text-muted-foreground">
+                            {candidate.address || candidate.display_name || "Confirmed saved place"}
+                          </span>
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {recentCandidates.length > 0 && (
+              <div>
+                <button
+                  type="button"
+                  className="flex h-9 w-full items-center justify-between gap-2 rounded-xl border border-border bg-secondary/10 px-3 text-left text-xs font-medium"
+                  onClick={() => {
+                    setShowRecentLocations(value => !value);
+                    setShowSavedLocations(false);
+                  }}
+                >
+                  <span className="truncate">Recent locations ({recentCandidates.length})</span>
+                  <ChevronDown className={`h-4 w-4 shrink-0 transition-transform ${showRecentLocations ? "rotate-180" : ""}`} />
+                </button>
+                {showRecentLocations && (
+                  <div
+                    className="absolute right-0 top-[calc(100%+6px)] z-[1000] max-h-52 w-[calc(50%-0.25rem)] space-y-1 overflow-y-auto rounded-2xl border border-border bg-card p-2 shadow-2xl"
+                    style={{ zIndex: 10000 }}
+                  >
+                    {recentCandidates.map((candidate, index) => (
+                      <button
+                        type="button"
+                        key={`${candidate.label || candidate.display_name}-${candidate.latitude}-${candidate.longitude}-${index}`}
+                        className="flex w-full items-start gap-2 rounded-xl px-2 py-1.5 text-left text-xs hover:bg-secondary"
+                        onClick={() => handleSelectCandidate({ ...candidate, source: candidate.source || "recent" })}
+                      >
+                        <MapPin className="mt-0.5 h-3.5 w-3.5 shrink-0 text-primary" />
+                        <span className="min-w-0">
+                          <span className="block truncate font-medium text-foreground">
+                            {candidate.label || candidate.display_name || "Recent location"}
+                          </span>
+                          <span className="block truncate text-muted-foreground">
+                            {candidate.address || candidate.display_name || "Recently used place"}
+                          </span>
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                )}
               </div>
             )}
           </div>
         )}
 
-        {recentCandidates.length > 0 && (
-          <div className="rounded-2xl border border-border bg-secondary/10">
-            <button
-              type="button"
-              className="flex w-full items-center justify-between gap-2 px-3 py-2 text-left text-xs font-medium"
-              onClick={() => setShowRecentLocations(value => !value)}
-            >
-              <span>Recent locations ({recentCandidates.length})</span>
-              <ChevronDown className={`h-4 w-4 transition-transform ${showRecentLocations ? "rotate-180" : ""}`} />
-            </button>
-            {showRecentLocations && (
-              <div className="max-h-32 space-y-1 overflow-y-auto border-t border-border/70 p-2">
-                {recentCandidates.map((candidate, index) => (
-                  <button
-                    type="button"
-                    key={`${candidate.label || candidate.display_name}-${candidate.latitude}-${candidate.longitude}-${index}`}
-                    className="flex w-full items-start gap-2 rounded-xl px-2 py-1.5 text-left text-xs hover:bg-background"
-                    onClick={() => handleSelectCandidate({ ...candidate, source: candidate.source || "recent" })}
-                  >
-                    <MapPin className="mt-0.5 h-3.5 w-3.5 shrink-0 text-primary" />
-                    <span className="min-w-0">
-                      <span className="block truncate font-medium text-foreground">
-                        {candidate.label || candidate.display_name || "Recent location"}
-                      </span>
-                      <span className="block truncate text-muted-foreground">
-                        {candidate.address || candidate.display_name || "Recently used place"}
-                      </span>
-                    </span>
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
-
-        <div className="rounded-2xl border border-border bg-secondary/10 p-3">
-          <p className="mb-2 text-xs font-medium">Search new location</p>
+        <div className="rounded-2xl border border-border bg-secondary/10 p-2.5">
           <div className="flex flex-col gap-2 sm:flex-row">
             <Input
               value={searchQuery}
@@ -399,12 +451,13 @@ export function LocationPickerDialog({
                 }
               }}
               placeholder="Search a nearby landmark or address"
-              className="rounded-xl bg-background"
+              className="h-9 rounded-xl bg-background"
             />
             <Button
               type="button"
               variant="outline"
-              className="rounded-xl bg-background"
+              size="sm"
+              className="h-9 rounded-xl bg-background"
               disabled={!searchQuery.trim() || isSearching}
               onClick={handleSearch}
             >
@@ -414,7 +467,8 @@ export function LocationPickerDialog({
             <Button
               type="button"
               variant="outline"
-              className="rounded-xl bg-background"
+              size="sm"
+              className="h-9 rounded-xl bg-background"
               onClick={handleUseDeviceLocation}
             >
               <Crosshair className="mr-2 h-4 w-4" />
@@ -423,13 +477,7 @@ export function LocationPickerDialog({
           </div>
         </div>
 
-        {notice && (
-          <div className="rounded-xl border border-primary/15 bg-primary/5 px-3 py-2 text-xs text-muted-foreground">
-            {notice}
-          </div>
-        )}
-
-        {searchResults.length > 0 && (
+        {!hasUserPickedLocation && searchResults.length > 0 && (
           <div className="max-h-28 space-y-1 overflow-y-auto rounded-2xl border border-border bg-secondary/10 p-2">
             {searchResults.slice(0, 8).map((candidate, index) => (
               <button
@@ -452,13 +500,13 @@ export function LocationPickerDialog({
           </div>
         )}
 
-        <div className="overflow-hidden rounded-2xl border border-border">
+        <div className="location-picker-map relative z-0 overflow-hidden rounded-2xl border border-border">
           <MapContainer
             center={[center.lat, center.lng]}
             zoom={16}
             scrollWheelZoom
-            className="w-full"
-            style={{ height: 420, width: "100%", zIndex: 1 }}
+            className="location-picker-map w-full"
+            style={{ height: 320, width: "100%", zIndex: 0 }}
           >
             <TileLayer
               attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
@@ -473,27 +521,28 @@ export function LocationPickerDialog({
           </MapContainer>
         </div>
 
-        <p className="text-xs text-muted-foreground">
-          Tip: zoom in and click the building entrance or closest point you want JPlan to use for travel timing.
-        </p>
-
-        <DialogFooter>
-          <Button
-            variant="outline"
-            className="rounded-xl"
-            onClick={() => onOpenChange(false)}
-            disabled={saving}
-          >
-            Cancel
-          </Button>
-          <Button
-            className="rounded-xl"
-            onClick={handleConfirm}
-            disabled={!pin || !hasUserPickedLocation || saving}
-          >
-            {saving ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Check className="mr-2 h-4 w-4" />}
-            {confirmLabel}
-          </Button>
+        <DialogFooter className="items-center gap-2 sm:justify-between">
+          <p className="max-w-md text-xs text-muted-foreground">
+            Click the exact building entrance or closest point, then save.
+          </p>
+          <div className="flex shrink-0 gap-2">
+            <Button
+              variant="outline"
+              className="rounded-xl"
+              onClick={() => onOpenChange(false)}
+              disabled={saving}
+            >
+              Cancel
+            </Button>
+            <Button
+              className="rounded-xl"
+              onClick={handleConfirm}
+              disabled={!pin || !hasUserPickedLocation || saving}
+            >
+              {saving ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Check className="mr-2 h-4 w-4" />}
+              {confirmLabel}
+            </Button>
+          </div>
         </DialogFooter>
       </DialogContent>
     </Dialog>

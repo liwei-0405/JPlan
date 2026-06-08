@@ -368,7 +368,7 @@ export function PlanningInputPage({
   const [activityLocation, setActivityLocation] = useState("");
   const [manualResolvedLocation, setManualResolvedLocation] = useState<ResolvedLocationSnapshot | null>(null);
   const [isManualLocationPickerOpen, setIsManualLocationPickerOpen] = useState(false);
-  const [manualActivityType, setManualActivityType] = useState<"activity" | "travel" | "buffer">("activity");
+  const [manualActivityType, setManualActivityType] = useState<"activity" | "buffer">("activity");
   const [isConflict, setIsConflict] = useState(false);
 
   // Chat state
@@ -639,16 +639,18 @@ export function PlanningInputPage({
 
   const handleAddManualActivity = () => {
     if (isScheduleBusy) return;
-    if (!activityName.trim() || !activityTime.trim()) return;
+    if (manualActivityType === "activity" && !activityName.trim()) return;
+    if (!activityTime.trim()) return;
 
     const formattedStartTime = formatTo12Hour(activityTime);
     // standardize duration display for example "1" -> "1 hour"
-    const displayDuration = activityDuration.includes('h') || activityDuration.includes('m')
-      ? activityDuration
-      : `${activityDuration} hour`;
+    const rawDuration = activityDuration.trim() || (manualActivityType === "buffer" ? "5m" : "1h");
+    const displayDuration = rawDuration.includes('h') || rawDuration.includes('m')
+      ? rawDuration
+      : `${rawDuration} hour`;
 
     const newStartTimeMins = timeToMinutes(formattedStartTime);
-    const endTimeStr = calculateEndTime(activityTime, activityDuration);
+    const endTimeStr = calculateEndTime(activityTime, rawDuration);
     let newEndTimeMins = timeToMinutes(endTimeStr);
 
     // Handle overnight activity (e.g. 11 PM to 1 AM)
@@ -678,10 +680,12 @@ export function PlanningInputPage({
     }
 
     const pickedLocationName = manualResolvedLocation?.display_name || manualResolvedLocation?.address;
+    const manualTitle = manualActivityType === "buffer" ? "Buffer" : activityName.trim();
     const newActivity: ActivityBlock = {
       id: Date.now().toString(),
       type: manualActivityType,
-      title: activityName,
+      block_type: manualActivityType,
+      title: manualTitle,
       startTime: formattedStartTime,
       endTime: endTimeStr,
       duration: displayDuration,
@@ -1874,7 +1878,7 @@ export function PlanningInputPage({
 
   return (
     <div className="min-h-screen bg-gradient-to-b from-background to-secondary/10">
-      <div className="max-w-7xl mx-auto px-6 py-8">
+      <div className="max-w-7xl mx-auto px-6 py-6">
         <Button
           variant="ghost"
           onClick={() => {
@@ -1886,7 +1890,7 @@ export function PlanningInputPage({
               onBack();
             }
           }}
-          className="mb-8 rounded-xl"
+          className="mb-5 rounded-xl"
         >
           <ArrowLeft className="mr-2 h-4 w-4" />
           Back to Dashboard
@@ -1917,7 +1921,7 @@ export function PlanningInputPage({
           {/* Left: Live Schedule Preview */}
           <div
             className="flex min-h-0 flex-col overflow-hidden rounded-2xl border border-border bg-card shadow-sm"
-            style={{ height: "550px", maxHeight: "550px" }}
+            style={{ height: "clamp(680px, calc(100vh - 260px), 760px)", maxHeight: "760px" }}
           >
             <div className="p-5 border-b bg-secondary/10 flex justify-between items-start gap-4">
               <div className="min-w-0 flex-1">
@@ -2030,12 +2034,12 @@ export function PlanningInputPage({
                   </Button>
                 )}
                 {hasGoogleEvents && (
-                  <div className="flex rounded-xl border border-border bg-background p-0.5">
+                  <div className="grid w-36 grid-cols-2 rounded-xl border border-border bg-background p-0.5">
                     <Button
                       type="button"
                       variant={calendarView === "jplan" ? "default" : "ghost"}
                       size="sm"
-                      className="h-7 rounded-lg px-2 text-xs"
+                      className="h-7 w-full rounded-lg px-0 text-xs"
                       onClick={() => setCalendarView("jplan")}
                       disabled={isScheduleBusy}
                     >
@@ -2045,7 +2049,7 @@ export function PlanningInputPage({
                       type="button"
                       variant={calendarView === "google_calendar" ? "default" : "ghost"}
                       size="sm"
-                      className="h-7 rounded-lg px-2 text-xs"
+                      className="h-7 w-full rounded-lg px-0 text-xs"
                       onClick={() => setCalendarView("google_calendar")}
                       disabled={isScheduleBusy}
                     >
@@ -2084,7 +2088,7 @@ export function PlanningInputPage({
           {/* RIGHT: Control Panel (5 Columns) */}
           <div
             className="grid min-h-0 gap-3 overflow-hidden"
-            style={{ height: "550px", maxHeight: "550px", gridTemplateRows: "auto minmax(0, 1fr)" }}
+            style={{ height: "clamp(680px, calc(100vh - 260px), 760px)", maxHeight: "760px", gridTemplateRows: "auto minmax(0, 1fr) auto auto" }}
           >
 
             {/* Mode Switcher */}
@@ -2411,7 +2415,7 @@ export function PlanningInputPage({
                   <div className="space-y-4">
                     <div className="space-y-1.5">
                       <Label>Block Type</Label>
-                      <div className="grid grid-cols-3 gap-2">
+                      <div className="grid grid-cols-2 gap-2">
                         <Button
                           variant={manualActivityType === "activity" ? "default" : "outline"}
                           size="sm"
@@ -2423,19 +2427,6 @@ export function PlanningInputPage({
                           className="rounded-xl text-xs"
                         >
                           Activity
-                        </Button>
-                        <Button
-                          variant={manualActivityType === "travel" ? "default" : "outline"}
-                          size="sm"
-                          disabled={isScheduleBusy}
-                          onClick={() => {
-                            setManualActivityType("travel");
-                            setActivityLocation("");
-                            setManualResolvedLocation(null);
-                          }}
-                          className="rounded-xl text-xs"
-                        >
-                          Travel
                         </Button>
                         <Button
                           variant={manualActivityType === "buffer" ? "default" : "outline"}
@@ -2453,18 +2444,18 @@ export function PlanningInputPage({
                       </div>
                     </div>
 
-                    <div className="space-y-1.5">
-                      <Label className={isConflict ? "text-destructive" : ""}>
-                        {manualActivityType === "activity" ? "Activity Name" : "Block Label"}
-                      </Label>
-                      <Input
-                        value={activityName}
-                        disabled={isScheduleBusy}
-                        onChange={e => { setActivityName(e.target.value); setIsConflict(false); }}
-                        placeholder={manualActivityType === "activity" ? "Meeting, Gym..." : "Travel, Break..."}
-                        className={`rounded-xl ${isConflict ? "border-destructive focus-visible:ring-destructive" : ""}`}
-                      />
-                    </div>
+                    {manualActivityType === "activity" && (
+                      <div className="space-y-1.5">
+                        <Label className={isConflict ? "text-destructive" : ""}>Activity Name</Label>
+                        <Input
+                          value={activityName}
+                          disabled={isScheduleBusy}
+                          onChange={e => { setActivityName(e.target.value); setIsConflict(false); }}
+                          placeholder="Meeting, Gym..."
+                          className={`rounded-xl ${isConflict ? "border-destructive focus-visible:ring-destructive" : ""}`}
+                        />
+                      </div>
+                    )}
                     <div className="grid grid-cols-2 gap-3">
                       <div className="space-y-1.5">
                         <Label className={isConflict ? "text-destructive" : ""}>Start Time</Label>
@@ -2538,12 +2529,12 @@ export function PlanningInputPage({
                     <Button
                       onClick={handleAddManualActivity}
                       className={`w-full rounded-xl gap-2 mt-4 ${isConflict ? "bg-destructive hover:bg-destructive/90 animate-pulse" : ""}`}
-                      disabled={isScheduleBusy || ((!activityName || !activityTime) && !isConflict)}
+                      disabled={isScheduleBusy || ((manualActivityType === "activity" && !activityName.trim()) || !activityTime.trim())}
                     >
                       {isConflict ? (
                         <>Conflict Detected</>
                       ) : (
-                        <><Plus size={18} /> Add to Schedule</>
+                        <><Plus size={18} /> {manualActivityType === "buffer" ? "Add Buffer" : "Add to Schedule"}</>
                       )}
                     </Button>
                   </div>

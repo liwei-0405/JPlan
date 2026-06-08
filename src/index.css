@@ -467,6 +467,22 @@
     background: var(--primary);
     opacity: 0.5;
   }
+
+  .location-picker-map,
+  .location-picker-map .leaflet-container,
+  .location-picker-map .leaflet-map-pane,
+  .location-picker-map .leaflet-pane,
+  .location-picker-map .leaflet-tile-pane,
+  .location-picker-map .leaflet-overlay-pane,
+  .location-picker-map .leaflet-shadow-pane,
+  .location-picker-map .leaflet-marker-pane,
+  .location-picker-map .leaflet-tooltip-pane,
+  .location-picker-map .leaflet-popup-pane,
+  .location-picker-map .leaflet-control-container,
+  .location-picker-map .leaflet-top,
+  .location-picker-map .leaflet-bottom {
+    z-index: 0 !important;
+  }
 }
 
 @layer utilities {
