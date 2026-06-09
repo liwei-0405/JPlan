@@ -657,10 +657,7 @@ def apply_calendar_sync(
         for event in buckets["external"] + buckets["jplan_created"]
         if not is_support_like(event)
     ]
-    synced["external_calendar_events"] = _upsert_external_events(
-        _list(synced.get("external_calendar_events")),
-        external_events,
-    )
+    synced["external_calendar_events"] = external_events
     if not had_jplan_state_before_sync and external_events:
         synced["activities"] = [_canonical_activity_from_external(event) for event in external_events]
         synced["active_view"] = "jplan"

@@ -28,6 +28,12 @@ const formatLocalDate = (date: Date) => {
   return `${yyyy}-${mm}-${dd}`;
 };
 
+const addDays = (date: Date, days: number) => {
+  const next = new Date(date);
+  next.setDate(next.getDate() + days);
+  return next;
+};
+
 export function TopNav({ 
   onSettingsClick, 
   showSyncButton = true, 
@@ -66,10 +72,13 @@ export function TopNav({
     if (!profile?.id) return;
 
     // Get target date
-    const todayStr = formatLocalDate(new Date());
+    const today = new Date();
+    const todayStr = formatLocalDate(today);
+    const defaultRangeEnd = formatLocalDate(addDays(today, 60));
     const targetDate = syncDate || todayStr;
+    const importRangeLabel = `${todayStr} to ${defaultRangeEnd}`;
 
-    const syncToast = toast.loading(`Importing Google Calendar data for ${targetDate}...`);
+    const syncToast = toast.loading(`Importing Google Calendar data for ${importRangeLabel}...`);
 
     try {
       const response = await fetch(apiUrl('/api/sync-calendar'), {
@@ -102,8 +111,12 @@ export function TopNav({
 
       const syncedDayCount = Array.isArray(data.synced_days) ? data.synced_days.length : 0;
       const targetEventCount = Array.isArray(data.events) ? data.events.length : 0;
+      const range = data.sync_range;
+      const rangeLabel = range?.start && range?.end
+        ? `${range.start} to ${range.end}`
+        : importRangeLabel;
       toast.success(
-        `Imported Google Calendar data into the external layer for ${syncedDayCount || "upcoming"} day${syncedDayCount === 1 ? "" : "s"}. ${targetEventCount} event${targetEventCount === 1 ? "" : "s"} are available for this date; open View Full Schedule to import selected events.`,
+        `Updated Google Calendar external layer for ${rangeLabel}. ${syncedDayCount || 0} day${syncedDayCount === 1 ? "" : "s"} refreshed; ${targetEventCount} event${targetEventCount === 1 ? "" : "s"} are available for ${targetDate}. Open View Full Schedule to import selected events.`,
         {
         id: syncToast,
         duration: 7000

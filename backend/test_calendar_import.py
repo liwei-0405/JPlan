@@ -86,6 +86,29 @@ def test_jplan_and_google_day_does_not_auto_merge():
     assert [item["title"] for item in synced["external_calendar_events"]] == ["Dentist"]
 
 
+def test_calendar_sync_replaces_external_layer_snapshot_for_date():
+    schedule = {
+        "date": "2026-05-26",
+        "activities": [{"id": "act-work", "stable_activity_id": "act-work", "title": "Focused work"}],
+        "schedule_blocks": [],
+        "committed_schedule_blocks": [],
+        "external_calendar_events": [
+            {"id": "gcal-external-1", "google_event_id": "external-1", "title": "Old Dentist"},
+            {"id": "gcal-stale-1", "google_event_id": "stale-1", "title": "Deleted Google event"},
+        ],
+        "sync_links": [],
+    }
+
+    synced = apply_calendar_sync(
+        schedule,
+        [google_event("external-1", "Dentist updated")],
+        date="2026-05-26",
+    )
+
+    assert [item["title"] for item in synced["activities"]] == ["Focused work"]
+    assert [item["title"] for item in synced["external_calendar_events"]] == ["Dentist updated"]
+
+
 def test_linked_jplan_calendar_events_do_not_materialize_orphan_committed_blocks():
     schedule = {
         "date": "2026-06-09",
