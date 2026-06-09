@@ -21,7 +21,7 @@ type TopNavProps = {
   syncDate?: string;
 };
 
-const APP_VERSION = "v2026.06.09-1";
+const APP_VERSION = "v2026.06.09-2";
 
 const formatLocalDate = (date: Date) => {
   const yyyy = date.getFullYear();
@@ -117,11 +117,14 @@ export function TopNav({
       const rangeLabel = range?.start && range?.end
         ? `${range.start} to ${range.end}`
         : importRangeLabel;
-      toast.success(
-        `Updated Google Calendar external layer for ${rangeLabel}. ${syncedDayCount || 0} day${syncedDayCount === 1 ? "" : "s"} refreshed; ${targetEventCount} event${targetEventCount === 1 ? "" : "s"} are available for ${targetDate}. Open View Full Schedule to import selected events.`,
+      const foundNoEvents = syncedDayCount === 0 && targetEventCount === 0;
+      toast[foundNoEvents ? "info" : "success"](
+        foundNoEvents
+          ? `No Google Calendar events found from ${rangeLabel}. Nothing was imported for ${targetDate}.`
+          : `Updated Google Calendar external layer for ${rangeLabel}. ${syncedDayCount} day${syncedDayCount === 1 ? "" : "s"} refreshed; ${targetEventCount} event${targetEventCount === 1 ? "" : "s"} are available for ${targetDate}. Open View Full Schedule to import selected events.`,
         {
-        id: syncToast,
-        duration: 7000
+          id: syncToast,
+          duration: foundNoEvents ? 5000 : 7000,
         }
       );
 

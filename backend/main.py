@@ -1165,29 +1165,22 @@ async def sync_calendar(request: Dict[str, Any]):
     try:
         # 1. Fetch upcoming from Google (next 60 days)
         days_ahead = 60
-        grouped_events = cal_service.sync_upcoming_events(user_id, days_ahead=days_ahead)
-        today = datetime.utcnow().date()
-        sync_start = today.isoformat()
-        sync_end = (today + timedelta(days=days_ahead)).isoformat()
+        sync_start_date = datetime.fromisoformat(date).date() if date else datetime.utcnow().date()
+        grouped_events = cal_service.sync_upcoming_events(user_id, days_ahead=days_ahead, start_date=sync_start_date.isoformat())
+        sync_start = sync_start_date.isoformat()
+        sync_end = (sync_start_date + timedelta(days=days_ahead)).isoformat()
         
         if not grouped_events:
             target_plan = None
             if date:
-                existing_plan = database.get_plan_by_date(date, user_id) or {
-                    "date": date,
-                    "activities": [],
-                    "schedule_blocks": [],
-                    "committed_schedule_blocks": [],
-                    "external_calendar_events": [],
-                    "sync_links": [],
-                    "active_view": "jplan",
-                }
-                target_plan = apply_calendar_sync(existing_plan, [], date=date)
-                database.save_plan_from_envelope(target_plan, user_id)
+                existing_plan = database.get_plan_by_date(date, user_id)
+                if existing_plan is not None:
+                    target_plan = apply_calendar_sync(existing_plan, [], date=date)
+                    database.save_plan_from_envelope(target_plan, user_id)
             return {
                 "events": [],
                 "message": "No upcoming events found",
-                "synced_days": [date] if date else [],
+                "synced_days": [date] if target_plan else [],
                 "plan": target_plan,
                 "sync_range": {
                     "start": sync_start,
@@ -1221,19 +1214,12 @@ async def sync_calendar(request: Dict[str, Any]):
                 target_date_events = updated_plan.get("external_calendar_events") or []
 
         if date and date not in grouped_events:
-            existing_plan = database.get_plan_by_date(date, user_id) or {
-                "date": date,
-                "activities": [],
-                "schedule_blocks": [],
-                "committed_schedule_blocks": [],
-                "external_calendar_events": [],
-                "sync_links": [],
-                "active_view": "jplan",
-            }
-            target_plan = apply_calendar_sync(existing_plan, [], date=date)
-            database.save_plan_from_envelope(target_plan, user_id)
-            target_date_events = []
-            all_synced_days.append(date)
+            existing_plan = database.get_plan_by_date(date, user_id)
+            if existing_plan is not None:
+                target_plan = apply_calendar_sync(existing_plan, [], date=date)
+                database.save_plan_from_envelope(target_plan, user_id)
+                target_date_events = []
+                all_synced_days.append(date)
 
         return {
             "synced_days": all_synced_days,

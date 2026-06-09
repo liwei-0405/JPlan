@@ -568,7 +568,12 @@ class CalendarService:
         except Exception as e:
             _calendar_log(f"Sync failed for user {user_id}: {e}", "ERROR")
             return []
-    def sync_upcoming_events(self, user_id: str, days_ahead: int = 60) -> Dict[str, List[Dict[str, Any]]]:
+    def sync_upcoming_events(
+        self,
+        user_id: str,
+        days_ahead: int = 60,
+        start_date: Optional[str] = None,
+    ) -> Dict[str, List[Dict[str, Any]]]:
         """
         Fetch all events from now to X days in the future and group by date
         """
@@ -593,10 +598,16 @@ class CalendarService:
                     raise e
                 return {}
 
-            # 3. Time range
-            now = datetime.utcnow()
-            time_min = now.isoformat() + "Z"
-            time_max = (now + timedelta(days=days_ahead)).isoformat() + "Z"
+            # 3. Time range. Start from the beginning of the selected/local day
+            # instead of "now" so importing today's calendar does not miss
+            # already-started events.
+            if start_date:
+                range_start = datetime.fromisoformat(start_date) - timedelta(hours=14)
+            else:
+                range_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(hours=14)
+            range_end = range_start + timedelta(days=days_ahead, hours=38)
+            time_min = range_start.isoformat() + "Z"
+            time_max = range_end.isoformat() + "Z"
             
             _calendar_debug(f"Fetching future events from {time_min} to {time_max}")
 
