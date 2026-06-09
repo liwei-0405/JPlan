@@ -21,6 +21,8 @@ type TopNavProps = {
   syncDate?: string;
 };
 
+const APP_VERSION = "v2026.06.09-1";
+
 const formatLocalDate = (date: Date) => {
   const yyyy = date.getFullYear();
   const mm = String(date.getMonth() + 1).padStart(2, "0");
@@ -147,7 +149,7 @@ export function TopNav({
         <div className="flex items-center gap-2">
           <h3 className="text-xl font-bold text-primary">JPlan</h3>
           <span className="text-[10px] px-2 py-0.5 rounded-full bg-primary/10 text-primary font-medium uppercase tracking-wider">
-            {isAdmin ? 'Admin' : 'Beta'}
+            {isAdmin ? 'Admin' : 'Beta'} <span className="text-[8px] font-semibold opacity-70">{APP_VERSION}</span>
           </span>
         </div>
 

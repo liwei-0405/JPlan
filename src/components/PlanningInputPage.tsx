@@ -405,7 +405,6 @@ export function PlanningInputPage({
   const [manualActivityType, setManualActivityType] = useState<"activity" | "buffer">("activity");
   const [manualTimingMode, setManualTimingMode] = useState<"fixed" | "flexible">("fixed");
   const [isConflict, setIsConflict] = useState(false);
-  const [planningInfoOpen, setPlanningInfoOpen] = useState(false);
 
   // Chat state
   const [chatInput, setChatInput] = useState("");
@@ -2175,24 +2174,18 @@ export function PlanningInputPage({
                   <Settings2 size={16} /> Manual Mode
                 </Button>
               </div>
-              <Tooltip open={planningInfoOpen} onOpenChange={setPlanningInfoOpen}>
-                <TooltipTrigger asChild>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon"
-                    className="h-9 w-9 rounded-full"
-                    disabled={isScheduleBusy}
-                    aria-label="Planning mode information"
-                    onClick={() => setPlanningInfoOpen((open) => !open)}
-                  >
-                    <Info className="h-4 w-4 text-muted-foreground" />
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent className="max-w-xs text-xs">
-                  Switch between AI chat and manual edits anytime. This page stays as a draft until you save, and manual changes are preserved.
-                </TooltipContent>
-              </Tooltip>
+              <TapTooltip content="Switch modes anytime. Your plan stays as a draft until saved.">
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  className="h-9 w-9 rounded-full"
+                  disabled={isScheduleBusy}
+                  aria-label="Planning mode information"
+                >
+                  <Info className="h-4 w-4 text-muted-foreground" />
+                </Button>
+              </TapTooltip>
             </div>
 
             {/* Dynamic Content Area */}
@@ -2810,8 +2803,6 @@ function CompactPlanningToggle({
   tooltip: string;
   ariaLabel: string;
 }) {
-  const [tooltipOpen, setTooltipOpen] = useState(false);
-
   return (
     <div
       className={`inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs shadow-sm transition-colors ${
@@ -2828,26 +2819,58 @@ function CompactPlanningToggle({
         aria-label={ariaLabel}
         className="scale-75"
       />
-      <Tooltip open={tooltipOpen} onOpenChange={setTooltipOpen}>
-        <TooltipTrigger asChild>
+      <TapTooltip content={tooltip}>
           <button
             type="button"
             className="inline-flex h-5 w-5 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-50"
             disabled={disabled}
             aria-label={`${label} help`}
-            onClick={(event) => {
-              event.preventDefault();
-              setTooltipOpen((open) => !open);
-            }}
           >
             <Info className="h-3.5 w-3.5" />
           </button>
-        </TooltipTrigger>
-        <TooltipContent className="max-w-xs text-xs">
-          {tooltip}
-        </TooltipContent>
-      </Tooltip>
+      </TapTooltip>
     </div>
+  );
+}
+
+function TapTooltip({
+  children,
+  content,
+}: {
+  children: React.ReactElement;
+  content: React.ReactNode;
+}) {
+  const [open, setOpen] = useState(false);
+  const trigger = (
+    <span
+      className="inline-flex"
+      onPointerDown={(event) => {
+        if (event.pointerType === "mouse") return;
+        event.preventDefault();
+        setOpen((current) => !current);
+      }}
+      onClick={(event) => {
+        event.preventDefault();
+        setOpen((current) => !current);
+      }}
+    >
+      {children}
+    </span>
+  );
+
+  return (
+    <Tooltip open={open} onOpenChange={setOpen}>
+      <TooltipTrigger asChild>{trigger}</TooltipTrigger>
+      <TooltipContent
+        side="top"
+        align="center"
+        sideOffset={8}
+        collisionPadding={12}
+        className="!w-[min(16rem,calc(100vw-2rem))] !max-w-[calc(100vw-2rem)] whitespace-normal break-words text-left text-xs leading-relaxed"
+      >
+        {content}
+      </TooltipContent>
+    </Tooltip>
   );
 }
 
