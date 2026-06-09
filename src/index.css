@@ -483,6 +483,25 @@
   .location-picker-map .leaflet-bottom {
     z-index: 0 !important;
   }
+
+  .location-picker-dialog-content {
+    overflow-y: auto !important;
+    --location-picker-map-height: clamp(180px, 26vh, 260px);
+  }
+
+  .location-picker-dialog-content.has-search-results {
+    --location-picker-map-height: clamp(150px, 20vh, 220px);
+  }
+
+  .location-picker-footer {
+    flex-direction: column;
+    position: sticky;
+    bottom: 0;
+    z-index: 30;
+    margin: 0 -.25rem -.25rem;
+    padding: .5rem .25rem .25rem;
+    background: var(--background);
+  }
 }
 
 @layer utilities {
@@ -2365,5 +2384,329 @@ html {
 @keyframes pulse {
   50% {
     opacity: .5;
+  }
+}
+
+/* JPlan responsive layout polish */
+.calendar-sync-desktop {
+  display: none;
+}
+
+.mobile-sync-menu-item {
+  display: flex;
+}
+
+.jplan-user-menu {
+  background: var(--popover);
+  border: 1px solid var(--border);
+  box-shadow: 0 14px 40px rgb(15 23 42 / 0.16);
+  z-index: 100;
+}
+
+.jplan-entry-page,
+.planning-input-page {
+  overflow-x: hidden;
+}
+
+.entry-content {
+  max-width: 72rem;
+  margin: 0 auto;
+  padding: 2rem 1.5rem;
+}
+
+.entry-header {
+  margin-bottom: 2rem;
+}
+
+.entry-hero-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1.5rem;
+}
+
+.entry-preview-shell {
+  min-width: 0;
+  height: 468px;
+}
+
+.entry-metrics-grid {
+  display: grid;
+  width: 100%;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+  margin-top: 1.5rem;
+}
+
+.jplan-calendar-card {
+  width: 100%;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.jplan-calendar-grid {
+  grid-template-rows: repeat(6, minmax(0, 1fr));
+}
+
+.jplan-calendar-day-cell {
+  min-height: 3.35rem;
+}
+
+.planning-workspace {
+  padding: 1.5rem;
+}
+
+.planning-page-header {
+  margin-bottom: 2rem;
+}
+
+.planning-main-grid {
+  display: grid;
+  min-height: 0;
+  align-items: start;
+  gap: 1.5rem;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.planning-panel,
+.planning-control-column {
+  height: 720px;
+  min-height: 640px;
+}
+
+.planning-live-header {
+  flex-direction: row;
+  align-items: flex-start;
+}
+
+.planning-settings-row {
+  max-width: 100%;
+}
+
+.planning-live-actions {
+  width: auto;
+}
+
+.schedule-actions {
+  flex-direction: row;
+  flex-wrap: wrap;
+}
+
+.schedule-actions > button {
+  width: auto;
+}
+
+@media (min-width: 768px) {
+  .calendar-sync-desktop {
+    display: flex;
+  }
+
+  .mobile-sync-menu-item {
+    display: none;
+  }
+}
+
+@media (max-width: 767px) {
+  .jplan-user-menu {
+    width: min(13.25rem, calc(100vw - 2rem));
+    padding: .25rem;
+    background: var(--popover);
+  }
+
+  .jplan-user-menu [data-slot="dropdown-menu-label"] {
+    padding: .45rem .5rem;
+  }
+
+  .jplan-user-menu [data-slot="dropdown-menu-item"] {
+    min-height: 2rem;
+    padding: .35rem .5rem;
+    font-size: .8125rem;
+    line-height: 1.15rem;
+  }
+
+  .entry-content {
+    padding: 1rem;
+  }
+
+  .entry-header {
+    margin-bottom: 1rem;
+  }
+
+  .entry-hero-grid {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 1rem;
+  }
+
+  .entry-preview-shell {
+    height: min(540px, 70vh);
+    min-height: 420px;
+  }
+
+  .entry-metrics-grid {
+    gap: .75rem;
+    margin-top: 1rem;
+  }
+
+  .jplan-calendar-card {
+    padding: .875rem;
+  }
+
+  .jplan-calendar-day-cell {
+    min-height: 3.25rem;
+  }
+
+  .location-picker-dialog-content {
+    gap: .65rem;
+    max-height: calc(100dvh - 1rem) !important;
+    padding-bottom: .75rem;
+    --location-picker-map-height: clamp(190px, 30vh, 300px);
+  }
+
+  .location-picker-dialog-content.has-search-results {
+    --location-picker-map-height: clamp(160px, 24vh, 240px);
+  }
+
+  .location-picker-footer {
+    flex-direction: column !important;
+  }
+
+  .planning-workspace {
+    padding: 1rem;
+  }
+
+  .planning-page-header {
+    margin-bottom: 1rem;
+  }
+
+  .planning-main-grid {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 1rem;
+  }
+
+  .planning-panel,
+  .planning-control-column {
+    width: 100%;
+    min-width: 0;
+    height: min(540px, calc(100vh - 10rem));
+    min-height: 430px;
+    max-height: none;
+  }
+
+  .planning-live-header {
+    flex-direction: column;
+    padding: 1rem;
+  }
+
+  .planning-settings-row {
+    display: flex;
+    max-width: 100%;
+    overflow: visible;
+    padding-bottom: 0;
+    flex-wrap: wrap;
+    row-gap: .4rem;
+  }
+
+  .planning-settings-row > * {
+    flex-shrink: 1;
+  }
+
+  .planning-settings-row select {
+    max-width: 8rem;
+  }
+
+  .planning-settings-row input[type="number"] {
+    width: 3.5rem;
+  }
+
+  .planning-live-actions {
+    width: 100%;
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: flex-start;
+    gap: .5rem;
+  }
+
+  .planning-live-actions .calendar-layer-switch {
+    order: 1;
+    width: 8.25rem;
+  }
+
+  .planning-live-actions .explain-schedule-button {
+    order: 2;
+    margin-left: auto;
+  }
+
+  .planning-live-actions .run-scheduler-button {
+    order: 3;
+    width: 100%;
+    justify-content: center;
+  }
+
+  .planning-panel > .min-h-0.flex-1 {
+    padding: .875rem;
+  }
+
+  .schedule-actions {
+    flex-direction: column;
+  }
+
+  .schedule-actions > button {
+    width: 100%;
+  }
+
+  .google-layer-card {
+    padding: .875rem;
+  }
+
+  .google-layer-header {
+    display: flex;
+    flex-direction: column !important;
+    align-items: stretch;
+    gap: .75rem;
+  }
+
+  .google-layer-header > div:first-child {
+    width: 100%;
+    flex: none;
+  }
+
+  .google-layer-actions {
+    display: grid;
+    width: 100%;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .google-layer-actions > button {
+    min-width: 0;
+    padding-inline: .65rem;
+    font-size: .8125rem;
+  }
+
+  .google-event-row {
+    align-items: flex-start;
+    gap: .6rem;
+  }
+
+  .google-event-title {
+    display: flex;
+    min-width: 0;
+    flex-direction: column;
+    gap: .15rem;
+    white-space: normal;
+  }
+
+  .google-event-time {
+    margin-left: 0;
+    white-space: normal;
+  }
+}
+
+@media (max-width: 380px) {
+  .entry-metrics-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .jplan-calendar-day-cell {
+    min-height: 3rem;
   }
 }

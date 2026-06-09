@@ -4950,6 +4950,85 @@ def test_start_route_constraint_moves_or_unfits_pre_first_event_task(capsys):
         assert any(item["title"] == "Deep Work" for item in schedule_to_check.get("unfit_activities", []))
 
 
+def test_attached_relative_pre_first_event_does_not_create_start_route_conflict(capsys):
+    fake_travel = FakeTravelService(route_minutes=35)
+    engine = SchedulingEngine(DummyClient(), travel_service=fake_travel)
+    doctor = {
+        "id": "doctor",
+        "stable_activity_id": "doctor",
+        "title": "Doctor appointment",
+        "startTime": "09:00 AM",
+        "endTime": "10:00 AM",
+        "scheduled_start": 540,
+        "scheduled_end": 600,
+        "duration_minutes": 60,
+        "timing_mode": TimingMode.FIXED,
+        "fixed_start": 540,
+        "fixed_end": 600,
+        "is_user_fixed": True,
+        "user_fixed_start": 540,
+        "can_move_for_repair": False,
+        "location": "Sunway Medical",
+        "location_label": "Sunway Medical",
+        "travel_required": True,
+    }
+    prepare = {
+        "id": "prepare",
+        "stable_activity_id": "prepare",
+        "title": "Prepare documents",
+        "startTime": "08:30 AM",
+        "endTime": "09:00 AM",
+        "scheduled_start": 510,
+        "scheduled_end": 540,
+        "duration_minutes": 30,
+        "timing_mode": TimingMode.RELATIVE,
+        "original_timing_mode": TimingMode.RELATIVE,
+        "is_user_fixed": False,
+        "can_move_for_repair": False,
+        "repair_protection": "derived",
+        "anchor_relation": {
+            "kind": "before",
+            "target_activity_id": "doctor",
+            "target_title": "Doctor appointment",
+        },
+        "anchor_activity_id": "doctor",
+        "anchor_title": "Doctor appointment",
+        "placement_source": "system_derived",
+        "is_derived_time": True,
+        "location": "Sunway Medical",
+        "location_label": "Sunway Medical",
+        "location_status": "not_required",
+        "travel_required": False,
+    }
+    envelope = {
+        "date": "2026-05-02",
+        "status": "ok",
+        "schedule_status": "ok",
+        "travel_validation_status": "not_requested",
+        "accurate_travel_time": True,
+        "preferences": _accurate_preferences(day_start_time="07:00", day_end_time="22:00"),
+        "activities": [prepare, doctor],
+        "schedule_blocks": [
+            {"block_type": "activity", "start": "08:30 AM", "end": "09:00 AM", **prepare},
+            {"block_type": "activity", "start": "09:00 AM", "end": "10:00 AM", **doctor},
+        ],
+        "warnings": [],
+        "location_resolution_requests": [],
+    }
+
+    updated = engine._apply_accurate_travel_if_requested(
+        envelope,
+        saved_locations=[{"label": "Sunway Medical", "address": "Sunway Medical", "latitude": 2.9, "longitude": 101.6}],
+    )
+    logs = capsys.readouterr().out
+
+    assert updated["start_route_summary"]["first_physical_event"] == "Doctor appointment"
+    assert updated["start_route_summary"]["leave_by"] == "08:25 AM"
+    assert updated["route_conflicts"] == []
+    assert updated["travel_validation_status"] in {"validated", "fallback_used"}
+    assert "reason=attached_relative_block" in logs
+
+
 def test_accurate_travel_validation_recognizes_type_only_activity_blocks():
     fake_travel = FakeTravelService(route_minutes=12)
     engine = SchedulingEngine(DummyClient(), travel_service=fake_travel)

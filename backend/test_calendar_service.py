@@ -218,6 +218,46 @@ def test_google_export_accepts_legacy_activity_without_type():
     assert result["events"][0]["location"] == "KLCC"
 
 
+def test_google_export_includes_canonical_activity_missing_from_committed_timeline():
+    plan = {
+        "activities": [
+            {
+                "id": "act-prep",
+                "stable_activity_id": "act-prep",
+                "title": "Prepare documents",
+                "startTime": "07:00 AM",
+                "endTime": "07:30 AM",
+                "duration_minutes": 30,
+            },
+            {
+                "id": "act-doctor",
+                "stable_activity_id": "act-doctor",
+                "title": "Doctor appointment",
+                "startTime": "09:00 AM",
+                "endTime": "10:00 AM",
+                "duration_minutes": 60,
+            },
+        ],
+        "committed_schedule_blocks": [
+            {
+                "block_type": "activity",
+                "id": "act-doctor",
+                "stable_activity_id": "act-doctor",
+                "title": "Doctor appointment",
+                "startTime": "09:00 AM",
+                "endTime": "10:00 AM",
+                "duration_minutes": 60,
+            }
+        ],
+    }
+
+    result = build_google_export_events(plan, "2026-06-09")
+    summaries = [event["summary"] for event in result["events"]]
+
+    assert result["activity_count"] == 2
+    assert summaries == ["Prepare documents", "Doctor appointment"]
+
+
 def test_google_export_adds_start_route_from_summary_but_skips_route_warnings():
     plan = {
         "activities": [],

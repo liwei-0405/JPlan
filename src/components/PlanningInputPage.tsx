@@ -211,10 +211,11 @@ function previewCanCommitLocally(status: string): boolean {
 }
 
 function isFixedOrProtectedActivityBlock(block: Partial<ActivityBlock>): boolean {
-  return Boolean(block.is_user_fixed || block.user_fixed_start != null)
-    || ["fixed", "protected", "protected_social", "critical"].includes(String(block.repair_protection || ""))
-    || String(block.timing_mode || "").toLowerCase() === "fixed"
-    || String(block.original_timing_mode || "").toLowerCase() === "fixed";
+  const timingMode = String(block.timing_mode || "").toLowerCase();
+  const protection = String(block.repair_protection || "").toLowerCase();
+  return Boolean(block.is_user_fixed || block.user_fixed_start != null || block.fixed_start != null)
+    || ["fixed", "protected", "protected_social", "critical"].includes(protection)
+    || timingMode === "fixed";
 }
 
 export function PlanningInputPage({
@@ -373,6 +374,7 @@ export function PlanningInputPage({
   const [manualResolvedLocation, setManualResolvedLocation] = useState<ResolvedLocationSnapshot | null>(null);
   const [isManualLocationPickerOpen, setIsManualLocationPickerOpen] = useState(false);
   const [manualActivityType, setManualActivityType] = useState<"activity" | "buffer">("activity");
+  const [manualTimingMode, setManualTimingMode] = useState<"fixed" | "flexible">("fixed");
   const [isConflict, setIsConflict] = useState(false);
 
   // Chat state
@@ -603,10 +605,12 @@ export function PlanningInputPage({
   };
 
   const normalizeManualTimeEdit = (original: ActivityBlock, updated: ActivityBlock): ActivityBlock => {
-    const start = timeToMinutes(updated.startTime);
-    const rawEnd = timeToMinutes(updated.endTime || calculateEndTime(updated.startTime, updated.duration || "1h"));
-    const end = rawEnd < start ? rawEnd + 24 * 60 : rawEnd;
-    const isFixed = isFixedOrProtectedActivityBlock(original);
+    const hasStart = Boolean(updated.startTime);
+    const start = hasStart ? timeToMinutes(updated.startTime) : null;
+    const rawEnd = hasStart ? timeToMinutes(updated.endTime || calculateEndTime(updated.startTime, updated.duration || "1h")) : null;
+    const end = start != null && rawEnd != null && rawEnd < start ? rawEnd + 24 * 60 : rawEnd;
+    const requestedMode = String(updated.timing_mode || "").toLowerCase();
+    const isFixed = requestedMode === "fixed";
 
     if (isFixed) {
       return {
@@ -626,14 +630,18 @@ export function PlanningInputPage({
 
     return {
       ...updated,
-      scheduled_start: start,
-      scheduled_end: end,
+      scheduled_start: updated.scheduled_start,
+      scheduled_end: updated.scheduled_end,
       preferred_start: start,
       fixed_start: null,
       fixed_end: null,
       user_fixed_start: null,
+      requested_fixed_start: null,
+      earliest_start: null,
+      latest_end: null,
       is_user_fixed: false,
-      timing_mode: updated.timing_mode && updated.timing_mode !== "fixed" ? updated.timing_mode : "preferred",
+      timing_mode: start != null ? "preferred" : "unspecified",
+      original_timing_mode: start != null ? "preferred" : "unspecified",
       can_move_for_repair: true,
       repair_protection: ["fixed", "protected", "protected_social", "critical"].includes(String(updated.repair_protection || ""))
         ? "flexible"
@@ -641,31 +649,55 @@ export function PlanningInputPage({
     };
   };
 
+  const parseManualDurationMinutes = (value: string): number => {
+    const text = String(value || "").trim().toLowerCase();
+    if (!text) return 60;
+    const hourMatch = text.match(/(\d+(?:\.\d+)?)\s*h/);
+    const minuteMatch = text.match(/(\d+(?:\.\d+)?)\s*m/);
+    if (hourMatch || minuteMatch) {
+      return Math.max(1, Math.round(Number(hourMatch?.[1] || 0) * 60 + Number(minuteMatch?.[1] || 0)));
+    }
+    const numeric = Number(text);
+    if (Number.isFinite(numeric) && numeric > 0) return Math.max(1, Math.round(numeric * 60));
+    return 60;
+  };
+
+  const compareActivityTimeForManual = (a: ActivityBlock, b: ActivityBlock) => {
+    const aTime = a.startTime || a.start;
+    const bTime = b.startTime || b.start;
+    if (!aTime && !bTime) return String(a.title || "").localeCompare(String(b.title || ""));
+    if (!aTime) return 1;
+    if (!bTime) return -1;
+    return timeToMinutes(aTime) - timeToMinutes(bTime);
+  };
+
   const handleAddManualActivity = () => {
     if (isScheduleBusy) return;
     if (manualActivityType === "activity" && !activityName.trim()) return;
-    if (!activityTime.trim()) return;
+    if (manualTimingMode === "fixed" && !activityTime.trim()) return;
 
-    const formattedStartTime = formatTo12Hour(activityTime);
+    const hasManualStart = Boolean(activityTime.trim());
+    const formattedStartTime = hasManualStart ? formatTo12Hour(activityTime) : "";
     // standardize duration display for example "1" -> "1 hour"
     const rawDuration = activityDuration.trim() || (manualActivityType === "buffer" ? "5m" : "1h");
     const displayDuration = rawDuration.includes('h') || rawDuration.includes('m')
       ? rawDuration
       : `${rawDuration} hour`;
 
-    const newStartTimeMins = timeToMinutes(formattedStartTime);
-    const endTimeStr = calculateEndTime(activityTime, rawDuration);
-    let newEndTimeMins = timeToMinutes(endTimeStr);
+    const newStartTimeMins = hasManualStart ? timeToMinutes(formattedStartTime) : null;
+    const endTimeStr = hasManualStart ? calculateEndTime(activityTime, rawDuration) : "";
+    let newEndTimeMins = hasManualStart ? timeToMinutes(endTimeStr) : null;
 
     // Handle overnight activity (e.g. 11 PM to 1 AM)
-    if (newEndTimeMins < newStartTimeMins) {
+    if (newStartTimeMins != null && newEndTimeMins != null && newEndTimeMins < newStartTimeMins) {
       newEndTimeMins += 24 * 60;
     }
 
     // Collision Detection
     const baseDraft = previewSchedule ? clearRouteRepairPreview(previewSchedule) : null;
     const currentActivities = baseDraft?.activities || [];
-    const hasCollision = currentActivities.some(activity => {
+    const hasCollision = hasManualStart && newStartTimeMins != null && newEndTimeMins != null && currentActivities.some(activity => {
+      if (!activity.startTime && !activity.start) return false;
       const actStart = timeToMinutes(activity.startTime);
       let actEnd = timeToMinutes(activity.endTime || calculateEndTime(activity.startTime, activity.duration || ""));
 
@@ -685,6 +717,7 @@ export function PlanningInputPage({
 
     const pickedLocationName = manualResolvedLocation?.display_name || manualResolvedLocation?.address;
     const manualTitle = manualActivityType === "buffer" ? "Buffer" : activityName.trim();
+    const isManualFixed = manualActivityType === "buffer" || manualTimingMode === "fixed";
     const newActivity: ActivityBlock = {
       id: Date.now().toString(),
       type: manualActivityType,
@@ -692,7 +725,19 @@ export function PlanningInputPage({
       title: manualTitle,
       startTime: formattedStartTime,
       endTime: endTimeStr,
+      start: formattedStartTime,
+      end: endTimeStr,
       duration: displayDuration,
+      duration_minutes: parseManualDurationMinutes(rawDuration),
+      timing_mode: isManualFixed ? "fixed" : (hasManualStart ? "preferred" : "unspecified"),
+      original_timing_mode: isManualFixed ? "fixed" : (hasManualStart ? "preferred" : "unspecified"),
+      fixed_start: isManualFixed && newStartTimeMins != null ? newStartTimeMins : null,
+      fixed_end: isManualFixed && newEndTimeMins != null ? newEndTimeMins : null,
+      user_fixed_start: isManualFixed && newStartTimeMins != null ? newStartTimeMins : null,
+      is_user_fixed: isManualFixed,
+      preferred_start: !isManualFixed && newStartTimeMins != null ? newStartTimeMins : null,
+      can_move_for_repair: !isManualFixed,
+      repair_protection: isManualFixed ? "fixed" : "flexible",
       location: manualActivityType === "activity" ? (pickedLocationName || undefined) : undefined,
       location_label: manualActivityType === "activity" ? (pickedLocationName || undefined) : undefined,
       location_status: manualActivityType === "activity" && manualResolvedLocation ? "resolved" : undefined,
@@ -701,9 +746,7 @@ export function PlanningInputPage({
       resolved_location: manualActivityType === "activity" ? (manualResolvedLocation || undefined) : undefined,
     };
 
-    const updatedActivities = [...currentActivities, newActivity].sort(
-      (a, b) => timeToMinutes(a.startTime) - timeToMinutes(b.startTime)
-    );
+    const updatedActivities = [...currentActivities, newActivity].sort(compareActivityTimeForManual);
 
     setPreviewSchedule(markDirtySchedule({
       ...(baseDraft || {}),
@@ -718,6 +761,7 @@ export function PlanningInputPage({
     setActivityName(""); setActivityTime(""); setActivityDuration(""); setActivityLocation("");
     setManualResolvedLocation(null);
     setManualActivityType("activity");
+    setManualTimingMode("fixed");
     setIsConflict(false);
   };
 
@@ -736,9 +780,16 @@ export function PlanningInputPage({
       originalEvent.startTime !== updatedEvent.startTime ||
       originalEvent.endTime !== updatedEvent.endTime
     );
+    const timingSemanticsChanged = Boolean(
+      originalEvent.timing_mode !== updatedEvent.timing_mode ||
+      originalEvent.is_user_fixed !== updatedEvent.is_user_fixed ||
+      originalEvent.fixed_start !== updatedEvent.fixed_start ||
+      originalEvent.user_fixed_start !== updatedEvent.user_fixed_start ||
+      originalEvent.preferred_start !== updatedEvent.preferred_start
+    );
     const locationChanged = locationFingerprint(originalEvent) !== locationFingerprint(updatedEvent);
     const locationPreparedEvent = locationChanged ? promoteManualLocationEdit(originalEvent, updatedEvent) : updatedEvent;
-    const normalizedEvent = timeChanged ? normalizeManualTimeEdit(originalEvent, locationPreparedEvent) : {
+    const normalizedEvent = (timeChanged || timingSemanticsChanged) ? normalizeManualTimeEdit(originalEvent, locationPreparedEvent) : {
       ...locationPreparedEvent,
       timing_mode: isFixedOrProtectedActivityBlock(originalEvent) ? (updatedEvent.timing_mode || originalEvent.timing_mode || "fixed") : updatedEvent.timing_mode,
       is_user_fixed: originalEvent.is_user_fixed,
@@ -755,21 +806,23 @@ export function PlanningInputPage({
       setIsConflict(false);
       return;
     }
-    const newStartTimeMins = timeToMinutes(updatedEvent.startTime);
+    const hasUpdatedTime = Boolean(updatedEvent.startTime);
+    const newStartTimeMins = hasUpdatedTime ? timeToMinutes(updatedEvent.startTime) : null;
     const endTimeStr = updatedEvent.endTime || calculateEndTime(updatedEvent.startTime, updatedEvent.duration || "1h");
-    let newEndTimeMins = timeToMinutes(endTimeStr);
+    let newEndTimeMins = hasUpdatedTime ? timeToMinutes(endTimeStr) : null;
 
     // handle overnight activity
-    if (newEndTimeMins < newStartTimeMins) {
+    if (newStartTimeMins != null && newEndTimeMins != null && newEndTimeMins < newStartTimeMins) {
       newEndTimeMins += 24 * 60;
     }
 
     // Collision Detection
-    const hasCollision = baseDraft.activities.some(activity => {
+    const hasCollision = hasUpdatedTime && newStartTimeMins != null && newEndTimeMins != null && baseDraft.activities.some(activity => {
       if (activity.id === updatedEvent.id) return false; // skip self
+      if (!activity.startTime && !activity.start) return false;
 
-      const actStart = timeToMinutes(activity.startTime);
-      let actEnd = timeToMinutes(activity.endTime || calculateEndTime(activity.startTime, activity.duration || "1h"));
+      const actStart = timeToMinutes(activity.startTime || activity.start || "");
+      let actEnd = timeToMinutes(activity.endTime || activity.end || calculateEndTime(activity.startTime || activity.start || "", activity.duration || "1h"));
 
       if (actEnd < actStart) {
         actEnd += 24 * 60;
@@ -789,7 +842,7 @@ export function PlanningInputPage({
       existingIndex >= 0
         ? baseDraft.activities.map(a => a.id === updatedEvent.id ? normalizedEvent : a)
         : [...baseDraft.activities, normalizedEvent]
-    ).sort((a, b) => timeToMinutes(a.startTime) - timeToMinutes(b.startTime));
+    ).sort(compareActivityTimeForManual);
     const updatedScheduleBlocks = syncActivityBlocks(baseDraft.schedule_blocks, updatedActivities);
     const remainingLocationRequests = locationChanged
       ? ((baseDraft.location_resolution_requests || []) as LocationResolutionRequest[])
@@ -1522,11 +1575,13 @@ export function PlanningInputPage({
     }
   };
 
-  const isFixedOrProtectedBlock = (block: Partial<ActivityBlock>) => (
-    Boolean(block.is_user_fixed || block.user_fixed_start != null)
-    || ["fixed", "protected_social"].includes(String(block.repair_protection || ""))
-    || (String(block.original_timing_mode || "").toLowerCase() === "fixed")
-  );
+  const isFixedOrProtectedBlock = (block: Partial<ActivityBlock>) => {
+    const timingMode = String(block.timing_mode || "").toLowerCase();
+    const protection = String(block.repair_protection || "").toLowerCase();
+    return Boolean(block.is_user_fixed || block.user_fixed_start != null || block.fixed_start != null)
+      || ["fixed", "protected_social"].includes(protection)
+      || timingMode === "fixed";
+  };
 
   const blockIdentity = (block: Partial<ActivityBlock>) => (
     String(block.stable_activity_id || block.id || block.title || "").trim().toLowerCase()
@@ -1881,8 +1936,8 @@ export function PlanningInputPage({
   const timelineActivities = activeDisplaySchedule ? withDisplayOnlyStartRouteRow(activeDisplaySchedule, calendarView) : [];
 
   return (
-    <div className="min-h-screen bg-gradient-to-b from-background to-secondary/10">
-      <div className="max-w-7xl mx-auto px-6 py-6">
+    <div className="planning-input-page min-h-screen bg-gradient-to-b from-background to-secondary/10">
+      <div className="planning-workspace mx-auto max-w-7xl">
         <Button
           variant="ghost"
           onClick={() => {
@@ -1894,40 +1949,25 @@ export function PlanningInputPage({
               onBack();
             }
           }}
-          className="mb-5 rounded-xl"
+          className="mb-4 rounded-xl sm:mb-5"
         >
           <ArrowLeft className="mr-2 h-4 w-4" />
           Back to Dashboard
         </Button>
 
-        <div className="mb-8">
+        <div className="planning-page-header">
           <h2 className="mb-2">Plan Your Day</h2>
           <p className="text-muted-foreground">
             Build a draft plan with AI or manual edits, then save when you're happy with it
           </p>
         </div>
 
-        {isScheduleBusy && (
-          <div className="mb-4 rounded-2xl border border-blue-200 bg-blue-50 p-4 text-blue-950 shadow-sm">
-            <div className="flex items-start gap-3">
-              <Loader2 className="mt-0.5 h-4 w-4 shrink-0 animate-spin text-blue-600" />
-              <div>
-                <p className="text-sm font-medium">Planner is updating this schedule.</p>
-                <p className="mt-1 text-xs text-blue-800">
-                  Editing is disabled until the backend finishes, so the returned plan cannot overwrite a newer manual change.
-                </p>
-              </div>
-            </div>
-          </div>
-        )}
-
-        <div className="grid min-h-0 gap-6 lg:grid-cols-2 items-start">
+        <div className="planning-main-grid">
           {/* Left: Live Schedule Preview */}
           <div
-            className="flex min-h-0 flex-col overflow-hidden rounded-2xl border border-border bg-card shadow-sm"
-            style={{ height: "clamp(680px, calc(100vh - 260px), 760px)", maxHeight: "760px" }}
+            className="planning-panel flex min-h-0 flex-col overflow-hidden rounded-2xl border border-border bg-card shadow-sm"
           >
-            <div className="p-5 border-b bg-secondary/10 flex justify-between items-start gap-4">
+            <div className="planning-live-header flex justify-between gap-4 border-b bg-secondary/10 p-5">
               <div className="min-w-0 flex-1">
                 <div className="flex flex-wrap items-center gap-2">
                   <h3 className="text-lg font-bold">Live Schedule</h3>
@@ -1942,7 +1982,7 @@ export function PlanningInputPage({
                   {previewSchedule?.date || "No activities yet"}
                   {saveWithoutRerunNotice && showDirtyRerunState ? " · Saved, but not re-optimized" : ""}
                 </p>
-                <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
+                <div className="planning-settings-row mt-2 flex flex-wrap items-center gap-2 text-xs">
                   <span className="inline-flex items-center gap-1 text-muted-foreground">
                     <MapPin className="h-3.5 w-3.5" />
                     From
@@ -2024,12 +2064,12 @@ export function PlanningInputPage({
                   )}
                 </div>
               </div>
-              <div className="flex shrink-0 flex-col items-end gap-2">
+              <div className="planning-live-actions flex shrink-0 flex-col items-end gap-2">
                 {showRunSchedulerButton && (
                   <Button
                     type="button"
                     size="sm"
-                    className="h-8 rounded-xl gap-2 px-3 text-xs"
+                    className="run-scheduler-button h-8 rounded-xl gap-2 px-3 text-xs"
                     onClick={handleRunScheduler}
                     disabled={isScheduleBusy}
                   >
@@ -2038,7 +2078,7 @@ export function PlanningInputPage({
                   </Button>
                 )}
                 {hasGoogleEvents && (
-                  <div className="grid w-36 grid-cols-2 rounded-xl border border-border bg-background p-0.5">
+                  <div className="calendar-layer-switch grid w-36 grid-cols-2 rounded-xl border border-border bg-background p-0.5">
                     <Button
                       type="button"
                       variant={calendarView === "jplan" ? "default" : "ghost"}
@@ -2065,14 +2105,14 @@ export function PlanningInputPage({
                   variant="outline"
                   size="sm"
                   onClick={() => onViewExplanation(previewSchedule || { date: isoDateStr, activities: [] })}
-                  className="rounded-xl gap-2 text-xs border-primary/20 hover:bg-primary/5"
+                  className="explain-schedule-button rounded-xl gap-2 text-xs border-primary/20 hover:bg-primary/5"
                 >
                   <Lightbulb size={14} className="text-yellow-500" /> Explain Schedule
                 </Button>
               </div>
             </div>
 
-            <div className="min-h-0 flex-1 overflow-y-auto p-6 bg-secondary/5">
+            <div className="min-h-0 flex-1 overflow-y-auto bg-secondary/5 p-6">
               {previewSchedule && timelineActivities.length > 0 ? (
                 <TimelineGrid
                   activities={timelineActivities}
@@ -2083,7 +2123,7 @@ export function PlanningInputPage({
               ) : (
                 <div className="h-full flex flex-col items-center justify-center text-muted-foreground opacity-30 italic">
                   <Bot size={48} className="mb-2" />
-                  <p>Your timeline is empty. Try saying "Plan my day"!</p>
+                  <p className="px-4 text-center">Your timeline is empty. Try saying "Plan my day"!</p>
                 </div>
               )}
             </div>
@@ -2091,8 +2131,8 @@ export function PlanningInputPage({
 
           {/* RIGHT: Control Panel (5 Columns) */}
           <div
-            className="grid min-h-0 gap-3 overflow-hidden"
-            style={{ height: "clamp(680px, calc(100vh - 260px), 760px)", maxHeight: "760px", gridTemplateRows: "auto minmax(0, 1fr) auto auto" }}
+            className="planning-control-column grid min-h-0 gap-3 overflow-hidden"
+            style={{ gridTemplateRows: "auto minmax(0, 1fr) auto auto" }}
           >
 
             {/* Mode Switcher */}
@@ -2101,7 +2141,7 @@ export function PlanningInputPage({
                 <Button
                   variant={activeMode === "assistant" ? "default" : "ghost"}
                   onClick={() => setActiveMode("assistant")}
-                  className="rounded-xl gap-2"
+                  className="rounded-xl gap-1.5 px-2 text-xs sm:gap-2 sm:text-sm"
                   disabled={isScheduleBusy}
                 >
                   <MessageSquare size={16} /> AI Assistant
@@ -2109,7 +2149,7 @@ export function PlanningInputPage({
                 <Button
                   variant={activeMode === "manual" ? "default" : "ghost"}
                   onClick={() => setActiveMode("manual")}
-                  className="rounded-xl gap-2"
+                  className="rounded-xl gap-1.5 px-2 text-xs sm:gap-2 sm:text-sm"
                   disabled={isScheduleBusy}
                 >
                   <Settings2 size={16} /> Manual Mode
@@ -2139,10 +2179,10 @@ export function PlanningInputPage({
               {activeMode === "assistant" ? (
                 /* Assistant UI */
                 <div className="grid h-full min-h-0 overflow-hidden" style={{ gridTemplateRows: "minmax(0, 1fr) auto" }}>
-                  <div className="min-h-0 overflow-y-auto p-4 space-y-4" style={{ minHeight: 0 }}>
+                  <div className="min-h-0 space-y-4 overflow-y-auto p-3 sm:p-4" style={{ minHeight: 0 }}>
                     {conversationHistory.map((msg, i) => (
                       <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                        <div className={`max-w-[85%] p-3 rounded-2xl text-sm ${msg.role === 'user' ? 'bg-primary text-primary-foreground' : msg.status === 'conflict' ? 'bg-destructive/10 text-destructive border border-destructive/20' : msg.status === 'partial' || msg.status === 'warning' || msg.status === 'location_pending' || msg.status === 'clarification_needed' || msg.status === 'not_applied' ? 'bg-yellow-50 text-yellow-900 border border-yellow-200' : 'bg-secondary'
+                        <div className={`max-w-[92%] break-words p-3 rounded-2xl text-sm sm:max-w-[85%] ${msg.role === 'user' ? 'bg-primary text-primary-foreground' : msg.status === 'conflict' ? 'bg-destructive/10 text-destructive border border-destructive/20' : msg.status === 'partial' || msg.status === 'warning' || msg.status === 'location_pending' || msg.status === 'clarification_needed' || msg.status === 'not_applied' ? 'bg-yellow-50 text-yellow-900 border border-yellow-200' : 'bg-secondary'
                           }`}>
                           {msg.message}
                         </div>
@@ -2350,7 +2390,7 @@ export function PlanningInputPage({
                     )}
                     <div ref={chatEndRef} />
                   </div>
-                  <div className="shrink-0 border-t bg-secondary/5 p-4">
+                  <div className="shrink-0 border-t bg-secondary/5 p-3 sm:p-4">
                     <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
                       <div className="flex flex-wrap items-center gap-2">
                         <CompactPlanningToggle
@@ -2378,7 +2418,7 @@ export function PlanningInputPage({
                         {chatInput.length}/{CHAT_INPUT_MAX_LENGTH}
                       </span>
                     </div>
-                    <div className="flex gap-2 items-end">
+                    <div className="flex items-end gap-2">
                       <Button
                         variant={isRecording ? "destructive" : "ghost"}
                         size="icon"
@@ -2394,7 +2434,7 @@ export function PlanningInputPage({
                           onChange={(e) => setChatInput(e.target.value)}
                           maxLength={CHAT_INPUT_MAX_LENGTH}
                           placeholder={isRecording ? "Listening..." : "e.g. Move lunch to 1pm..."}
-                          className="min-h-[80px] rounded-xl resize-none"
+                          className="min-h-[56px] rounded-xl resize-none sm:min-h-[80px]"
                           disabled={isScheduleBusy}
                           onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSendMessage(); } }}
                         />
@@ -2412,7 +2452,7 @@ export function PlanningInputPage({
                 </div>
               ) : (
                 /* Manual Planning UI */
-                <div className={`h-full min-h-0 overflow-y-auto p-6 space-y-4 transition-colors ${isConflict ? "bg-destructive/5" : ""}`} style={{ minHeight: 0 }}>
+                <div className={`h-full min-h-0 space-y-4 overflow-y-auto p-4 transition-colors sm:p-6 ${isConflict ? "bg-destructive/5" : ""}`} style={{ minHeight: 0 }}>
                   <h3 className={`font-bold mb-2 flex items-center justify-between ${isConflict ? "text-destructive" : ""}`}>
                     {isConflict ? "Conflict Detected!" : "Add Activity Manually"}
                   </h3>
@@ -2438,6 +2478,7 @@ export function PlanningInputPage({
                           disabled={isScheduleBusy}
                           onClick={() => {
                             setManualActivityType("buffer");
+                            setManualTimingMode("fixed");
                             setActivityLocation("");
                             setManualResolvedLocation(null);
                           }}
@@ -2460,9 +2501,41 @@ export function PlanningInputPage({
                         />
                       </div>
                     )}
-                    <div className="grid grid-cols-2 gap-3">
+                    {manualActivityType === "activity" && (
                       <div className="space-y-1.5">
-                        <Label className={isConflict ? "text-destructive" : ""}>Start Time</Label>
+                        <Label>Time behavior</Label>
+                        <div className="grid grid-cols-2 gap-2 rounded-xl border border-border bg-secondary/20 p-1">
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant={manualTimingMode === "fixed" ? "default" : "ghost"}
+                            disabled={isScheduleBusy}
+                            onClick={() => setManualTimingMode("fixed")}
+                            className="rounded-lg text-xs"
+                          >
+                            Fixed time
+                          </Button>
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant={manualTimingMode === "flexible" ? "default" : "ghost"}
+                            disabled={isScheduleBusy}
+                            onClick={() => setManualTimingMode("flexible")}
+                            className="rounded-lg text-xs"
+                          >
+                            Flexible
+                          </Button>
+                        </div>
+                        <p className="text-xs text-muted-foreground">
+                          Flexible events can move. A start time becomes a preference.
+                        </p>
+                      </div>
+                    )}
+                    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                      <div className="space-y-1.5">
+                        <Label className={isConflict ? "text-destructive" : ""}>
+                          {manualActivityType === "activity" && manualTimingMode === "flexible" ? "Preferred Start (optional)" : "Start Time"}
+                        </Label>
                         <Input
                           type="time"
                           value={activityTime}
@@ -2499,7 +2572,7 @@ export function PlanningInputPage({
                             <p className="text-sm text-muted-foreground">No exact location selected.</p>
                           )}
                         </div>
-                        <div className="flex gap-2">
+                        <div className="flex flex-wrap gap-2">
                           <Button
                             type="button"
                             variant="outline"
@@ -2533,7 +2606,7 @@ export function PlanningInputPage({
                     <Button
                       onClick={handleAddManualActivity}
                       className={`w-full rounded-xl gap-2 mt-4 ${isConflict ? "bg-destructive hover:bg-destructive/90 animate-pulse" : ""}`}
-                      disabled={isScheduleBusy || ((manualActivityType === "activity" && !activityName.trim()) || !activityTime.trim())}
+                      disabled={isScheduleBusy || (manualActivityType === "activity" && !activityName.trim()) || (manualTimingMode === "fixed" && !activityTime.trim())}
                     >
                       {isConflict ? (
                         <>Conflict Detected</>
@@ -2549,7 +2622,7 @@ export function PlanningInputPage({
             {/* Save Button */}
             <Button
               onClick={handleSaveCurrentPlan}
-              className="w-full shrink-0 rounded-xl py-6 text-lg font-semibold shadow-lg hover:shadow-xl transition-all"
+              className="w-full shrink-0 rounded-xl py-4 text-base font-semibold shadow-lg transition-all hover:shadow-xl sm:py-6 sm:text-lg"
               disabled={!previewSchedule || previewSchedule.activities.length === 0 || isScheduleBusy}
             >
               {isProcessing ? (
@@ -2598,13 +2671,15 @@ export function PlanningInputPage({
           zIndex: 9999,
           display: 'flex',
           alignItems: 'center',
-          justifyContent: 'center'
+          justifyContent: 'center',
+          padding: '16px'
         }}>
           <div style={{
             background: 'white',
             padding: '24px',
             borderRadius: '12px',
-            maxWidth: '500px'
+            maxWidth: '500px',
+            width: '100%'
           }}>
             <h2 style={{ marginBottom: '16px' }}>
               {!previewSchedule?.activities?.length ? "Clear Schedule?" : "Save your plan?"}
@@ -2615,7 +2690,7 @@ export function PlanningInputPage({
                 : "You have unsaved changes in your schedule. Do you want to save them before leaving?"
               }
             </p>
-            <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
+            <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end', flexWrap: 'wrap' }}>
               <button
                 onClick={() => setShowExitConfirmation(false)}
                 style={{ padding: '8px 16px', border: '1px solid #ccc', borderRadius: '6px' }}
@@ -2772,6 +2847,9 @@ function withDisplayOnlyStartRouteRow(schedule: DailySchedule, activeView: Sched
   const baseBlocks = getBlocksForView(schedule, activeView, { preferDraft: true });
   if (activeView === "google_calendar") return baseBlocks;
   const blocksWithRouteWarnings = withDisplayOnlyFixedRouteConflictRows(baseBlocks, schedule);
+  if (blocksWithRouteWarnings.some(block => block.is_start_route || block.type === "start_route" || block.block_type === "start_route")) {
+    return blocksWithRouteWarnings;
+  }
   const summary = (schedule.start_route_summary || {}) as Record<string, unknown>;
   const hasUnresolvedStartRouteConflict = (schedule.route_conflicts || []).some((conflict) => {
     const reasonCode = String(conflict.reason_code || "");

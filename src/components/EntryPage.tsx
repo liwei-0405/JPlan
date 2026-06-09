@@ -214,16 +214,16 @@ export function EntryPage({
   const isPastDate = selectedDate < new Date(new Date().setHours(0, 0, 0, 0));
 
   return (
-    <div className="min-h-screen bg-background">
+    <div className="jplan-entry-page min-h-screen bg-background">
       <TopNav 
         onSettingsClick={onSettingsClick} 
         onSyncComplete={onSyncComplete} 
         syncDate={selectedDateStr}
       />
 
-      <div className="max-w-6xl mx-auto px-6 py-8">
+      <div className="entry-content">
         {/* Header */}
-        <div className="mb-8">
+        <div className="entry-header">
           <div className="flex items-center gap-2 mb-2">
             <Sparkles className="h-6 w-6 text-primary" />
             <h1>Welcome to JPlan</h1>
@@ -233,9 +233,9 @@ export function EntryPage({
           </p>
         </div>
 
-        <div className="grid lg:grid-cols-2 gap-6" >
+        <div className="entry-hero-grid">
           {/* Calendar */}
-          <div>
+          <div className="min-w-0">
             <CalendarWidget
               scheduleDates={scheduleDates}
               onDateSelect={handleDateSelect}
@@ -244,7 +244,7 @@ export function EntryPage({
           </div>
 
           {/* Selected Date's Plan Preview */}
-          <div className="h-[500px]" style={{ height: "40.85vw", maxHeight:"475px" }}>
+          <div className="entry-preview-shell">
             <div
               onClick={
                 hasSelectedPlan 
@@ -259,7 +259,7 @@ export function EntryPage({
                   hasSelectedPlan ? selectedSchedule && onViewSchedule(selectedSchedule) : onStartPlanning(selectedDate);
                 }
               }}
-              className={`bg-card rounded-2xl border border-border p-6 shadow-sm h-full flex flex-col w-full text-left transition-all ${
+              className={`bg-card rounded-2xl border border-border p-4 shadow-sm h-full flex flex-col w-full text-left transition-all sm:p-6 ${
                 hasSelectedPlan || !isPastDate 
                   ? "hover:shadow-md hover:border-primary/30 cursor-pointer group" 
                   : "cursor-default"
@@ -337,31 +337,31 @@ export function EntryPage({
         </div>
 
         {/* Planning Metrics */}
-        <div className="mt-6 grid w-full grid-cols-2 gap-4">
-          <div className="min-w-0 min-h-[112px] bg-gradient-to-br from-[#ffd4e5]/20 to-[#ffd4e5]/5 rounded-xl p-4 border border-[#ffd4e5]/30 flex flex-col justify-between overflow-hidden">
+        <div className="entry-metrics-grid">
+          <div className="min-w-0 min-h-[104px] bg-gradient-to-br from-[#ffd4e5]/20 to-[#ffd4e5]/5 rounded-xl p-3 border border-[#ffd4e5]/30 flex flex-col justify-between overflow-hidden sm:min-h-[112px] sm:p-4">
             <p className="text-sm text-muted-foreground">Plans This Month</p>
-            <p className="text-2xl leading-tight break-words">{plansThisMonth}</p>
+            <p className="text-xl leading-tight break-words sm:text-2xl">{plansThisMonth}</p>
             <p className="text-xs leading-snug text-muted-foreground">
               saved plans in {selectedDate.toLocaleDateString("en-US", { month: "short" })}
             </p>
           </div>
-          <div className="min-w-0 min-h-[112px] bg-gradient-to-br from-[#d4e5ff]/20 to-[#d4e5ff]/5 rounded-xl p-4 border border-[#d4e5ff]/30 flex flex-col justify-between overflow-hidden">
+          <div className="min-w-0 min-h-[104px] bg-gradient-to-br from-[#d4e5ff]/20 to-[#d4e5ff]/5 rounded-xl p-3 border border-[#d4e5ff]/30 flex flex-col justify-between overflow-hidden sm:min-h-[112px] sm:p-4">
             <p className="text-sm text-muted-foreground">Selected Day Events</p>
-            <p className="text-2xl leading-tight break-words">{selectedEventCount}</p>
+            <p className="text-xl leading-tight break-words sm:text-2xl">{selectedEventCount}</p>
             <p className="text-xs leading-snug text-muted-foreground">
               JPlan activities only
             </p>
           </div>
-          <div className="min-w-0 min-h-[112px] bg-gradient-to-br from-[#dff7e8]/20 to-[#dff7e8]/5 rounded-xl p-4 border border-[#dff7e8]/30 flex flex-col justify-between overflow-hidden">
+          <div className="min-w-0 min-h-[104px] bg-gradient-to-br from-[#dff7e8]/20 to-[#dff7e8]/5 rounded-xl p-3 border border-[#dff7e8]/30 flex flex-col justify-between overflow-hidden sm:min-h-[112px] sm:p-4">
             <p className="text-sm text-muted-foreground">Travel Time</p>
-            <p className="text-2xl leading-tight break-words">{formatMinutes(travelMetric.minutes)}</p>
+            <p className="text-xl leading-tight break-words sm:text-2xl">{formatMinutes(travelMetric.minutes)}</p>
             <p className="text-xs leading-snug text-muted-foreground">
               {travelMetric.source === "route_total" ? "from route total" : "from timeline travel blocks"}
             </p>
           </div>
-          <div className="min-w-0 min-h-[112px] bg-gradient-to-br from-[#fff9d4]/20 to-[#fff9d4]/5 rounded-xl p-4 border border-[#fff9d4]/30 flex flex-col justify-between overflow-hidden">
+          <div className="min-w-0 min-h-[104px] bg-gradient-to-br from-[#fff9d4]/20 to-[#fff9d4]/5 rounded-xl p-3 border border-[#fff9d4]/30 flex flex-col justify-between overflow-hidden sm:min-h-[112px] sm:p-4">
             <p className="text-sm text-muted-foreground">Plan Status</p>
-            <p className="text-2xl leading-tight break-words">{statusLabel}</p>
+            <p className="text-xl leading-tight break-words sm:text-2xl">{statusLabel}</p>
             <p className="text-xs leading-snug text-muted-foreground">
               {googleEventCount > 0 ? `${googleEventCount} Google events stored separately` : "selected date summary"}
             </p>

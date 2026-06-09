@@ -2340,6 +2340,58 @@ class TravelValidationMixin:
             return 0
         return int(estimate_travel_minutes(left.get("location"), right.get("location")) or 0)
 
+    def _start_route_blocker_is_attached_to_first_event(
+        self,
+        block: Dict[str, Any],
+        first_event: Dict[str, Any],
+    ) -> bool:
+        """Ignore relative/prep blocks that are intentionally attached to the first routed event."""
+        if not block or not first_event:
+            return False
+        if self._block_requires_travel_coordinate(block):
+            return False
+
+        anchor = block.get("anchor_relation") if isinstance(block.get("anchor_relation"), dict) else {}
+        anchor_id = (
+            (anchor or {}).get("target_activity_id")
+            or (anchor or {}).get("target_id")
+            or block.get("anchor_activity_id")
+        )
+        anchor_title = (
+            (anchor or {}).get("target_title")
+            or block.get("anchor_title")
+            or block.get("same_location_as")
+        )
+        first_id = first_event.get("stable_activity_id") or first_event.get("id") or first_event.get("activity_id")
+        anchored_to_first = bool(
+            (anchor_id and first_id and str(anchor_id) == str(first_id))
+            or (
+                anchor_title
+                and clean_title(anchor_title) == clean_title(first_event.get("title") or "")
+            )
+        )
+        if not anchored_to_first:
+            return False
+
+        relation = clean_title(
+            (anchor or {}).get("kind")
+            or block.get("relation_type")
+            or block.get("placement_source")
+            or ""
+        )
+        is_relative_predecessor = (
+            "before" in relation
+            or "dependency" in relation
+            or relation == "system_derived"
+            or bool(block.get("is_derived_time"))
+        )
+        if not is_relative_predecessor:
+            return False
+
+        block_end = parse_clock(block.get("end") or block.get("endTime") or "")
+        first_start = parse_clock(first_event.get("start") or first_event.get("startTime") or "")
+        return block_end is None or first_start is None or block_end <= first_start
+
     def _route_sequence_total_minutes(self, envelope: Dict[str, Any], route_context: Dict[str, Any]) -> int:
         activities = sorted(
             [
@@ -3649,6 +3701,13 @@ class TravelValidationMixin:
                     })
                 for block in blocks[:first_index]:
                     if not self._is_activity_schedule_block(block):
+                        continue
+                    if self._start_route_blocker_is_attached_to_first_event(block, first):
+                        jlog(
+                            "START_ROUTE",
+                            f"blocker={block.get('title')} first_event={first.get('title')} reason=attached_relative_block",
+                            "SKIP",
+                        )
                         continue
                     block_end = parse_clock(block.get("end") or block.get("endTime") or "")
                     if block_end is not None and block_end > leave_by:
@@ -5295,6 +5354,13 @@ class TravelValidationMixin:
                     blockers: List[Tuple[Dict[str, Any], int]] = []
                     for block in blocks[:first_physical_index]:
                         if not self._is_activity_schedule_block(block):
+                            continue
+                        if self._start_route_blocker_is_attached_to_first_event(block, right):
+                            jlog(
+                                "START_ROUTE",
+                                f"blocker={block.get('title')} first_event={right.get('title')} reason=attached_relative_block",
+                                "SKIP",
+                            )
                             continue
                         block_end = parse_clock(block.get("end") or block.get("endTime") or "")
                         if block_end is not None and block_end > leave_by:

@@ -41,7 +41,7 @@ def _normalize_export_type(block: Dict[str, Any]) -> str:
 
 
 def _activity_key(item: Dict[str, Any]) -> str:
-    for field in ("stable_activity_id", "activity_id", "id", "source_activity_id"):
+    for field in ("stable_activity_id", "activity_id", "id", "source_activity_id", "block_id"):
         value = item.get(field)
         if value:
             return str(value)
@@ -94,6 +94,62 @@ def _item_start_end(item: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]
     if not end:
         end = _format_minutes_as_time(item.get("scheduled_end") or item.get("fixed_end"))
     return start, end
+
+
+def _time_text_to_minutes(value: Any) -> int:
+    text = str(value or "").strip()
+    if not text:
+        return 24 * 60 + 999
+    for fmt in ("%I:%M %p", "%I %p", "%H:%M"):
+        try:
+            parsed = datetime.strptime(text.upper(), fmt)
+            return parsed.hour * 60 + parsed.minute
+        except ValueError:
+            continue
+    return 24 * 60 + 999
+
+
+def _activity_identity_values(item: Dict[str, Any]) -> set:
+    values = {
+        str(item.get(field) or "").strip()
+        for field in ("stable_activity_id", "activity_id", "id", "source_activity_id", "block_id")
+        if item.get(field)
+    }
+    title = str(item.get("title") or item.get("activity") or "").strip().lower()
+    start, end = _item_start_end(item)
+    if title:
+        values.add(f"title:{title}")
+        values.add(f"title:{title}|start:{start or ''}|end:{end or ''}")
+    return {value for value in values if value}
+
+
+def _merge_missing_canonical_activities(
+    timeline_blocks: List[Dict[str, Any]],
+    activities: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    if not timeline_blocks:
+        return activities
+
+    existing_keys = set()
+    for block in timeline_blocks:
+        if isinstance(block, dict) and _is_exportable_activity(block):
+            existing_keys.update(_activity_identity_values(block))
+
+    merged = list(timeline_blocks)
+    for activity in activities:
+        if not isinstance(activity, dict):
+            continue
+        if str(activity.get("source") or "").strip().lower() == "google_calendar":
+            continue
+        if not _is_exportable_activity(activity):
+            continue
+        activity_keys = _activity_identity_values(activity)
+        if activity_keys and existing_keys.intersection(activity_keys):
+            continue
+        merged.append(activity)
+        existing_keys.update(activity_keys)
+
+    return sorted(merged, key=lambda item: _time_text_to_minutes(_item_start_end(item)[0]))
 
 
 def _is_display_only(block: Dict[str, Any]) -> bool:
@@ -197,7 +253,7 @@ def build_google_export_events(plan: Dict[str, Any], date_str: str) -> Dict[str,
         if isinstance(activity, dict)
     }
     blocks = plan.get("committed_schedule_blocks") or plan.get("schedule_blocks") or []
-    export_source = blocks if blocks else activities
+    export_source = _merge_missing_canonical_activities(blocks, activities) if blocks else activities
 
     events: List[Dict[str, Any]] = []
     skipped_count = 0
@@ -574,7 +630,13 @@ class CalendarService:
             _calendar_log(f"Bulk sync failed for user {user_id}: {e}", "ERROR")
             return {}
 
-    def export_schedule_to_google(self, user_id: str, date_str: str, plan: Dict[str, Any]) -> Dict[str, int]:
+    def export_schedule_to_google(
+        self,
+        user_id: str,
+        date_str: str,
+        plan: Dict[str, Any],
+        replace_google_day: bool = False,
+    ) -> Dict[str, int]:
         """
         Push the committed JPlan timeline to Google Calendar.
         """
@@ -599,6 +661,8 @@ class CalendarService:
                 "Authorization": f"Bearer {access_token}",
                 "Content-Type": "application/json"
             }
+
+            deleted_count = 0
             
             def parse_time_to_dt(t_str, d_str):
                 if not t_str or t_str == "All Day":
@@ -615,6 +679,31 @@ class CalendarService:
             clean_min = (target_date_dt - timedelta(hours=14)).isoformat() + "Z"
             clean_max = (target_date_dt + timedelta(hours=38)).isoformat() + "Z"
             existing_google_events = self.get_calendar_events(access_token, clean_min, clean_max)
+            if replace_google_day:
+                day_min = f"{date_str}T00:00:00+08:00"
+                day_max = f"{(target_date_dt + timedelta(days=1)).strftime('%Y-%m-%d')}T00:00:00+08:00"
+                events_to_delete = self.get_calendar_events(access_token, day_min, day_max)
+                _calendar_log(
+                    f"Replacing Google day date={date_str}; deleting {len(events_to_delete)} existing event(s)",
+                    "EXPORT_REPLACE",
+                )
+                for event in events_to_delete:
+                    event_id = event.get("id")
+                    if not event_id:
+                        continue
+                    delete_url = f"https://www.googleapis.com/calendar/v3/calendars/primary/events/{event_id}"
+                    delete_resp = requests.delete(delete_url, headers=headers)
+                    if delete_resp.status_code in {200, 204, 410, 404}:
+                        if delete_resp.status_code in {200, 204}:
+                            deleted_count += 1
+                        continue
+                    if delete_resp.status_code == 403:
+                        _calendar_log(f"403 Forbidden deleting calendar event: {delete_resp.text}", "ERROR")
+                        raise Exception("insufficientPermissions")
+                    delete_resp.raise_for_status()
+                    deleted_count += 1
+                existing_google_events = []
+
             existing_by_block_id: Dict[str, str] = {}
             for gev in existing_google_events:
                 metadata = extract_jplan_metadata(gev)
@@ -628,7 +717,7 @@ class CalendarService:
                 str(link.get("block_id")): str(link.get("calendar_event_id") or link.get("google_event_id"))
                 for link in (plan.get("sync_links") or [])
                 if link.get("block_id") and (link.get("calendar_event_id") or link.get("google_event_id"))
-            }
+            } if not replace_google_day else {}
 
             # 4. Push each exportable timeline item
             if not plan.get("committed_schedule_blocks"):
@@ -727,6 +816,7 @@ class CalendarService:
                 "activity_count": export_payload["activity_count"],
                 "travel_count": export_payload["travel_count"],
                 "skipped_count": export_payload["skipped_count"],
+                "deleted_count": deleted_count,
                 "updated_count": updated_count,
                 "created_count": created_count,
                 "exported_events": exported_event_links,

@@ -44,6 +44,7 @@ export function ScheduleViewPage({
   const [isExporting, setIsExporting] = useState(false);
   const [isCalendarActionBusy, setIsCalendarActionBusy] = useState(false);
   const [showConfirmDialog, setShowConfirmDialog] = useState(false);
+  const [confirmReplaceGoogleDay, setConfirmReplaceGoogleDay] = useState(false);
   const [replacePreview, setReplacePreview] = useState<CalendarReplacePreview | null>(null);
   const [activeView, setActiveView] = useState<ScheduleViewMode>(
     schedule.active_view === "google_calendar" && hasGoogleCalendarLayer(schedule) ? "google_calendar" : "jplan"
@@ -58,12 +59,12 @@ export function ScheduleViewPage({
   const hasGoogleEvents = hasGoogleCalendarLayer(schedule);
   const timelineBlocks = getBlocksForView(schedule, activeView);
 
-  const handleExportToGoogle = async () => {
+  const handleExportToGoogle = async (replaceGoogleDay = false) => {
     if (!user) return;
     setIsExporting(true);
-    const exportToast = toast.loading("Exporting to Google Calendar...");
+    const exportToast = toast.loading(replaceGoogleDay ? "Replacing Google Calendar day..." : "Exporting to Google Calendar...");
     try {
-      const result = await exportPlanToGoogle(schedule.date, user.id);
+      const result = await exportPlanToGoogle(schedule.date, user.id, replaceGoogleDay);
       if (!result.success) {
         if (result.error === 'TOKEN_EXPIRED') {
           toast.error("Google Session Expired or Insufficient Permissions. Re-linking...", { id: exportToast, duration: 4000 });
@@ -89,8 +90,14 @@ export function ScheduleViewPage({
       const count = result.exportedCount || 0;
       const activityCount = result.activityCount || 0;
       const travelCount = result.travelCount || 0;
+      const deletedCount = result.deletedCount || 0;
       if (count === 0) {
         toast.info("No new activities to export. (Synced Google events are skipped)", { id: exportToast, duration: 5000 });
+      } else if (replaceGoogleDay) {
+        toast.success(
+          `Replaced Google Calendar day: deleted ${deletedCount} existing event${deletedCount === 1 ? "" : "s"} and exported ${count} JPlan item${count === 1 ? "" : "s"}.`,
+          { id: exportToast, duration: 6000 }
+        );
       } else {
         const parts = [
           `${activityCount} ${activityCount === 1 ? "activity" : "activities"}`,
@@ -174,9 +181,9 @@ export function ScheduleViewPage({
 
   return (
     <div className="min-h-screen bg-gradient-to-b from-background to-secondary/20">
-      <div className="max-w-4xl mx-auto px-6 py-8">
+      <div className="max-w-4xl mx-auto px-4 py-5 sm:px-6 sm:py-8">
         {/* Header */}
-        <div className="flex items-center justify-between mb-8">
+        <div className="mb-5 flex items-center justify-between gap-3 sm:mb-8">
           <Button
             variant="ghost"
             onClick={onBack}
@@ -209,7 +216,7 @@ export function ScheduleViewPage({
         </div>
 
         {/* Date Header */}
-        <div className="mb-8 bg-card rounded-2xl border border-border p-6 shadow-sm">
+        <div className="mb-5 bg-card rounded-2xl border border-border p-4 shadow-sm sm:mb-8 sm:p-6">
           <div className="flex items-center gap-2 mb-2">
             <Sparkles className="h-5 w-5 text-primary" />
             <h2>Your Daily Schedule</h2>
@@ -232,7 +239,7 @@ export function ScheduleViewPage({
         )}
 
         {/* Action Buttons */}
-        <div className="flex gap-3 mb-6 flex-wrap">
+        <div className="schedule-actions mt-3 mb-6 flex gap-3 sm:mt-4">
           {!isPastDate && (
             <Button onClick={onModify} variant="outline" className="rounded-xl gap-2">
               <Sparkles className="h-4 w-4" />
@@ -244,7 +251,10 @@ export function ScheduleViewPage({
           </Button>
           {isGoogleLinked && (
             <Button
-              onClick={() => setShowConfirmDialog(true)}
+              onClick={() => {
+                setConfirmReplaceGoogleDay(false);
+                setShowConfirmDialog(true);
+              }}
               variant="outline"
               className="rounded-xl gap-2 border-primary/20 hover:bg-primary/5 hover:text-primary transition-colors"
               disabled={isExporting}
@@ -277,13 +287,15 @@ export function ScheduleViewPage({
         )}
 
         {activeView === "google_calendar" && (
-          <div className="mb-6 rounded-2xl border border-border bg-card p-4 shadow-sm">
-            <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
-              <div>
+          <div className="google-layer-card mb-6 rounded-2xl border border-border bg-card p-4 shadow-sm">
+            <div className="google-layer-header mb-3 flex flex-wrap items-center justify-between gap-3">
+              <div className="min-w-0 flex-1">
                 <p className="text-sm font-medium">Google Calendar layer</p>
-                <p className="text-xs text-muted-foreground">Read-only until imported or replaced.</p>
+                <p className="text-xs text-muted-foreground">
+                  Imported Google Calendar data stays separate here. Select events to import into JPlan, or preview a full replacement.
+                </p>
               </div>
-              <div className="flex flex-wrap gap-2">
+              <div className="google-layer-actions flex flex-wrap gap-2">
                 <Button
                   variant="outline"
                   size="sm"
@@ -308,16 +320,17 @@ export function ScheduleViewPage({
               {googleEvents.map(event => {
                 const key = calendarEventKey(event);
                 return (
-                  <label key={key} className="flex items-center gap-3 rounded-xl border border-border/60 px-3 py-2 text-sm">
+                  <label key={key} className="google-event-row flex min-w-0 items-center gap-3 rounded-xl border border-border/60 px-3 py-2 text-sm">
                     <input
+                      className="shrink-0"
                       type="checkbox"
                       checked={selectedGoogleEventIds.includes(key)}
                       onChange={() => toggleGoogleEventSelection(key)}
                       disabled={Boolean(event.maybe_support_block)}
                     />
-                    <span className="flex-1">
-                      {event.title}
-                      <span className="ml-2 text-xs text-muted-foreground">
+                    <span className="google-event-title min-w-0 flex-1 truncate">
+                      <span className="truncate">{event.title}</span>
+                      <span className="google-event-time ml-2 whitespace-nowrap text-xs text-muted-foreground">
                         {event.startTime || event.start} - {event.endTime || event.end}
                       </span>
                     </span>
@@ -342,7 +355,7 @@ export function ScheduleViewPage({
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
-            padding: '24px'
+            padding: '16px'
           }}>
             {/* Backdrop */}
             <div
@@ -365,7 +378,7 @@ export function ScheduleViewPage({
               borderRadius: '28px',
               border: '1px solid rgba(0,0,0,0.05)',
               boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.25)',
-              padding: '40px',
+              padding: 'clamp(20px, 5vw, 40px)',
               animation: 'modalFadeIn 0.3s ease-out'
             }}>
               <style>{`
@@ -385,31 +398,62 @@ export function ScheduleViewPage({
                 </h3>
 
                 <p className="text-muted-foreground leading-relaxed mb-10 text-base px-2">
-                  Ready to refresh your Google Calendar?
+                  Ready to push JPlan to Google Calendar?
                   <br /><br />
                   JPlan will update linked calendar events for <span className="font-bold text-foreground" style={{ fontWeight: 'bold' }}>{schedule.date}</span> and create missing JPlan events.
                   External Google Calendar events will not be deleted.
                 </p>
 
-                <div className="flex flex-col sm:flex-row gap-4 w-full">
+                <div className="grid w-full gap-3">
                   <Button
                     variant="outline"
                     onClick={() => setShowConfirmDialog(false)}
                     style={{ borderRadius: '16px' }}
-                    className="flex-1 h-14 border-muted hover:bg-muted font-semibold transition-all"
+                    className="h-14 border-muted hover:bg-muted font-semibold transition-all"
                   >
                     Cancel
                   </Button>
                   <Button
                     onClick={() => {
                       setShowConfirmDialog(false);
-                      handleExportToGoogle();
+                      handleExportToGoogle(false);
                     }}
                     style={{ borderRadius: '16px' }}
-                    className="flex-1 h-14 bg-primary hover:bg-primary/90 text-white shadow-xl shadow-primary/20 font-bold transition-all active:scale-95"
+                    className="h-14 bg-primary hover:bg-primary/90 text-white shadow-xl shadow-primary/20 font-bold transition-all active:scale-95"
                   >
-                    Confirm & Push
+                    Push JPlan only
                   </Button>
+                  <div className="rounded-2xl border border-destructive/20 bg-destructive/5 p-3">
+                    <label className="mb-2 flex items-start gap-2 text-left text-sm">
+                      <input
+                        type="checkbox"
+                        className="mt-1"
+                        checked={confirmReplaceGoogleDay}
+                        onChange={(event) => setConfirmReplaceGoogleDay(event.target.checked)}
+                      />
+                      <span className="font-semibold text-destructive">
+                        I understand this will overwrite all Google Calendar events on {schedule.date}.
+                      </span>
+                    </label>
+                    <Button
+                      onClick={() => {
+                        setShowConfirmDialog(false);
+                        handleExportToGoogle(true);
+                      }}
+                      disabled={!confirmReplaceGoogleDay}
+                      style={{ borderRadius: '16px' }}
+                      className={`h-14 w-full font-bold transition-all ${
+                        confirmReplaceGoogleDay
+                          ? "bg-destructive text-white hover:bg-destructive/90 active:scale-95"
+                          : "cursor-not-allowed border border-dashed border-destructive/35 bg-destructive/20 text-destructive shadow-none hover:bg-destructive/20"
+                      }`}
+                    >
+                      Replace Google day
+                    </Button>
+                    <p className="mt-2 text-left text-xs text-muted-foreground">
+                      This deletes the day's existing Google Calendar events first, then exports the current JPlan schedule.
+                    </p>
+                  </div>
                 </div>
               </div>
             </div>
@@ -417,8 +461,8 @@ export function ScheduleViewPage({
         )}
 
         {replacePreview && (
-          <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/60 p-6">
-            <div className="w-full max-w-lg rounded-2xl border border-border bg-card p-6 shadow-xl">
+          <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/60 p-4 sm:p-6">
+            <div className="w-full max-w-lg rounded-2xl border border-border bg-card p-4 shadow-xl sm:p-6">
               <h3 className="mb-2 text-xl font-semibold">Replace JPlan with Google Calendar?</h3>
               <p className="mb-4 text-sm text-muted-foreground">
                 This will import {replacePreview.import_count} selected event{replacePreview.import_count === 1 ? "" : "s"},
@@ -432,7 +476,7 @@ export function ScheduleViewPage({
                   </div>
                 ))}
               </div>
-              <div className="flex justify-end gap-3">
+              <div className="flex flex-wrap justify-end gap-3">
                 <Button variant="outline" className="rounded-xl" onClick={() => setReplacePreview(null)}>
                   Cancel
                 </Button>

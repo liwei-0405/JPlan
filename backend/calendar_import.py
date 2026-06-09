@@ -217,6 +217,14 @@ def _stable_activity_id(item: Dict[str, Any]) -> str:
     return str(item.get("stable_activity_id") or item.get("activity_id") or item.get("id") or f"act-{uuid4().hex[:12]}")
 
 
+def _has_jplan_state(schedule: Dict[str, Any]) -> bool:
+    return bool(
+        _list(schedule.get("activities"))
+        or _list(schedule.get("schedule_blocks"))
+        or _list(schedule.get("committed_schedule_blocks"))
+    )
+
+
 def _canonical_activity_from_external(event: Dict[str, Any]) -> Dict[str, Any]:
     start_time = event.get("startTime") or event.get("start")
     end_time = event.get("endTime") or event.get("end")
@@ -506,17 +514,9 @@ def prepare_schedule_for_save(schedule: Dict[str, Any]) -> Dict[str, Any]:
     return prepared
 
 
-def _has_jplan_state(schedule: Dict[str, Any]) -> bool:
-    return bool(
-        _list(schedule.get("activities"))
-        or _list(schedule.get("schedule_blocks"))
-        or _list(schedule.get("committed_schedule_blocks"))
-    )
-
-
 def _link_jplan_events(schedule: Dict[str, Any], events: List[Dict[str, Any]]) -> None:
     links = _list(schedule.get("sync_links"))
-    committed = _list(schedule.get("committed_schedule_blocks"))
+    committed = _prune_orphan_jplan_calendar_committed_blocks(schedule)
     by_block_id = {str(block.get("block_id")): block for block in committed if block.get("block_id")}
 
     for event in events:
@@ -534,14 +534,8 @@ def _link_jplan_events(schedule: Dict[str, Any], events: List[Dict[str, Any]]) -
                 ),
                 None,
             )
-        if event_id and not block_id:
-            block_id = f"gcal-{event_id}"
         if event_id and block_id and str(block_id) in by_block_id:
             by_block_id[str(block_id)]["calendar_event_id"] = event_id
-        elif event_id and block_id:
-            block = _jplan_event_to_committed_block(event, metadata, str(block_id))
-            committed.append(block)
-            by_block_id[str(block_id)] = block
         link = {
             "calendar_event_id": event_id,
             "google_event_id": event_id,
@@ -556,6 +550,47 @@ def _link_jplan_events(schedule: Dict[str, Any], events: List[Dict[str, Any]]) -
 
     schedule["sync_links"] = links
     schedule["committed_schedule_blocks"] = committed
+
+
+def _prune_orphan_jplan_calendar_committed_blocks(schedule: Dict[str, Any]) -> List[Dict[str, Any]]:
+    activities = _list(schedule.get("activities"))
+    schedule_blocks = _list(schedule.get("schedule_blocks"))
+    referenced_ids = {
+        str(value)
+        for item in activities + schedule_blocks
+        for value in (
+            item.get("stable_activity_id"),
+            item.get("block_id"),
+            item.get("id"),
+        )
+        if value
+    }
+
+    kept: List[Dict[str, Any]] = []
+    for block in _list(schedule.get("committed_schedule_blocks")):
+        if not isinstance(block, dict):
+            continue
+        block_id = str(block.get("block_id") or "")
+        stable_id = str(block.get("stable_activity_id") or "")
+        is_calendar_materialized = bool(
+            block.get("calendar_event_id")
+            or block.get("google_event_id")
+            or "[JPLAN_META]" in str(block.get("description") or "")
+        )
+        is_jplan_calendar_block = (
+            block.get("source_system") == "jplan"
+            and block.get("read_only") is True
+            and is_calendar_materialized
+        )
+        still_referenced = bool(
+            (block_id and block_id in referenced_ids)
+            or (stable_id and stable_id in referenced_ids)
+        )
+        if is_jplan_calendar_block and not still_referenced:
+            jlog("STATE", f"removed_orphan_jplan_calendar_committed title={block.get('title')}", "WARNING")
+            continue
+        kept.append(block)
+    return kept
 
 
 def _jplan_event_to_committed_block(
@@ -605,7 +640,12 @@ def _jplan_event_to_committed_block(
     return {key: value for key, value in block.items() if value not in (None, "")}
 
 
-def apply_calendar_sync(schedule: Dict[str, Any], google_events: List[Dict[str, Any]], *, date: str) -> Dict[str, Any]:
+def apply_calendar_sync(
+    schedule: Dict[str, Any],
+    google_events: List[Dict[str, Any]],
+    *,
+    date: str,
+) -> Dict[str, Any]:
     synced = cleanDirtySchedule(schedule or {"date": date, "activities": []})
     synced["date"] = synced.get("date") or date
     had_jplan_state_before_sync = _has_jplan_state(synced)
@@ -614,22 +654,15 @@ def apply_calendar_sync(schedule: Dict[str, Any], google_events: List[Dict[str, 
     _link_jplan_events(synced, buckets["jplan_created"])
     external_events = [
         google_event_to_external_event(event, maybe_support_block=False)
-        for event in buckets["external"]
-    ] + [
-        google_event_to_external_event(event, maybe_support_block=True)
-        for event in buckets["unknown_support_like"]
+        for event in buckets["external"] + buckets["jplan_created"]
+        if not is_support_like(event)
     ]
     synced["external_calendar_events"] = _upsert_external_events(
         _list(synced.get("external_calendar_events")),
         external_events,
     )
-
-    true_external = [
-        event for event in _list(synced.get("external_calendar_events"))
-        if not event.get("maybe_support_block") and not is_support_like(event)
-    ]
-    if not had_jplan_state_before_sync and true_external:
-        synced["activities"] = [_canonical_activity_from_external(event) for event in true_external]
+    if not had_jplan_state_before_sync and external_events:
+        synced["activities"] = [_canonical_activity_from_external(event) for event in external_events]
         synced["active_view"] = "jplan"
         jlog(
             "IMPORT",

@@ -26,7 +26,7 @@ def google_event(event_id, title, *, description="", metadata=None):
     return payload
 
 
-def test_calendar_only_day_bootstraps_only_true_external_events():
+def test_calendar_import_stores_google_events_and_bootstraps_empty_jplan_day():
     schedule = {
         "date": "2026-05-26",
         "activities": [],
@@ -44,11 +44,30 @@ def test_calendar_only_day_bootstraps_only_true_external_events():
 
     synced = apply_calendar_sync(schedule, events, date="2026-05-26")
 
-    assert [item["title"] for item in synced["activities"]] == ["Dentist"]
-    assert synced["activities"][0]["source"] == "imported_google_calendar"
+    assert [item["title"] for item in synced["activities"]] == ["Dentist", "Lunch"]
+    assert [item["title"] for item in synced["external_calendar_events"]] == ["Dentist", "Lunch"]
+    assert all(item["title"] not in {"Travel to Dentist", "Prep / Buffer"} for item in synced["external_calendar_events"])
     assert all(item.get("source") != "google_calendar" for item in synced["activities"])
-    assert any(item["title"] == "Travel to Dentist" and item["maybe_support_block"] for item in synced["external_calendar_events"])
-    assert not any(item["title"] == "Lunch" for item in synced["external_calendar_events"])
+
+
+def test_calendar_import_bootstraps_empty_jplan_day():
+    schedule = {
+        "date": "2026-05-27",
+        "activities": [],
+        "schedule_blocks": [],
+        "committed_schedule_blocks": [],
+        "external_calendar_events": [],
+        "sync_links": [],
+    }
+
+    synced = apply_calendar_sync(
+        schedule,
+        [google_event("external-1", "Dentist")],
+        date="2026-05-27",
+    )
+
+    assert [item["title"] for item in synced["activities"]] == ["Dentist"]
+    assert [item["title"] for item in synced["external_calendar_events"]] == ["Dentist"]
 
 
 def test_jplan_and_google_day_does_not_auto_merge():
@@ -67,7 +86,7 @@ def test_jplan_and_google_day_does_not_auto_merge():
     assert [item["title"] for item in synced["external_calendar_events"]] == ["Dentist"]
 
 
-def test_linked_jplan_calendar_events_materialize_orphan_committed_blocks_for_display():
+def test_linked_jplan_calendar_events_do_not_materialize_orphan_committed_blocks():
     schedule = {
         "date": "2026-06-09",
         "activities": [],
@@ -88,11 +107,42 @@ def test_linked_jplan_calendar_events_materialize_orphan_committed_blocks_for_di
 
     synced = apply_calendar_sync(schedule, events, date="2026-06-09")
 
-    assert synced["activities"] == []
-    assert synced["external_calendar_events"] == []
-    assert len(synced["committed_schedule_blocks"]) == 1
-    assert synced["committed_schedule_blocks"][0]["title"] == "Focused work"
-    assert synced["committed_schedule_blocks"][0]["calendar_event_id"] == "aaa56rom1dremffqoilppstv1g"
+    assert [item["title"] for item in synced["activities"]] == ["Focused work"]
+    assert [item["title"] for item in synced["external_calendar_events"]] == ["Focused work"]
+    assert synced["committed_schedule_blocks"] == []
+    assert synced["sync_links"][0]["calendar_event_id"] == "aaa56rom1dremffqoilppstv1g"
+
+
+def test_sync_prunes_orphan_jplan_calendar_committed_duplicates():
+    schedule = {
+        "date": "2026-06-09",
+        "activities": [{"id": "act-current", "stable_activity_id": "act-current", "title": "Focused work"}],
+        "schedule_blocks": [{"block_id": "act-current", "stable_activity_id": "act-current", "title": "Focused work"}],
+        "committed_schedule_blocks": [
+            {"block_id": "act-current", "stable_activity_id": "act-current", "title": "Focused work"},
+            {
+                "block_id": "act-old-export",
+                "stable_activity_id": "act-old-export",
+                "title": "Focused work",
+                "source_system": "jplan",
+                "read_only": True,
+                "calendar_event_id": "google-old",
+                "description": "Created via JPlan\n[JPLAN_META] {}",
+            },
+        ],
+        "external_calendar_events": [],
+        "sync_links": [],
+    }
+
+    synced = apply_calendar_sync(
+        schedule,
+        [google_event("google-old", "Focused work", metadata={"source_system": "jplan", "block_id": "act-old-export"})],
+        date="2026-06-09",
+    )
+
+    assert [block["block_id"] for block in synced["committed_schedule_blocks"]] == ["act-current"]
+    assert synced["activities"][0]["title"] == "Focused work"
+    assert [item["title"] for item in synced["external_calendar_events"]] == ["Focused work"]
 
 
 def test_replace_preview_is_non_mutating_and_confirm_applies():

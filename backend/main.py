@@ -341,6 +341,7 @@ class PlanRequest(BaseModel):
 class ExportRequest(BaseModel):
     user_id: str
     date: str
+    replace_google_day: Optional[bool] = False
 
 class CalendarImportRequest(BaseModel):
     user_id: str
@@ -1274,9 +1275,15 @@ async def export_calendar(request: ExportRequest):
         prepared = prepare_schedule_for_save(plan)
         if prepared != plan:
             plan = database.save_plan_from_envelope(prepared, request.user_id)
-        result = cal_service.export_schedule_to_google(request.user_id, request.date, plan)
+        export_plan = {**plan, "sync_links": []} if request.replace_google_day else plan
+        result = cal_service.export_schedule_to_google(
+            request.user_id,
+            request.date,
+            export_plan,
+            replace_google_day=bool(request.replace_google_day),
+        )
         if result.get("exported_events"):
-            linked = upsert_sync_links_from_export(plan, result.get("exported_events") or [])
+            linked = upsert_sync_links_from_export(export_plan, result.get("exported_events") or [])
             database.save_plan_from_envelope(linked, request.user_id)
             
         return {"message": "Success", **result}

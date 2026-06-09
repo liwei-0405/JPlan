@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import { Button } from "./ui/button";
 import { Label } from "./ui/label";
-import { AlertCircle, ArrowLeft, Bell, Calendar, Check, Home, Info, Loader2, MapPin, Search, Trash2 } from "lucide-react";
+import { AlertCircle, ArrowLeft, Check, Home, Info, Loader2, MapPin, Search, Trash2 } from "lucide-react";
 import { Switch } from "./ui/switch";
 import { Checkbox } from "./ui/checkbox";
 import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
@@ -67,11 +67,6 @@ export function PreferencesPage({ onBack }: PreferencesPageProps) {
   const [dayStart, setDayStart] = useState("8:00 AM");
   const [dayEnd, setDayEnd] = useState("10:00 PM");
   const [useDayBoundaries, setUseDayBoundaries] = useState(true);
-  const [allowWeekends, setAllowWeekends] = useState(true);
-  const [minimizeTravel, setMinimizeTravel] = useState(true);
-  const [notificationsEnabled, setNotificationsEnabled] = useState(true);
-  const [reminderBefore, setReminderBefore] = useState(true);
-  const [calendarConnected, setCalendarConnected] = useState(true);
   const [defaultStartLocation, setDefaultStartLocation] = useState<PlanningLocation | null>(null);
   const [defaultBufferMinutes, setDefaultBufferMinutes] = useState(5);
 
@@ -356,72 +351,26 @@ export function PreferencesPage({ onBack }: PreferencesPageProps) {
 
   return (
     <div className="min-h-screen bg-gradient-to-b from-background to-secondary/20">
-      <div className="max-w-2xl mx-auto px-6 py-8">
+      <div className="max-w-2xl mx-auto px-4 py-5 sm:px-6 sm:py-8">
         <Button 
           variant="ghost" 
           onClick={handleRequestBack}
-          className="mb-8 rounded-xl"
+          className="mb-5 rounded-xl sm:mb-8"
         >
           <ArrowLeft className="mr-2 h-4 w-4" />
           Back
         </Button>
 
-        <div className="mb-8">
+        <div className="mb-5 sm:mb-8">
           <h2 className="mb-2">Settings & Preferences</h2>
           <p className="text-muted-foreground">
             Customize your planning experience
           </p>
         </div>
 
-        <div className="space-y-6">
-          {/* Calendar Sync Status */}
-          <div className="bg-card rounded-2xl border border-border p-5 shadow-sm">
-            <div className="flex items-center gap-3 mb-4">
-              <Calendar className="h-5 w-5 text-primary" />
-              <h3>Calendar Connection</h3>
-            </div>
-
-            <div className="flex items-center justify-between mb-4">
-              <div>
-                <p className="text-sm mb-1">Status</p>
-                <div className="flex items-center gap-2">
-                  {calendarConnected ? (
-                    <>
-                      <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
-                      <span className="text-sm text-muted-foreground">Connected</span>
-                    </>
-                  ) : (
-                    <>
-                      <div className="w-2 h-2 rounded-full bg-gray-400" />
-                      <span className="text-sm text-muted-foreground">Disconnected</span>
-                    </>
-                  )}
-                </div>
-              </div>
-              <Button 
-                variant="outline" 
-                size="sm"
-                className="rounded-xl"
-                onClick={() => setCalendarConnected(!calendarConnected)}
-              >
-                {calendarConnected ? "Disconnect" : "Connect"}
-              </Button>
-            </div>
-
-            {calendarConnected && (
-              <Button 
-                variant="secondary" 
-                className="w-full rounded-xl"
-                size="sm"
-              >
-                <Check className="mr-2 h-4 w-4" />
-                Sync Now
-              </Button>
-            )}
-          </div>
-
+        <div className="space-y-4 sm:space-y-6">
           {/* Day Time Preferences */}
-          <div className="bg-card rounded-2xl border border-border p-5 shadow-sm">
+          <div className="bg-card rounded-2xl border border-border p-4 shadow-sm sm:p-5">
             <div className="mb-4 flex items-center justify-between gap-3">
               <div className="flex items-center gap-2">
                 <h3>Daily Schedule Preferences</h3>
@@ -448,7 +397,7 @@ export function PreferencesPage({ onBack }: PreferencesPageProps) {
             </div>
 
             <div
-              className={`grid grid-cols-2 gap-3 rounded-2xl border p-3 transition-all ${
+              className={`grid grid-cols-1 gap-3 rounded-2xl border p-3 transition-all sm:grid-cols-2 ${
                 useDayBoundaries
                   ? "border-transparent bg-transparent"
                   : "pointer-events-none border-border/60 bg-secondary/30 opacity-45 grayscale"
@@ -498,7 +447,7 @@ export function PreferencesPage({ onBack }: PreferencesPageProps) {
             </div>
 
             <div className="mt-4 rounded-2xl border border-border/60 bg-background/70 p-3">
-              <div className="flex items-center justify-between gap-3">
+              <div className="flex flex-wrap items-center justify-between gap-3">
                 <div>
                   <Label htmlFor="default-buffer-minutes" className="text-sm">
                     Default buffer time
@@ -524,59 +473,15 @@ export function PreferencesPage({ onBack }: PreferencesPageProps) {
             </div>
           </div>
 
-          {/* Notifications */}
-          <div className="bg-card rounded-2xl border border-border p-5 shadow-sm">
-            <div className="flex items-center gap-3 mb-4">
-              <Bell className="h-5 w-5 text-primary" />
-              <h3>Notifications</h3>
-            </div>
-
-            <div className="space-y-4">
-              <div className="flex items-center justify-between py-2">
-                <div>
-                  <Label htmlFor="notifications-enabled" className="text-sm">
-                    Enable Notifications
-                  </Label>
-                  <p className="text-xs text-muted-foreground mt-1">
-                    Get notified about your schedule
-                  </p>
-                </div>
-                <Switch
-                  id="notifications-enabled"
-                  checked={notificationsEnabled}
-                  onCheckedChange={setNotificationsEnabled}
-                />
-              </div>
-
-              {notificationsEnabled && (
-                <div className="flex items-center justify-between py-2 pl-4 border-l-2 border-primary/20">
-                  <div>
-                    <Label htmlFor="reminder-before" className="text-sm">
-                      Reminder Before Activity
-                    </Label>
-                    <p className="text-xs text-muted-foreground mt-1">
-                      Get a reminder 15 minutes before each activity
-                    </p>
-                  </div>
-                  <Switch
-                    id="reminder-before"
-                    checked={reminderBefore}
-                    onCheckedChange={setReminderBefore}
-                  />
-                </div>
-              )}
-            </div>
-          </div>
-
           {/* Saved Locations Section */}
-          <div className="bg-card rounded-2xl border border-border p-5 shadow-sm">
-            <div className="flex items-center justify-between gap-3 mb-4">
+          <div className="bg-card rounded-2xl border border-border p-4 shadow-sm sm:p-5">
+            <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
               <div className="flex items-center gap-3">
                 <MapPin className="h-5 w-5 text-primary" />
                 <h3>Saved Locations</h3>
               </div>
               {isChoosingDefaultStart ? (
-                <div className="flex gap-2">
+                <div className="flex flex-wrap gap-2">
                   <Button
                     size="sm"
                     className="rounded-xl"
@@ -680,7 +585,7 @@ export function PreferencesPage({ onBack }: PreferencesPageProps) {
             {/* Add Location Form */}
             <div className="rounded-2xl border border-dashed border-border bg-background/60 p-4">
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 mb-3">
-                <div>
+                <div className="min-w-0">
                   <Label htmlFor="location-label" className="text-xs mb-1.5 block">
                     Label
                   </Label>
@@ -768,8 +673,8 @@ export function PreferencesPage({ onBack }: PreferencesPageProps) {
                     const key = `${candidate.latitude}-${candidate.longitude}-${index}`;
                     return (
                       <div key={key} className="rounded-xl border border-border bg-card p-3">
-                        <div className="flex items-start justify-between gap-3">
-                          <div className="min-w-0">
+                        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                          <div className="min-w-0 flex-1">
                             <p className="text-sm font-medium leading-snug">
                               {candidate.display_name || candidate.address || "Unnamed location"}
                             </p>
@@ -809,49 +714,10 @@ export function PreferencesPage({ onBack }: PreferencesPageProps) {
             </div>
           </div>
 
-          {/* Planning Options */}
-          <div className="bg-card rounded-2xl border border-border p-5 shadow-sm">
-            <h3 className="mb-4">Planning Options</h3>
-            {/* ... existing planning options ... */}
-
-            <div className="space-y-4">
-              <div className="flex items-center justify-between py-2">
-                <div>
-                  <Label htmlFor="minimize-travel" className="text-sm">
-                    Minimize Travel Time
-                  </Label>
-                  <p className="text-xs text-muted-foreground mt-1">
-                    Group activities by location when possible
-                  </p>
-                </div>
-                <Switch
-                  id="minimize-travel"
-                  checked={minimizeTravel}
-                  onCheckedChange={setMinimizeTravel}
-                />
-              </div>
-
-              <div className="flex items-center justify-between py-2">
-                <div>
-                  <Label htmlFor="allow-weekends" className="text-sm">
-                    Include Weekend Planning
-                  </Label>
-                  <p className="text-xs text-muted-foreground mt-1">
-                    Allow schedules for Saturdays and Sundays
-                  </p>
-                </div>
-                <Switch
-                  id="allow-weekends"
-                  checked={allowWeekends}
-                  onCheckedChange={setAllowWeekends}
-                />
-              </div>
-            </div>
-          </div>
         </div>
 
         {/* Save Button */}
-        <div className="mt-8 flex gap-3">
+        <div className="mt-6 flex gap-3 sm:mt-8">
           <Button onClick={handleSave} className="flex-1 rounded-xl shadow-sm" disabled={isSavingPreferences}>
             {isSavingPreferences ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
             Save Preferences
@@ -861,11 +727,6 @@ export function PreferencesPage({ onBack }: PreferencesPageProps) {
           </Button>
         </div>
 
-        <div className="mt-6 bg-gradient-to-br from-[#d4e5ff]/20 to-[#d4e5ff]/5 rounded-2xl p-5 border border-[#d4e5ff]/30">
-          <p className="text-sm text-muted-foreground">
-            💡 These preferences help the system create schedules that align with your daily routines and constraints.
-          </p>
-        </div>
       </div>
 
       {showExitConfirmation && (
@@ -874,12 +735,12 @@ export function PreferencesPage({ onBack }: PreferencesPageProps) {
           role="dialog"
           aria-modal="true"
         >
-          <div className="w-full max-w-md rounded-2xl border border-border bg-card p-6 shadow-xl">
+          <div className="w-full max-w-md rounded-2xl border border-border bg-card p-4 shadow-xl sm:p-6">
             <h2 className="mb-2 text-xl font-semibold">Save preferences?</h2>
             <p className="mb-6 text-sm text-muted-foreground">
               You have unsaved preference changes. Save them before going back to the dashboard?
             </p>
-            <div className="flex justify-end gap-2">
+            <div className="flex flex-wrap justify-end gap-2">
               <Button
                 variant="outline"
                 className="rounded-xl"

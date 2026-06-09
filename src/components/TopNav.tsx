@@ -69,7 +69,7 @@ export function TopNav({
     const todayStr = formatLocalDate(new Date());
     const targetDate = syncDate || todayStr;
 
-    const syncToast = toast.loading(`Syncing calendar for ${targetDate}...`);
+    const syncToast = toast.loading(`Importing Google Calendar data for ${targetDate}...`);
 
     try {
       const response = await fetch(apiUrl('/api/sync-calendar'), {
@@ -100,10 +100,15 @@ export function TopNav({
 
       const data = await response.json();
 
-      toast.success(`Successfully synced ${data.events.length} events!`, {
+      const syncedDayCount = Array.isArray(data.synced_days) ? data.synced_days.length : 0;
+      const targetEventCount = Array.isArray(data.events) ? data.events.length : 0;
+      toast.success(
+        `Imported Google Calendar data into the external layer for ${syncedDayCount || "upcoming"} day${syncedDayCount === 1 ? "" : "s"}. ${targetEventCount} event${targetEventCount === 1 ? "" : "s"} are available for this date; open View Full Schedule to import selected events.`,
+        {
         id: syncToast,
-        duration: 5000
-      });
+        duration: 7000
+        }
+      );
 
       // Trigger refresh-less update if possible
       if (onSyncComplete) {
@@ -125,7 +130,7 @@ export function TopNav({
 
   return (
     <div className="border-b border-border bg-card/50 backdrop-blur-sm sticky top-0 z-50">
-      <div className="max-w-6xl mx-auto px-6 py-3 flex items-center justify-between">
+      <div className="mx-auto flex max-w-6xl items-center justify-between gap-3 px-4 py-3 sm:px-6">
         <div className="flex items-center gap-2">
           <h3 className="text-xl font-bold text-primary">JPlan</h3>
           <span className="text-[10px] px-2 py-0.5 rounded-full bg-primary/10 text-primary font-medium uppercase tracking-wider">
@@ -133,9 +138,9 @@ export function TopNav({
           </span>
         </div>
 
-        <div className="flex items-center gap-3">
+        <div className="flex min-w-0 items-center gap-2 sm:gap-3">
           {showSyncButton && (
-            <div className="hidden md:flex items-center gap-4">
+            <div className="calendar-sync-desktop items-center gap-4">
               {isGoogleLinked ? (
                 <>
                   <div className="flex items-center gap-2 text-sm text-muted-foreground mr-2">
@@ -150,7 +155,7 @@ export function TopNav({
                     onClick={handleSync}
                   >
                     <RefreshCw className="h-4 w-4" />
-                    Sync
+                    Import Calendar
                   </Button>
                 </>
               ) : (
@@ -189,8 +194,8 @@ export function TopNav({
           {profile && (
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
-                <Button variant="ghost" className="relative h-10 w-10 rounded-full">
-                  <Avatar className="h-10 w-10 border border-border">
+                <Button variant="ghost" className="relative h-9 w-9 rounded-full sm:h-10 sm:w-10">
+                  <Avatar className="h-9 w-9 border border-border sm:h-10 sm:w-10">
                     <AvatarImage
                       src={profile.avatar_url || ''}
                       alt={profile.full_name || ''}
@@ -202,16 +207,31 @@ export function TopNav({
                   </Avatar>
                 </Button>
               </DropdownMenuTrigger>
-              <DropdownMenuContent className="w-56" align="end" forceMount>
+              <DropdownMenuContent className="jplan-user-menu w-56" align="end" forceMount>
                 <DropdownMenuLabel className="font-normal">
-                  <div className="flex flex-col space-y-1">
-                    <p className="text-sm font-medium leading-none">{profile.full_name}</p>
-                    <p className="text-xs leading-none text-muted-foreground">
+                  <div className="flex min-w-0 flex-col space-y-1">
+                    <p className="truncate text-sm font-medium leading-none">{profile.full_name}</p>
+                    <p className="truncate text-xs leading-none text-muted-foreground">
                       {profile.email}
                     </p>
                   </div>
                 </DropdownMenuLabel>
                 <DropdownMenuSeparator />
+                {showSyncButton && (
+                  <>
+                    {isGoogleLinked ? (
+                      <DropdownMenuItem onSelect={handleSync} className="mobile-sync-menu-item">
+                        <RefreshCw className="mr-2 h-4 w-4" />
+                        <span>Import Calendar</span>
+                      </DropdownMenuItem>
+                    ) : (
+                      <DropdownMenuItem onSelect={handleLinkGoogle} className="mobile-sync-menu-item">
+                        <RefreshCw className="mr-2 h-4 w-4" />
+                        <span>Link Google Calendar</span>
+                      </DropdownMenuItem>
+                    )}
+                  </>
+                )}
                 {onSettingsClick && (
                   <DropdownMenuItem onSelect={onSettingsClick}>
                     <Settings className="mr-2 h-4 w-4" />

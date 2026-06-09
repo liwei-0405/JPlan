@@ -37,6 +37,10 @@ export function EventEditModal({
   }, [event]);
 
   useEffect(() => {
+    if (!formData.startTime || !formData.endTime) {
+      setIsConflict(false);
+      return;
+    }
     const newStartMins = timeToMinutes(formData.startTime);
     const newEndMins = timeToMinutes(formData.endTime);
     // Handle overnight normalization for conflict check
@@ -44,8 +48,11 @@ export function EventEditModal({
 
     const hasCollision = allActivities.some(act => {
       if (act.id === event.id) return false; // Skip the current event being edited
-      const s = timeToMinutes(act.startTime || act.start || "");
-      let e = timeToMinutes(act.endTime || act.end || "");
+      const actStartTime = act.startTime || act.start || "";
+      const actEndTime = act.endTime || act.end || "";
+      if (!actStartTime || !actEndTime) return false;
+      const s = timeToMinutes(actStartTime);
+      let e = timeToMinutes(actEndTime);
       if (e < s) e += 1440;
       return (newStartMins < e) && (effectiveEnd > s);
     });
@@ -55,6 +62,10 @@ export function EventEditModal({
 
   const handleSave = () => {
     const confirmedLocationName = formData.resolved_location?.display_name || formData.resolved_location?.address;
+    const mode = String(formData.timing_mode || "").toLowerCase() === "fixed" ? "fixed" : "preferred";
+    const hasStart = Boolean(formData.startTime);
+    const startMinutes = hasStart ? timeToMinutes(formData.startTime) : null;
+    const endMinutes = hasStart && formData.endTime ? normalizeEndMinutes(startMinutes ?? 0, timeToMinutes(formData.endTime)) : null;
     onSave({
       ...formData,
       title: formData.title.trim(),
@@ -63,10 +74,25 @@ export function EventEditModal({
       location_status: formData.resolved_location ? "resolved" : formData.location_status,
       start: formData.startTime,
       end: formData.endTime,
+      timing_mode: mode,
+      original_timing_mode: mode,
+      fixed_start: mode === "fixed" ? startMinutes : null,
+      fixed_end: mode === "fixed" ? endMinutes : null,
+      user_fixed_start: mode === "fixed" ? startMinutes : null,
+      is_user_fixed: mode === "fixed",
+      preferred_start: mode === "fixed" ? null : startMinutes,
+      scheduled_start: mode === "fixed" ? startMinutes : formData.scheduled_start,
+      scheduled_end: mode === "fixed" ? endMinutes : formData.scheduled_end,
+      can_move_for_repair: mode !== "fixed",
+      repair_protection: mode === "fixed" ? "fixed" : "flexible",
     });
   };
 
   const handleEndTimeChange = (newEndTime12h: string) => {
+    if (!newEndTime12h || !formData.startTime) {
+      setFormData({ ...formData, endTime: newEndTime12h });
+      return;
+    }
     const startMins = timeToMinutes(formData.startTime);
     const endMins = timeToMinutes(newEndTime12h);
     let diff = endMins - startMins;
@@ -80,6 +106,14 @@ export function EventEditModal({
   };
 
   const handleStartTimeChange = (newStartTime12h: string) => {
+    if (!newStartTime12h) {
+      setFormData({ ...formData, startTime: "", endTime: "" });
+      return;
+    }
+    if (!formData.endTime) {
+      setFormData({ ...formData, startTime: newStartTime12h });
+      return;
+    }
     const startMins = timeToMinutes(newStartTime12h);
     const endMins = timeToMinutes(formData.endTime);
     let diff = endMins - startMins;
@@ -100,6 +134,10 @@ export function EventEditModal({
     if (minMatch) totalMins += parseInt(minMatch[1]);
     if (!hourMatch && !minMatch) totalMins = parseFloat(durStr) * 60 || 0;
 
+    if (!formData.startTime) {
+      setFormData({ ...formData, duration: durStr });
+      return;
+    }
     const startMins = timeToMinutes(formData.startTime);
     const newEndMins = (startMins + totalMins) % 1440;
 
@@ -109,6 +147,7 @@ export function EventEditModal({
 
   const existingLocationCandidate = resolvedLocationToCandidate(formData);
   const existingLocationPoint = candidateToMapPoint(existingLocationCandidate);
+  const isFixedTime = String(formData.timing_mode || "").toLowerCase() === "fixed";
 
   const handleConfirmPickedLocation = async (candidate: GeocodeCandidate) => {
     const displayName = candidate.display_name || candidate.address || formData.location || formData.title;
@@ -139,10 +178,10 @@ export function EventEditModal({
   };
 
   return (
-    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
-      <div className="bg-card rounded-2xl border border-border shadow-xl max-w-md w-full max-h-[90vh] overflow-y-auto">
+    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-3 sm:p-4">
+      <div className="bg-card rounded-2xl border border-border shadow-xl max-w-md w-full max-h-[calc(100vh-1.5rem)] overflow-y-auto sm:max-h-[90vh]">
         {/* Header */}
-        <div className="flex items-center justify-between p-5 border-b border-border">
+        <div className="flex items-center justify-between p-4 border-b border-border sm:p-5">
           <div>
             <h3>Manual Edit</h3>
             <p className="text-sm text-muted-foreground mt-1">
@@ -160,7 +199,7 @@ export function EventEditModal({
         </div>
 
         {/* Content */}
-        <div className="p-5 space-y-4">
+        <div className="p-4 space-y-4 sm:p-5">
           {/* Activity Title */}
           <div>
             <Label htmlFor="title">Activity Title</Label>
@@ -174,9 +213,45 @@ export function EventEditModal({
           </div>
 
           {/* Time Fields */}
-          <div className="grid grid-cols-2 gap-3">
+          <div className="space-y-1.5">
+            <Label>Time behavior</Label>
+            <div className="grid grid-cols-2 gap-2 rounded-xl border border-border bg-secondary/20 p-1">
+              <Button
+                type="button"
+                size="sm"
+                variant={isFixedTime ? "default" : "ghost"}
+                className="rounded-lg text-xs"
+                onClick={() => setFormData({ ...formData, timing_mode: "fixed", original_timing_mode: "fixed" })}
+              >
+                Fixed time
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant={!isFixedTime ? "default" : "ghost"}
+                className="rounded-lg text-xs"
+                onClick={() => setFormData({
+                  ...formData,
+                  timing_mode: formData.startTime ? "preferred" : "unspecified",
+                  original_timing_mode: formData.startTime ? "preferred" : "unspecified",
+                  fixed_start: null,
+                  fixed_end: null,
+                  user_fixed_start: null,
+                  is_user_fixed: false,
+                  can_move_for_repair: true,
+                  repair_protection: "flexible",
+                })}
+              >
+                Flexible
+              </Button>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Flexible events can move. A start time becomes a preference, not a lock.
+            </p>
+          </div>
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
             <div>
-              <Label htmlFor="start-time">Start Time</Label>
+              <Label htmlFor="start-time">{isFixedTime ? "Start Time" : "Preferred Start (optional)"}</Label>
               <Input
                 id="start-time"
                 type="time"
@@ -186,7 +261,7 @@ export function EventEditModal({
               />
             </div>
             <div>
-              <Label htmlFor="end-time">End Time</Label>
+              <Label htmlFor="end-time">{isFixedTime ? "End Time" : "Preferred End (optional)"}</Label>
               <Input
                 id="end-time"
                 type="time"
@@ -199,7 +274,7 @@ export function EventEditModal({
 
           {/* Duration */}
           <div>
-            <Label htmlFor="duration">Duration (optional)</Label>
+            <Label htmlFor="duration">Duration</Label>
             <Input
               id="duration"
               value={formData.duration}
@@ -233,7 +308,7 @@ export function EventEditModal({
                 <p className="text-sm text-muted-foreground">No exact location selected.</p>
               )}
             </div>
-            <div className="mt-2 flex gap-2">
+            <div className="mt-2 flex flex-wrap gap-2">
               <Button
                 type="button"
                 variant="outline"
@@ -282,7 +357,7 @@ export function EventEditModal({
         </div>
 
         {/* Footer */}
-        <div className="p-5 border-t border-border flex flex-wrap gap-3">
+        <div className="p-4 border-t border-border flex flex-wrap gap-3 sm:p-5">
           {onDelete && (
             <Button
               onClick={onDelete}
@@ -302,8 +377,8 @@ export function EventEditModal({
           </Button>
           <Button
             onClick={handleSave}
-            className={`min-w-[124px] rounded-xl px-4 whitespace-nowrap ${isConflict ? "bg-destructive hover:bg-destructive/90" : ""}`}
-            disabled={!formData.title.trim() || !formData.startTime || !formData.endTime}
+            className={`min-w-[136px] rounded-xl px-4 whitespace-nowrap ${isConflict ? "bg-destructive hover:bg-destructive/90" : ""}`}
+            disabled={!formData.title.trim() || (isFixedTime && (!formData.startTime || !formData.endTime))}
           >
             {isConflict ? "Save Anyway" : "Save Changes"}
           </Button>
@@ -333,6 +408,12 @@ export function EventEditModal({
 function normalizeEventForEdit(event: ActivityBlock): ActivityBlock {
   const startTime = event.startTime || event.start || "";
   const endTime = event.endTime || event.end || "";
+  const fixed = Boolean(
+    event.is_user_fixed
+    || event.user_fixed_start != null
+    || event.fixed_start != null
+    || String(event.timing_mode || event.original_timing_mode || "").toLowerCase() === "fixed"
+  );
 
   return {
     ...event,
@@ -340,6 +421,8 @@ function normalizeEventForEdit(event: ActivityBlock): ActivityBlock {
     endTime,
     start: startTime,
     end: endTime,
+    timing_mode: fixed ? "fixed" : (event.timing_mode || (startTime ? "preferred" : "unspecified")),
+    original_timing_mode: fixed ? "fixed" : (event.original_timing_mode || event.timing_mode || (startTime ? "preferred" : "unspecified")),
     duration: event.duration || deriveDuration(startTime, endTime),
   };
 }
@@ -407,6 +490,10 @@ function timeToMinutes(timeStr: string): number {
     [hours, minutes] = timeStr.split(":").map(Number);
   }
   return hours * 60 + minutes;
+}
+
+function normalizeEndMinutes(startMinutes: number, endMinutes: number): number {
+  return endMinutes < startMinutes ? endMinutes + 1440 : endMinutes;
 }
 
 function minutesTo12Hour(totalMinutes: number): string {

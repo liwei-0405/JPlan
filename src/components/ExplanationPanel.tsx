@@ -25,17 +25,17 @@ export function ExplanationPanel({ schedule, onBack }: ExplanationPanelProps) {
 
   return (
     <div className="min-h-screen bg-gradient-to-b from-background to-secondary/20">
-      <div className="mx-auto max-w-3xl px-6 py-8">
+      <div className="mx-auto max-w-3xl px-4 py-5 sm:px-6 sm:py-8">
         <Button
           variant="ghost"
           onClick={onBack}
-          className="mb-8 rounded-xl"
+          className="mb-5 rounded-xl sm:mb-8"
         >
           <ArrowLeft className="mr-2 h-4 w-4" />
           Back to Schedule
         </Button>
 
-        <div className="mb-8">
+        <div className="mb-5 sm:mb-8">
           <div className="mb-2 flex items-center gap-2">
             <Sparkles className="h-6 w-6 text-primary" />
             <h2>Schedule Explanation</h2>
@@ -49,10 +49,10 @@ export function ExplanationPanel({ schedule, onBack }: ExplanationPanelProps) {
           {model.sections.map((section) => (
             <section
               key={section.id}
-              className="rounded-xl border border-border bg-card p-5 shadow-sm"
+              className="rounded-xl border border-border bg-card p-4 shadow-sm sm:p-5"
             >
               <div className="mb-4 flex gap-3">
-                <div className="mt-0.5 flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-xl bg-primary/10">
+                <div className="mt-0.5 flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-xl bg-primary/10 sm:h-10 sm:w-10">
                   {renderSectionIcon(section.icon)}
                 </div>
                 <div>
@@ -83,7 +83,7 @@ export function ExplanationPanel({ schedule, onBack }: ExplanationPanelProps) {
         </div>
 
         {model.technicalTrace.length > 0 && (
-          <details className="mt-6 rounded-xl border border-border bg-card p-5 text-sm">
+          <details className="mt-6 rounded-xl border border-border bg-card p-4 text-sm sm:p-5">
             <summary className="cursor-pointer font-medium">
               Technical trace
             </summary>
@@ -95,7 +95,7 @@ export function ExplanationPanel({ schedule, onBack }: ExplanationPanelProps) {
           </details>
         )}
 
-        <div className="mt-8 rounded-xl border border-[#fff9d4]/30 bg-gradient-to-br from-[#fff9d4]/20 to-[#fff9d4]/5 p-5">
+        <div className="mt-6 rounded-xl border border-[#fff9d4]/30 bg-gradient-to-br from-[#fff9d4]/20 to-[#fff9d4]/5 p-4 sm:mt-8 sm:p-5">
           <p className="text-sm text-muted-foreground">
             These explanations are generated from stored planner metadata: constraints, route validation, repair actions, and activity traces.
           </p>

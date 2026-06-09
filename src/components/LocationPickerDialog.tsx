@@ -183,6 +183,7 @@ export function LocationPickerDialog({
   const [isSearching, setIsSearching] = useState(false);
   const [showSavedLocations, setShowSavedLocations] = useState(false);
   const [showRecentLocations, setShowRecentLocations] = useState(false);
+  const [showSearchResults, setShowSearchResults] = useState(false);
   const [hasUserPickedLocation, setHasUserPickedLocation] = useState(false);
 
   useEffect(() => {
@@ -203,6 +204,7 @@ export function LocationPickerDialog({
     setHasUserPickedLocation(Boolean(initialCandidate || initialPin));
     setShowSavedLocations(false);
     setShowRecentLocations(false);
+    setShowSearchResults(false);
   }, [safeCandidates, initialCenter, initialPin, initialSearchQuery, open, savedCandidates, recentCandidates]);
 
   const handlePickPoint = (point: MapPoint) => {
@@ -211,6 +213,7 @@ export function LocationPickerDialog({
     setHasUserPickedLocation(true);
     setShowSavedLocations(false);
     setShowRecentLocations(false);
+    setShowSearchResults(false);
     setNotice(referenceLabel ? `Pin selected near ${referenceLabel}.` : (label ? `Pin selected for ${label}.` : "Pin selected on the map."));
   };
 
@@ -239,6 +242,7 @@ export function LocationPickerDialog({
         setHasUserPickedLocation(true);
         setShowSavedLocations(false);
         setShowRecentLocations(false);
+        setShowSearchResults(false);
         setReferenceLabel("your current location");
         setNotice("Centered on your current location. Adjust the pin if needed before confirming.");
       },
@@ -257,6 +261,7 @@ export function LocationPickerDialog({
       const result = await geocodeLocation(searchQuery.trim(), searchCategory);
       const results = result.candidates || [];
       setSearchResults(results);
+      setShowSearchResults(results.length > 0);
       if (results.length) {
         const candidate = results[0];
         const point = candidateToMapPoint(candidate);
@@ -272,9 +277,11 @@ export function LocationPickerDialog({
       if (warning) {
         setNotice(warning);
       } else if (!results.length) {
+        setShowSearchResults(false);
         setNotice("No search results found. You can still click the exact point on the map.");
       }
     } catch (error) {
+      setShowSearchResults(false);
       setNotice("Location search is unavailable right now. You can still click the map manually.");
     } finally {
       setIsSearching(false);
@@ -291,6 +298,7 @@ export function LocationPickerDialog({
     setHasUserPickedLocation(true);
     setShowSavedLocations(false);
     setShowRecentLocations(false);
+    setShowSearchResults(false);
     setNotice(`Pin moved to ${candidate.display_name || candidate.address || "the selected result"}.`);
   };
 
@@ -320,7 +328,7 @@ export function LocationPickerDialog({
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
-        className="max-w-3xl rounded-2xl overflow-visible"
+        className={`location-picker-dialog-content max-w-3xl rounded-2xl p-4 sm:p-6 ${showSearchResults && searchResults.length > 0 ? "has-search-results" : ""}`}
         hideCloseButton
         style={{
           position: "fixed",
@@ -328,7 +336,8 @@ export function LocationPickerDialog({
           top: "50%",
           transform: "translate(-50%, -50%)",
           zIndex: 80,
-          maxHeight: "92vh",
+          maxHeight: "min(92vh, 840px)",
+          width: "calc(100vw - 1rem)",
         }}
       >
         <DialogHeader className="space-y-1">
@@ -338,7 +347,7 @@ export function LocationPickerDialog({
           </DialogDescription>
         </DialogHeader>
 
-        <div className="rounded-2xl border border-border bg-background px-4 py-3">
+        <div className="rounded-2xl border border-border bg-background px-3 py-2.5 sm:px-4 sm:py-3">
           <p className="mb-2 text-sm font-semibold text-primary">Selected location</p>
           <div className="flex min-w-0 items-start gap-3">
             <MapPin className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
@@ -370,7 +379,7 @@ export function LocationPickerDialog({
                 </button>
                 {showSavedLocations && (
                   <div
-                    className="absolute left-0 top-[calc(100%+6px)] z-[1000] max-h-52 w-[calc(50%-0.25rem)] space-y-1 overflow-y-auto rounded-2xl border border-border bg-card p-2 shadow-2xl"
+                    className="absolute left-0 top-[calc(100%+6px)] z-[1000] max-h-[42vh] w-[calc(100vw-3rem)] space-y-1 overflow-y-auto rounded-2xl border border-border bg-card p-2 shadow-2xl sm:max-h-52 sm:w-[calc(50%-0.25rem)]"
                     style={{ zIndex: 10000 }}
                   >
                     {savedCandidates.map((candidate, index) => (
@@ -411,7 +420,7 @@ export function LocationPickerDialog({
                 </button>
                 {showRecentLocations && (
                   <div
-                    className="absolute right-0 top-[calc(100%+6px)] z-[1000] max-h-52 w-[calc(50%-0.25rem)] space-y-1 overflow-y-auto rounded-2xl border border-border bg-card p-2 shadow-2xl"
+                    className="absolute right-0 top-[calc(100%+6px)] z-[1000] max-h-[42vh] w-[calc(100vw-3rem)] space-y-1 overflow-y-auto rounded-2xl border border-border bg-card p-2 shadow-2xl sm:max-h-52 sm:w-[calc(50%-0.25rem)]"
                     style={{ zIndex: 10000 }}
                   >
                     {recentCandidates.map((candidate, index) => (
@@ -439,7 +448,7 @@ export function LocationPickerDialog({
           </div>
         )}
 
-        <div className="rounded-2xl border border-border bg-secondary/10 p-2.5">
+        <div className="relative z-[850] rounded-2xl border border-border bg-secondary/10 p-2.5">
           <div className="flex flex-col gap-2 sm:flex-row">
             <Input
               value={searchQuery}
@@ -475,30 +484,29 @@ export function LocationPickerDialog({
               Use my current location
             </Button>
           </div>
-        </div>
-
-        {!hasUserPickedLocation && searchResults.length > 0 && (
-          <div className="max-h-28 space-y-1 overflow-y-auto rounded-2xl border border-border bg-secondary/10 p-2">
-            {searchResults.slice(0, 8).map((candidate, index) => (
-              <button
-                type="button"
-                key={`${candidate.latitude}-${candidate.longitude}-${candidate.display_name || candidate.address || index}`}
-                className="flex w-full items-start gap-2 rounded-xl px-2 py-1.5 text-left text-xs hover:bg-background"
-                onClick={() => handleSelectCandidate(candidate)}
-              >
-                <MapPin className="mt-0.5 h-3.5 w-3.5 shrink-0 text-primary" />
-                <span>
-                  <span className="block font-medium text-foreground">
-                    {candidate.display_name || candidate.address || "Location result"}
+          {showSearchResults && searchResults.length > 0 && (
+            <div className="absolute left-2 right-2 top-[calc(100%+6px)] z-[1200] max-h-44 space-y-1 overflow-y-auto rounded-2xl border border-border bg-card p-2 shadow-2xl">
+              {searchResults.slice(0, 6).map((candidate, index) => (
+                <button
+                  type="button"
+                  key={`${candidate.latitude}-${candidate.longitude}-${candidate.display_name || candidate.address || index}`}
+                  className="flex w-full items-start gap-2 rounded-xl px-2 py-1.5 text-left text-xs hover:bg-secondary"
+                  onClick={() => handleSelectCandidate(candidate)}
+                >
+                  <MapPin className="mt-0.5 h-3.5 w-3.5 shrink-0 text-primary" />
+                  <span className="min-w-0">
+                    <span className="block truncate font-medium text-foreground">
+                      {candidate.display_name || candidate.address || "Location result"}
+                    </span>
+                    {candidate.address && candidate.address !== candidate.display_name && (
+                      <span className="block truncate text-muted-foreground">{candidate.address}</span>
+                    )}
                   </span>
-                  {candidate.address && candidate.address !== candidate.display_name && (
-                    <span className="block text-muted-foreground">{candidate.address}</span>
-                  )}
-                </span>
-              </button>
-            ))}
-          </div>
-        )}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
 
         <div className="location-picker-map relative z-0 overflow-hidden rounded-2xl border border-border">
           <MapContainer
@@ -506,7 +514,7 @@ export function LocationPickerDialog({
             zoom={16}
             scrollWheelZoom
             className="location-picker-map w-full"
-            style={{ height: 320, width: "100%", zIndex: 0 }}
+            style={{ height: "var(--location-picker-map-height, clamp(190px, 30vh, 300px))", width: "100%", zIndex: 0 }}
           >
             <TileLayer
               attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
@@ -521,26 +529,26 @@ export function LocationPickerDialog({
           </MapContainer>
         </div>
 
-        <DialogFooter className="items-center gap-2 sm:justify-between">
-          <p className="max-w-md text-xs text-muted-foreground">
+        <DialogFooter className="location-picker-footer flex-col items-stretch gap-2 sm:flex-row sm:items-center sm:justify-between">
+          <p className="min-w-0 text-xs leading-snug text-muted-foreground sm:flex-1">
             Click the exact building entrance or closest point, then save.
           </p>
-          <div className="flex shrink-0 gap-2">
+          <div className="grid w-full grid-cols-2 gap-2 sm:w-[360px] sm:shrink-0">
             <Button
               variant="outline"
-              className="rounded-xl"
+              className="min-w-0 rounded-xl px-3"
               onClick={() => onOpenChange(false)}
               disabled={saving}
             >
               Cancel
             </Button>
             <Button
-              className="rounded-xl"
+              className="min-w-0 rounded-xl px-3"
               onClick={handleConfirm}
               disabled={!pin || !hasUserPickedLocation || saving}
             >
               {saving ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Check className="mr-2 h-4 w-4" />}
-              {confirmLabel}
+              <span className="truncate">{confirmLabel}</span>
             </Button>
           </div>
         </DialogFooter>

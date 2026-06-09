@@ -41,6 +41,9 @@ export function CalendarWidget({ scheduleDates, onDateSelect, selectedDate }: Ca
   for (let day = 1; day <= daysInMonth; day++) {
     calendarDays.push(day);
   }
+  while (calendarDays.length < 42) {
+    calendarDays.push(null);
+  }
 
   const hasScheduleOnDate = (day: number): boolean => {
     const date = new Date(year, month, day);
@@ -89,7 +92,7 @@ export function CalendarWidget({ scheduleDates, onDateSelect, selectedDate }: Ca
   };
 
   return (
-    <div className="bg-card rounded-2xl border border-border p-5 shadow-sm">
+    <div className="jplan-calendar-card bg-card rounded-2xl border border-border p-4 shadow-sm sm:p-5">
       {/* Month Header */}
       <div className="flex items-center justify-between mb-4">
         <h3>{monthNames[month]} {year}</h3>
@@ -114,7 +117,7 @@ export function CalendarWidget({ scheduleDates, onDateSelect, selectedDate }: Ca
       </div>
 
       {/* Day Names */}
-      <div className="grid grid-cols-7 gap-2 mb-2">
+      <div className="grid grid-cols-7 gap-1.5 mb-2 sm:gap-2">
         {dayNames.map(day => (
           <div 
             key={day} 
@@ -126,14 +129,14 @@ export function CalendarWidget({ scheduleDates, onDateSelect, selectedDate }: Ca
       </div>
 
       {/* Calendar Grid */}
-      <div className="grid grid-cols-7 gap-2">
+      <div className="jplan-calendar-grid grid grid-cols-7 gap-1.5 sm:gap-2">
         {calendarDays.map((day, index) => (
-          <div key={index} className="aspect-square">
+          <div key={index} className="jplan-calendar-day-cell">
             {day !== null ? (
               <button
                 onClick={() => handleDayClick(day)}
                 className={`
-                  w-full h-full rounded-xl flex flex-col items-center justify-center
+                  w-full h-full rounded-lg sm:rounded-xl flex flex-col items-center justify-center
                   transition-all duration-200 relative
                   ${isToday(day) 
                     ? 'bg-primary text-primary-foreground shadow-md ring-2 ring-primary/20' 
@@ -143,7 +146,7 @@ export function CalendarWidget({ scheduleDates, onDateSelect, selectedDate }: Ca
                   }
                 `}
               >
-                <span className="text-sm">{day}</span>
+                <span className="text-xs sm:text-sm">{day}</span>
                 {hasScheduleOnDate(day) && (
                   <div className={`
                     w-1.5 h-1.5 rounded-full mt-0.5

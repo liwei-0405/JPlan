@@ -419,12 +419,13 @@ export async function deletePlan(date: string, userId: string): Promise<{ succes
 /**
  * Export a daily schedule to Google Calendar via backend API
  */
-export async function exportPlanToGoogle(date: string, userId: string): Promise<{
+export async function exportPlanToGoogle(date: string, userId: string, replaceGoogleDay = false): Promise<{
     success: boolean;
     exportedCount?: number;
     activityCount?: number;
     travelCount?: number;
     skippedCount?: number;
+    deletedCount?: number;
     error?: string;
 }> {
     try {
@@ -432,7 +433,7 @@ export async function exportPlanToGoogle(date: string, userId: string): Promise<
         const response = await fetch(`${API_BASE_URL}/api/export-calendar`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ user_id: userId, date }),
+            body: JSON.stringify({ user_id: userId, date, replace_google_day: replaceGoogleDay }),
         });
         if (!response.ok) {
             let detail = 'Failed';
@@ -451,6 +452,7 @@ export async function exportPlanToGoogle(date: string, userId: string): Promise<
             activityCount: data.activity_count,
             travelCount: data.travel_count,
             skippedCount: data.skipped_count,
+            deletedCount: data.deleted_count,
         };
     } catch (err) {
         return { success: false, error: 'Connection failed' };
