@@ -404,6 +404,7 @@ export function PlanningInputPage({
   // Voice Recognition state
   const [isRecording, setIsRecording] = useState(false);
   const recognitionRef = useRef<any>(null);
+  const recognitionFinalTranscriptRef = useRef("");
 
   const startSpeechRecognition = () => {
     const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
@@ -425,22 +426,38 @@ export function PlanningInputPage({
 
     recognition.onstart = () => {
       setIsRecording(true);
+      recognitionFinalTranscriptRef.current = "";
       setChatInput(""); // Clear before starting
     };
 
     recognition.onresult = (event: any) => {
-      let finalTranscript = '';
-      let interimTranscript = '';
+      let interimTranscript = "";
+      const startIndex = typeof event.resultIndex === "number" ? event.resultIndex : 0;
+      let finalTranscriptFromEvent = "";
 
-      for (let i = 0; i < event.results.length; ++i) {
+      for (let i = startIndex; i < event.results.length; ++i) {
+        const transcript = String(event.results[i]?.[0]?.transcript || "").trim();
+        if (!transcript) continue;
         if (event.results[i].isFinal) {
-          finalTranscript += event.results[i][0].transcript;
+          finalTranscriptFromEvent = [finalTranscriptFromEvent, transcript].filter(Boolean).join(" ");
         } else {
-          interimTranscript += event.results[i][0].transcript;
+          interimTranscript = [interimTranscript, transcript].filter(Boolean).join(" ");
         }
       }
 
-      setChatInput(finalTranscript + interimTranscript);
+      if (finalTranscriptFromEvent) {
+        recognitionFinalTranscriptRef.current = startIndex === 0
+          ? finalTranscriptFromEvent
+          : [recognitionFinalTranscriptRef.current, finalTranscriptFromEvent].filter(Boolean).join(" ");
+      }
+
+      setChatInput(
+        [recognitionFinalTranscriptRef.current, interimTranscript]
+          .filter(Boolean)
+          .join(" ")
+          .replace(/\s+/g, " ")
+          .slice(0, CHAT_INPUT_MAX_LENGTH)
+      );
     };
 
     recognition.onerror = (event: any) => {

@@ -11,6 +11,7 @@ import { SignupPage } from "./components/auth/SignupPage";
 import { AdminSignupPage } from "./components/auth/AdminSignupPage";
 import { useAuth } from "./context/AuthContext";
 import { getAllPlans, savePlan as savePlanToDb } from "./services/planService";
+import { apiUrl } from "./services/apiConfig";
 
 export type Page =
   | "entry"
@@ -207,6 +208,29 @@ const formatToISODate = (date: Date) => {
   return `${yyyy}-${mm}-${dd}`;
 };
 
+type BackendStatus = "idle" | "checking" | "waiting" | "ready";
+
+const BackendPendingScreen: React.FC<{ status: BackendStatus; onRetry: () => void }> = ({ status, onRetry }) => (
+  <div className="flex min-h-screen items-center justify-center bg-gradient-to-b from-background to-secondary/20 px-6">
+    <div className="w-full max-w-md rounded-2xl border border-border bg-card p-6 text-center shadow-lg">
+      <div className="mx-auto mb-4 h-10 w-10 animate-spin rounded-full border-2 border-primary/20 border-t-primary" />
+      <h2 className="mb-2 text-xl font-semibold">Starting JPlan</h2>
+      <p className="text-sm leading-6 text-muted-foreground">
+        {status === "waiting"
+          ? "The backend is still waking up. JPlan will unlock automatically once it connects."
+          : "Checking the backend connection before loading your plans."}
+      </p>
+      <button
+        type="button"
+        onClick={onRetry}
+        className="mt-5 rounded-xl border border-border px-4 py-2 text-sm font-medium transition-colors hover:bg-secondary"
+      >
+        Retry now
+      </button>
+    </div>
+  </div>
+);
+
 const ProtectedRoute: React.FC<{ children: React.ReactNode; adminOnly?: boolean }> = ({ children, adminOnly = false }) => {
   const { user, loading, isAdmin } = useAuth();
   const location = useLocation();
@@ -234,10 +258,47 @@ export default function App() {
   const [scheduleHistory, setScheduleHistory] = useState<DailySchedule[]>([]);
   const [planningDate, setPlanningDate] = useState<Date>(new Date());
   const [isLoadingPlans, setIsLoadingPlans] = useState(true);
+  const [backendStatus, setBackendStatus] = useState<BackendStatus>("idle");
+  const [backendAttempt, setBackendAttempt] = useState(0);
+
+  useEffect(() => {
+    if (loading) return;
+    if (!user) {
+      setBackendStatus("idle");
+      return;
+    }
+
+    let cancelled = false;
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
+    const controller = new AbortController();
+    const timeoutTimer = setTimeout(() => controller.abort(), 15000);
+
+    setBackendStatus((current) => current === "ready" ? "ready" : "checking");
+    fetch(apiUrl("/health"), { signal: controller.signal, cache: "no-store" })
+      .then((response) => {
+        if (!response.ok) throw new Error("Backend health check failed");
+        if (!cancelled) setBackendStatus("ready");
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setBackendStatus("waiting");
+        retryTimer = setTimeout(() => {
+          setBackendAttempt((attempt) => attempt + 1);
+        }, 3000);
+      })
+      .finally(() => clearTimeout(timeoutTimer));
+
+    return () => {
+      cancelled = true;
+      controller.abort();
+      clearTimeout(timeoutTimer);
+      if (retryTimer) clearTimeout(retryTimer);
+    };
+  }, [user?.id, loading, backendAttempt]);
 
   // Load all plans from Supabase on mount/user change
   useEffect(() => {
-    if (!user) return;
+    if (!user || backendStatus !== "ready") return;
 
     const loadPlans = async () => {
       setIsLoadingPlans(true);
@@ -252,7 +313,7 @@ export default function App() {
     };
 
     loadPlans();
-  }, [user]);
+  }, [user, backendStatus]);
 
   // Catch OAuth errors in URL
   useEffect(() => {
@@ -308,6 +369,15 @@ export default function App() {
 
   if (loading) {
     return <div className="flex h-screen items-center justify-center">Loading session...</div>;
+  }
+
+  if (user && backendStatus !== "ready") {
+    return (
+      <BackendPendingScreen
+        status={backendStatus}
+        onRetry={() => setBackendAttempt((attempt) => attempt + 1)}
+      />
+    );
   }
 
   return (
