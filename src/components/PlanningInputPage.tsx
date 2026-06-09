@@ -67,6 +67,35 @@ import {
 
 const CHAT_INPUT_MAX_LENGTH = 500;
 
+function compactSpeechParts(parts: string[]): string {
+  return parts.reduce((current, rawPart) => {
+    const part = String(rawPart || "").replace(/\s+/g, " ").trim();
+    if (!part) return current;
+    if (!current) return part;
+    const currentLower = current.toLowerCase();
+    const partLower = part.toLowerCase();
+    if (partLower === currentLower || currentLower.endsWith(partLower)) return current;
+    if (partLower.startsWith(currentLower)) return part;
+    return `${current} ${part}`;
+  }, "");
+}
+
+function buildSpeechTranscript(results: SpeechRecognitionResultList | any): string {
+  const finalParts: string[] = [];
+  let latestInterim = "";
+  for (let i = 0; i < results.length; i += 1) {
+    const result = results[i];
+    const transcript = String(result?.[0]?.transcript || "").replace(/\s+/g, " ").trim();
+    if (!transcript) continue;
+    if (result.isFinal) {
+      finalParts.push(transcript);
+    } else {
+      latestInterim = transcript;
+    }
+  }
+  return compactSpeechParts([...finalParts, latestInterim]).slice(0, CHAT_INPUT_MAX_LENGTH);
+}
+
 function isSchedulableEventBlock(block?: Partial<ActivityBlock> | null): boolean {
   if (!block) return false;
   const kind = String(block.block_type || block.type || "").toLowerCase();
@@ -376,6 +405,7 @@ export function PlanningInputPage({
   const [manualActivityType, setManualActivityType] = useState<"activity" | "buffer">("activity");
   const [manualTimingMode, setManualTimingMode] = useState<"fixed" | "flexible">("fixed");
   const [isConflict, setIsConflict] = useState(false);
+  const [planningInfoOpen, setPlanningInfoOpen] = useState(false);
 
   // Chat state
   const [chatInput, setChatInput] = useState("");
@@ -404,7 +434,6 @@ export function PlanningInputPage({
   // Voice Recognition state
   const [isRecording, setIsRecording] = useState(false);
   const recognitionRef = useRef<any>(null);
-  const recognitionFinalTranscriptRef = useRef("");
 
   const startSpeechRecognition = () => {
     const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
@@ -422,42 +451,16 @@ export function PlanningInputPage({
 
     recognition.lang = 'en-US';
     recognition.interimResults = true;
-    recognition.continuous = true;
+    const isCoarsePointer = typeof window !== "undefined" && window.matchMedia?.("(pointer: coarse)").matches;
+    recognition.continuous = !isCoarsePointer;
 
     recognition.onstart = () => {
       setIsRecording(true);
-      recognitionFinalTranscriptRef.current = "";
       setChatInput(""); // Clear before starting
     };
 
     recognition.onresult = (event: any) => {
-      let interimTranscript = "";
-      const startIndex = typeof event.resultIndex === "number" ? event.resultIndex : 0;
-      let finalTranscriptFromEvent = "";
-
-      for (let i = startIndex; i < event.results.length; ++i) {
-        const transcript = String(event.results[i]?.[0]?.transcript || "").trim();
-        if (!transcript) continue;
-        if (event.results[i].isFinal) {
-          finalTranscriptFromEvent = [finalTranscriptFromEvent, transcript].filter(Boolean).join(" ");
-        } else {
-          interimTranscript = [interimTranscript, transcript].filter(Boolean).join(" ");
-        }
-      }
-
-      if (finalTranscriptFromEvent) {
-        recognitionFinalTranscriptRef.current = startIndex === 0
-          ? finalTranscriptFromEvent
-          : [recognitionFinalTranscriptRef.current, finalTranscriptFromEvent].filter(Boolean).join(" ");
-      }
-
-      setChatInput(
-        [recognitionFinalTranscriptRef.current, interimTranscript]
-          .filter(Boolean)
-          .join(" ")
-          .replace(/\s+/g, " ")
-          .slice(0, CHAT_INPUT_MAX_LENGTH)
-      );
+      setChatInput(buildSpeechTranscript(event.results));
     };
 
     recognition.onerror = (event: any) => {
@@ -2172,7 +2175,7 @@ export function PlanningInputPage({
                   <Settings2 size={16} /> Manual Mode
                 </Button>
               </div>
-              <Tooltip>
+              <Tooltip open={planningInfoOpen} onOpenChange={setPlanningInfoOpen}>
                 <TooltipTrigger asChild>
                   <Button
                     type="button"
@@ -2181,6 +2184,7 @@ export function PlanningInputPage({
                     className="h-9 w-9 rounded-full"
                     disabled={isScheduleBusy}
                     aria-label="Planning mode information"
+                    onClick={() => setPlanningInfoOpen((open) => !open)}
                   >
                     <Info className="h-4 w-4 text-muted-foreground" />
                   </Button>
@@ -2806,6 +2810,8 @@ function CompactPlanningToggle({
   tooltip: string;
   ariaLabel: string;
 }) {
+  const [tooltipOpen, setTooltipOpen] = useState(false);
+
   return (
     <div
       className={`inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs shadow-sm transition-colors ${
@@ -2822,13 +2828,17 @@ function CompactPlanningToggle({
         aria-label={ariaLabel}
         className="scale-75"
       />
-      <Tooltip>
+      <Tooltip open={tooltipOpen} onOpenChange={setTooltipOpen}>
         <TooltipTrigger asChild>
           <button
             type="button"
             className="inline-flex h-5 w-5 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-50"
             disabled={disabled}
             aria-label={`${label} help`}
+            onClick={(event) => {
+              event.preventDefault();
+              setTooltipOpen((open) => !open);
+            }}
           >
             <Info className="h-3.5 w-3.5" />
           </button>
