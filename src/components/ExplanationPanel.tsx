@@ -1,6 +1,7 @@
-import { AlertTriangle, ArrowLeft, Clock, Info, Lock, Route, SlidersHorizontal, Sparkles } from "lucide-react";
+import { AlertTriangle, ArrowLeft, Clock, Info, Lock, Route, SlidersHorizontal } from "lucide-react";
 import type { ActivityBlock, DailySchedule } from "../App";
 import { Button } from "./ui/button";
+import { jplanLogoUrl } from "../brand";
 
 type ExplanationPanelProps = {
   schedule: DailySchedule;
@@ -37,7 +38,7 @@ export function ExplanationPanel({ schedule, onBack }: ExplanationPanelProps) {
 
         <div className="mb-5 sm:mb-8">
           <div className="mb-2 flex items-center gap-2">
-            <Sparkles className="h-6 w-6 text-primary" />
+            <img src={jplanLogoUrl} alt="JPlan logo" className="brand-logo-heading rounded-md object-cover shadow-sm" />
             <h2>Schedule Explanation</h2>
           </div>
           <p className="text-muted-foreground">

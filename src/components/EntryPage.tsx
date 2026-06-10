@@ -6,6 +6,7 @@ import type { ActivityBlock, DailySchedule } from "../App";
 import { useState } from "react";
 import { TimelineGrid } from "./TimelineGrid";
 import { getBlocksForView } from "../utils/scheduleDisplayUtils";
+import { jplanLogoUrl } from "../brand";
 
 type EntryPageProps = {
   onStartPlanning: (date: Date) => void;
@@ -225,7 +226,7 @@ export function EntryPage({
         {/* Header */}
         <div className="entry-header">
           <div className="flex items-center gap-2 mb-2">
-            <Sparkles className="h-6 w-6 text-primary" />
+            <img src={jplanLogoUrl} alt="JPlan logo" className="brand-logo-entry rounded-lg object-cover shadow-sm" />
             <h1>Welcome to JPlan</h1>
           </div>
           <p className="text-muted-foreground">

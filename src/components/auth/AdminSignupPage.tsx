@@ -5,8 +5,9 @@ import { Button } from '../ui/button';
 import { Input } from '../ui/input';
 import { Label } from '../ui/label';
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from '../ui/card';
-import { CalendarDays, ShieldCheck } from 'lucide-react';
+import { ShieldCheck } from 'lucide-react';
 import { toast } from 'sonner';
+import { jplanLogoUrl } from '../../brand';
 
 export const AdminSignupPage: React.FC = () => {
   const [email, setEmail] = useState('');
@@ -46,8 +47,11 @@ export const AdminSignupPage: React.FC = () => {
       <Card className="w-full max-w-md border-slate-200 shadow-lg dark:border-slate-800">
         <CardHeader className="space-y-1 text-center">
           <div className="flex justify-center mb-4">
-            <div className="bg-primary/10 p-3 rounded-xl">
-              <ShieldCheck className="h-10 w-10 text-primary" />
+            <div className="relative">
+              <img src={jplanLogoUrl} alt="JPlan logo" className="brand-logo-auth rounded-2xl object-cover shadow-md" />
+              <span className="absolute -bottom-1 -right-1 rounded-full bg-primary p-1 text-primary-foreground shadow-sm">
+                <ShieldCheck className="h-3.5 w-3.5" />
+              </span>
             </div>
           </div>
           <CardTitle className="text-3xl font-bold tracking-tight text-primary">Admin Registration</CardTitle>

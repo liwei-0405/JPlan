@@ -13,6 +13,7 @@ import {
   type SavedLocation,
 } from "../services/planService";
 import { apiUrl } from "../services/apiConfig";
+import { jplanLogoUrl } from "../brand";
 import { Button } from "./ui/button";
 import { Textarea } from "./ui/textarea";
 import { Input } from "./ui/input";
@@ -1975,7 +1976,14 @@ export function PlanningInputPage({
         </Button>
 
         <div className="planning-page-header">
-          <h2 className="mb-2">Plan Your Day</h2>
+          <div className="mb-2 flex items-center gap-2">
+            <img
+              src={jplanLogoUrl}
+              alt="JPlan logo"
+              className="brand-logo-heading rounded-md object-cover shadow-sm"
+            />
+            <h2>Plan Your Day</h2>
+          </div>
           <p className="text-muted-foreground">
             Build a draft plan with AI or manual edits, then save when you're happy with it
           </p>

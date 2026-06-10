@@ -5,8 +5,9 @@ import { Button } from '../ui/button';
 import { Input } from '../ui/input';
 import { Label } from '../ui/label';
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from '../ui/card';
-import { CalendarDays, LogIn } from 'lucide-react';
+import { LogIn } from 'lucide-react';
 import { toast } from 'sonner';
+import { jplanLogoUrl } from '../../brand';
 
 export const LoginPage: React.FC = () => {
   const [email, setEmail] = useState('');
@@ -56,11 +57,8 @@ export const LoginPage: React.FC = () => {
       <Card className="w-full max-w-md border-slate-200 shadow-lg dark:border-slate-800">
         <CardHeader className="space-y-1 text-center">
           <div className="flex justify-center mb-4">
-            <div className="bg-primary/10 p-3 rounded-xl">
-              <CalendarDays className="h-10 w-10 text-primary" />
-            </div>
+            <img src={jplanLogoUrl} alt="JPlan logo" className="brand-logo-auth rounded-2xl object-cover shadow-md" />
           </div>
-          <CardTitle className="text-3xl font-bold tracking-tight text-primary">JPlan</CardTitle>
           <CardDescription className="text-slate-500 dark:text-slate-400">
             A feasibility-aware daily planning assistant
           </CardDescription>

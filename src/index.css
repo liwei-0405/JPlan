@@ -2388,6 +2388,30 @@ html {
 }
 
 /* JPlan responsive layout polish */
+.brand-logo-nav {
+  width: 28px;
+  height: 28px;
+  flex: 0 0 28px;
+}
+
+.brand-logo-entry {
+  width: 32px;
+  height: 32px;
+  flex: 0 0 32px;
+}
+
+.brand-logo-heading {
+  width: 24px;
+  height: 24px;
+  flex: 0 0 24px;
+}
+
+.brand-logo-auth {
+  width: 64px;
+  height: 64px;
+  flex: 0 0 64px;
+}
+
 .calendar-sync-desktop {
   display: none;
 }

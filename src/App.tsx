@@ -9,9 +9,11 @@ import { PreferencesPage } from "./components/PreferencesPage";
 import { LoginPage } from "./components/auth/LoginPage";
 import { SignupPage } from "./components/auth/SignupPage";
 import { AdminSignupPage } from "./components/auth/AdminSignupPage";
+import { PrivacyPage, TermsPage } from "./components/LegalPage";
 import { useAuth } from "./context/AuthContext";
 import { getAllPlans, savePlan as savePlanToDb } from "./services/planService";
 import { apiUrl } from "./services/apiConfig";
+import { jplanLogoUrl } from "./brand";
 
 export type Page =
   | "entry"
@@ -213,7 +215,10 @@ type BackendStatus = "idle" | "checking" | "waiting" | "ready";
 const BackendPendingScreen: React.FC<{ status: BackendStatus; onRetry: () => void }> = ({ status, onRetry }) => (
   <div className="flex min-h-screen items-center justify-center bg-gradient-to-b from-background to-secondary/20 px-6">
     <div className="w-full max-w-md rounded-2xl border border-border bg-card p-6 text-center shadow-lg">
-      <div className="mx-auto mb-4 h-10 w-10 animate-spin rounded-full border-2 border-primary/20 border-t-primary" />
+      <div className="relative mx-auto mb-4 h-16 w-16">
+        <img src={jplanLogoUrl} alt="JPlan logo" className="brand-logo-auth rounded-2xl object-cover shadow-md" />
+        <div className="absolute -inset-1 animate-spin rounded-2xl border-2 border-primary/20 border-t-primary" />
+      </div>
       <h2 className="mb-2 text-xl font-semibold">Starting JPlan</h2>
       <p className="text-sm leading-6 text-muted-foreground">
         {status === "waiting"
@@ -253,6 +258,7 @@ const ProtectedRoute: React.FC<{ children: React.ReactNode; adminOnly?: boolean 
 export default function App() {
   const { user, loading } = useAuth();
   const navigate = useNavigate();
+  const location = useLocation();
   const [currentSchedule, setCurrentSchedule] = useState<DailySchedule | null>(null);
   const [planningSchedule, setPlanningSchedule] = useState<DailySchedule | null>(null);
   const [scheduleHistory, setScheduleHistory] = useState<DailySchedule[]>([]);
@@ -371,7 +377,9 @@ export default function App() {
     return <div className="flex h-screen items-center justify-center">Loading session...</div>;
   }
 
-  if (user && backendStatus !== "ready") {
+  const isPublicRoute = ["/login", "/signup", "/admin/signup", "/privacy", "/terms"].includes(location.pathname);
+
+  if (user && backendStatus !== "ready" && !isPublicRoute) {
     return (
       <BackendPendingScreen
         status={backendStatus}
@@ -386,6 +394,8 @@ export default function App() {
         <Route path="/login" element={<LoginPage />} />
         <Route path="/signup" element={<SignupPage />} />
         <Route path="/admin/signup" element={<AdminSignupPage />} />
+        <Route path="/privacy" element={<PrivacyPage />} />
+        <Route path="/terms" element={<TermsPage />} />
 
         <Route
           path="/"

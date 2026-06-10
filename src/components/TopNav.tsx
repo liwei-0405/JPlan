@@ -13,6 +13,7 @@ import { Avatar, AvatarFallback, AvatarImage } from "./ui/avatar";
 import { toast } from "sonner";
 import { supabase } from "../lib/supabase";
 import { apiUrl } from "../services/apiConfig";
+import { APP_VERSION, jplanLogoUrl } from "../brand";
 
 type TopNavProps = {
   onSettingsClick?: () => void;
@@ -20,8 +21,6 @@ type TopNavProps = {
   onSyncComplete?: () => void;
   syncDate?: string;
 };
-
-const APP_VERSION = "v2026.06.09-2";
 
 const formatLocalDate = (date: Date) => {
   const yyyy = date.getFullYear();
@@ -150,6 +149,11 @@ export function TopNav({
     <div className="border-b border-border bg-card/50 backdrop-blur-sm sticky top-0 z-50">
       <div className="mx-auto flex max-w-6xl items-center justify-between gap-3 px-4 py-3 sm:px-6">
         <div className="flex items-center gap-2">
+          <img
+            src={jplanLogoUrl}
+            alt="JPlan logo"
+            className="brand-logo-nav rounded-md object-cover shadow-sm"
+          />
           <h3 className="text-xl font-bold text-primary">JPlan</h3>
           <span className="text-[10px] px-2 py-0.5 rounded-full bg-primary/10 text-primary font-medium uppercase tracking-wider">
             {isAdmin ? 'Admin' : 'Beta'} <span className="text-[8px] font-semibold opacity-70">{APP_VERSION}</span>

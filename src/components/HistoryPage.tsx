@@ -1,6 +1,7 @@
 import { Button } from "./ui/button";
-import { ArrowLeft, Calendar, Clock, Sparkles } from "lucide-react";
+import { ArrowLeft, Calendar, Clock } from "lucide-react";
 import type { DailySchedule } from "../App";
+import { jplanLogoUrl } from "../brand";
 
 type HistoryPageProps = {
   schedules: DailySchedule[];
@@ -26,7 +27,7 @@ export function HistoryPage({ schedules, onSelectSchedule, onBack }: HistoryPage
 
         <div className="mb-5 sm:mb-8">
           <div className="flex items-center gap-2 mb-2">
-            <Sparkles className="h-6 w-6 text-primary" />
+            <img src={jplanLogoUrl} alt="JPlan logo" className="brand-logo-heading rounded-md object-cover shadow-sm" />
             <h2>Schedule History</h2>
           </div>
           <p className="text-muted-foreground">
