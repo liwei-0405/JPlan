@@ -1,6 +1,7 @@
 import React, { createContext, useContext, useEffect, useState } from 'react';
 import { Session, User } from '@supabase/supabase-js';
 import { supabase } from '../lib/supabase';
+import { apiUrl } from '../services/apiConfig';
 
 // Capture OAuth provider refresh token before Supabase clears the URL hash.
 const initialHashParams = typeof window !== 'undefined' ? window.location.hash : '';
@@ -86,17 +87,34 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           }
 
           if (providerRefreshToken) {
-            const { error: updateError } = await supabase
-              .from('profiles')
-              .update({ 
-                google_refresh_token: providerRefreshToken,
-                calendar_sync_enabled: true 
-              })
-              .eq('id', session.user.id);
-            if (updateError) {
-              console.error('[AuthContext] Failed to save provider_refresh_token:', updateError);
-            } else {
+            try {
+              const response = await fetch(apiUrl('/api/google-calendar/store-token'), {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                  user_id: session.user.id,
+                  provider_refresh_token: providerRefreshToken,
+                }),
+              });
+              if (!response.ok) {
+                throw new Error('Backend token storage failed');
+              }
               setProfile((current) => current ? { ...current, calendar_sync_enabled: true } : current);
+            } catch (storeError) {
+              const { error: updateError } = await supabase
+                .from('profiles')
+                .update({
+                  google_refresh_token: providerRefreshToken,
+                  calendar_sync_enabled: true
+                })
+                .eq('id', session.user.id);
+              if (updateError) {
+                console.error('[AuthContext] Failed to save provider_refresh_token:', updateError || storeError);
+              } else {
+                setProfile((current) => current ? { ...current, calendar_sync_enabled: true } : current);
+              }
             }
           }
         } catch (err) {

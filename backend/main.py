@@ -26,7 +26,7 @@ from travel_service import TravelService
 # load environment variables from .env file
 load_dotenv()
 
-BACKEND_VERSION = "2026.06.11-2"
+BACKEND_VERSION = "2026.06.11-4"
 
 def _parse_allowed_origins() -> List[str]:
     raw = os.getenv("ALLOWED_ORIGINS", "")
@@ -346,6 +346,10 @@ class ExportRequest(BaseModel):
     user_id: str
     date: str
     replace_google_day: Optional[bool] = False
+
+class GoogleTokenRequest(BaseModel):
+    user_id: str
+    provider_refresh_token: str
 
 class CalendarImportRequest(BaseModel):
     user_id: str
@@ -1255,6 +1259,35 @@ async def sync_calendar(request: Dict[str, Any]):
                 jlog("API", f"Failed to clear token: {db_err}", "CALENDAR")
             raise HTTPException(status_code=401, detail="TOKEN_EXPIRED")
         raise HTTPException(status_code=500, detail=error_msg)
+
+
+@app.get("/api/google-calendar/link-status")
+async def google_calendar_link_status(user_id: str):
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id is required")
+    try:
+        linked = cal_service.has_refresh_token(user_id)
+        return {"linked": linked}
+    except Exception as exc:
+        jlog("API", f"Google link status error: {exc}", "CALENDAR")
+        raise HTTPException(status_code=500, detail="Failed to check Google Calendar link status")
+
+
+@app.post("/api/google-calendar/store-token")
+async def store_google_calendar_token(request: GoogleTokenRequest):
+    if not request.user_id:
+        raise HTTPException(status_code=400, detail="user_id is required")
+    if not request.provider_refresh_token:
+        raise HTTPException(status_code=400, detail="provider_refresh_token is required")
+    try:
+        database.supabase.table("profiles").update({
+            "google_refresh_token": request.provider_refresh_token,
+            "calendar_sync_enabled": True,
+        }).eq("id", request.user_id).execute()
+        return {"linked": True}
+    except Exception as exc:
+        jlog("API", f"Store Google token error: {exc}", "CALENDAR")
+        raise HTTPException(status_code=500, detail="Failed to store Google Calendar token")
 
 
 @app.post("/api/plans/{date}/import-calendar", response_model=ScheduleEnvelope)
