@@ -152,17 +152,23 @@ export function TopNav({
         }
 
         if (response.status === 401) {
-          toast.error("Google Calendar session expired. Please click Link Google Calendar again.", {
+          toast.error("Google Calendar needs to be linked again. Redirecting to Google...", {
             id: syncToast,
-            duration: 7000
+            duration: 4000
           });
+          setTimeout(() => {
+            handleLinkGoogle();
+          }, 1200);
           return;
         }
         if (detail === 'TOKEN_EXPIRED') {
-          toast.error("Google Calendar session expired. Please click Link Google Calendar again.", {
+          toast.error("Google Calendar needs to be linked again. Redirecting to Google...", {
             id: syncToast,
-            duration: 7000
+            duration: 4000
           });
+          setTimeout(() => {
+            handleLinkGoogle();
+          }, 1200);
           return;
         }
         throw new Error(errData.detail || 'Sync failed');

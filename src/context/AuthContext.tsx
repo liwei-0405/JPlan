@@ -130,10 +130,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   };
 
   const isAdmin = profile?.role === 'admin';
-  const isGoogleLinked = Boolean(profile?.calendar_sync_enabled) ||
-                        user?.app_metadata?.providers?.includes('google') || 
-                        user?.identities?.some(id => id.provider === 'google') ||
-                        false;
+  const isGoogleLinked = Boolean(profile?.calendar_sync_enabled);
 
   const value = {
     session,
