@@ -658,6 +658,11 @@ class ModuleCConstructorMixin:
                 fs = parse_clock(fs)
                 if fs is not None:
                     dur = int(item.get("duration_minutes") or item.get("durationMinutes") or 60)
+                    fixed_end = parse_clock(item.get("fixed_end") if item.get("fixed_end") is not None else item.get("fixedEnd"))
+                    if fixed_end is not None and fixed_end > fs:
+                        dur = fixed_end - fs
+                        item["fixed_end"] = fixed_end
+                        item["duration_minutes"] = dur
                     item["scheduled_start"] = fs
                     item["scheduled_end"] = fs + dur
                     fixed.append(item)

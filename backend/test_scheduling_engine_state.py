@@ -2404,6 +2404,85 @@ def test_location_normalizer_defaults_gym_to_fitness_center():
     assert gym["location_status"] == "resolved_default"
 
 
+def test_semantic_gym_location_uses_saved_coordinates():
+    engine = SchedulingEngine(DummyClient())
+    saved_locations = [
+        {
+            "label": "gym",
+            "display_name": "Saved Gym",
+            "address": "Saved Gym Address",
+            "category": "fitness_center",
+            "latitude": 2.92,
+            "longitude": 101.62,
+            "source": "saved_profile",
+            "confirmed_by_user": True,
+        }
+    ]
+
+    result = engine.build_schedule_response(
+        parsed={
+            "intent": "add",
+            "reply": "Draft created.",
+            "transcription": "Add gym later today.",
+            "date": "2026-05-02",
+            "preferences": {"allow_clash": False},
+            "operations": [{
+                "op": "add",
+                "title": "Gym",
+                "duration_minutes": 45,
+                "raw_location_text": "gym",
+                "location_kind": "exact_named_place",
+                "location_category": "fitness_center",
+                "location_resolution_status": "needs_coordinates",
+                "explicit_user_location": True,
+            }],
+        },
+        current_schedule=None,
+        latest_request="Add gym later today.",
+        saved_locations=saved_locations,
+    )
+    gym = _activity_by_title(result["schedule_data"], "Gym")
+
+    assert gym["location"] == "gym"
+    assert gym["location_source"] == "saved_profile"
+    assert gym["location_status"] == "resolved"
+    assert gym["location_resolution_status"] == "resolved"
+    assert gym["saved_location_label"] == "gym"
+    assert gym["resolved_location"]["latitude"] == 2.92
+    assert gym["resolved_location"]["longitude"] == 101.62
+
+
+def test_confirmed_resolved_location_wins_over_stale_outer_location_label():
+    engine = SchedulingEngine(DummyClient())
+
+    consultation = engine._canonicalize_activity({
+        "title": "FYP Consultation",
+        "timing_mode": TimingMode.FIXED,
+        "fixed_start": 600,
+        "duration_minutes": 60,
+        "location": "restaurant",
+        "location_label": "restaurant",
+        "location_status": "resolved",
+        "location_source": "explicit_user",
+        "explicit_user_location": True,
+        "resolved_location": {
+            "label": "school",
+            "display_name": "school",
+            "address": "School confirmed map point",
+            "latitude": 2.9275,
+            "longitude": 101.6410,
+            "source": "event_confirmed",
+            "confirmed_by_user": True,
+            "saved_location_label": "school",
+        },
+    })
+
+    assert consultation["location"] == "school"
+    assert consultation["location_label"] == "school"
+    assert consultation["location_status"] == "resolved"
+    assert consultation["resolved_location"]["latitude"] == 2.9275
+
+
 def test_busy_workday_location_mentions_are_scoped_to_nearest_activity():
     engine = SchedulingEngine(DummyClient())
     request_text = (
@@ -4711,6 +4790,116 @@ def test_route_context_detects_same_location_groups_and_excludes_non_physical(ca
     assert context["same_location_groups"]
     assert set(context["same_location_groups"][0]["titles"]) == {"Client Meeting", "Grocery Run"}
     assert "[JPLAN][MODULE_C][SAME_LOCATION_GROUP]" in logs
+
+
+def test_missing_location_fixed_event_requests_location_and_stays_out_of_route_nodes():
+    engine = SchedulingEngine(DummyClient(), travel_service=FakeTravelService(route_minutes=9))
+    saved_locations = [
+        {
+            "label": "Tamarind Square",
+            "display_name": "Tamarind Square",
+            "address": "Tamarind Square",
+            "category": "supermarket",
+            "latitude": 2.921,
+            "longitude": 101.636,
+        },
+        {
+            "label": "gym",
+            "display_name": "gym",
+            "address": "gym",
+            "category": "fitness_center",
+            "latitude": 2.929,
+            "longitude": 101.641,
+        },
+    ]
+    envelope = {
+        "date": "2026-06-15",
+        "preferences": _accurate_preferences(),
+        "activities": [],
+        "schedule_blocks": [
+            {
+                "block_type": "activity",
+                "id": "gym",
+                "stable_activity_id": "gym",
+                "title": "Gym",
+                "location": "gym",
+                "location_label": "gym",
+                "location_category": "fitness_center",
+                "travel_required": True,
+            },
+            {
+                "block_type": "activity",
+                "id": "group",
+                "stable_activity_id": "group",
+                "title": "Group discussion",
+                "timing_mode": TimingMode.FIXED,
+                "fixed_start": parse_clock("02:00 PM"),
+                "fixed_end": parse_clock("03:00 PM"),
+                "location_category": "supermarket",
+                "location_status": "resolved",
+                "travel_required": True,
+            },
+        ],
+    }
+
+    requests = engine._location_resolution_requests(envelope, saved_locations, include_start_location=False)
+    context = engine._build_route_context(
+        envelope,
+        [
+            {
+                "id": "gym",
+                "stable_activity_id": "gym",
+                "title": "Gym",
+                "location": "gym",
+                "location_label": "gym",
+                "location_category": "fitness_center",
+                "travel_required": True,
+            },
+            {
+                "id": "group",
+                "stable_activity_id": "group",
+                "title": "Group discussion",
+                "timing_mode": TimingMode.FIXED,
+                "fixed_start": parse_clock("02:00 PM"),
+                "fixed_end": parse_clock("03:00 PM"),
+                "location_category": "supermarket",
+                "location_status": "resolved",
+                "travel_required": True,
+            },
+        ],
+        saved_locations,
+    )
+
+    assert {request["title"] for request in requests} == {"Group discussion"}
+    assert "id:gym" in context["nodes"]
+    assert "id:group" not in context["nodes"]
+    assert context["missing"] == [{"title": "Group discussion", "location": None}]
+    assert not any(
+        "Group discussion" in group.get("titles", [])
+        for group in context["same_location_groups"]
+    )
+
+
+def test_route_repair_rejects_candidate_that_drops_currently_scheduled_items():
+    engine = SchedulingEngine(DummyClient())
+    current = {
+        "schedule_blocks": [
+            {"block_type": "activity", "id": "study", "stable_activity_id": "study", "title": "Study at School"},
+            {"block_type": "activity", "id": "review", "stable_activity_id": "review", "title": "Review FYP report"},
+        ],
+        "activities": [],
+    }
+    repaired = {
+        "schedule_blocks": [
+            {"block_type": "activity", "id": "study", "stable_activity_id": "study", "title": "Study at School"},
+        ],
+        "activities": [],
+    }
+    unfit = [
+        {"id": "review", "stable_activity_id": "review", "title": "Review FYP report"},
+    ]
+
+    assert engine._repair_candidate_drops_currently_scheduled_items(current, repaired, unfit) is True
 
 
 def _same_location_route_context():
@@ -8468,6 +8657,206 @@ def test_update_preserve_existing_fields_keeps_confirmed_location_over_parser_de
     assert updated_grocery["location_label"] == "KB01 Mid Valley"
     assert updated_grocery["location_status"] == "resolved"
     assert updated_grocery["resolved_location"]["latitude"] == 3.1184
+    assert "PRESERVE_LOCATION" in capsys.readouterr().out
+
+
+def test_existing_fixed_event_location_not_overwritten_by_parser_guess(capsys):
+    engine = SchedulingEngine(DummyClient())
+    envelope = _custom_envelope([
+        {
+            "op": "add",
+            "title": "FYP Consultation",
+            "timing_mode": TimingMode.FIXED,
+            "fixed_start": "10:00",
+            "duration_minutes": 60,
+            "location": "Campus Office",
+        },
+    ])
+    consultation = _activity_by_title(envelope, "FYP Consultation")
+    consultation["location"] = "Campus Office"
+    consultation["location_label"] = "Campus Office"
+    consultation["location_normalized"] = "campus office"
+    consultation["location_category"] = "office"
+    consultation["location_source"] = "event_confirmed"
+    consultation["location_status"] = "resolved"
+    consultation["resolved_location"] = {
+        "display_name": "Campus Office",
+        "latitude": 2.9275,
+        "longitude": 101.6410,
+        "source": "event_confirmed",
+    }
+
+    result = engine.apply_operations(
+        envelope=envelope,
+        operations=[{
+            "op": "update",
+            "title": "FYP Consultation",
+            "target_title": "FYP Consultation",
+            "preserve_existing_fields": True,
+            "location": "restaurant",
+            "location_label": "restaurant",
+            "location_category": "meal_place",
+            "location_status": "resolved",
+            "location_source": "explicit_user",
+            "explicit_user_location": True,
+            "_user_message": (
+                "Please plan my day around two fixed Google Calendar events: "
+                "FYP consultation from 10-11 AM and group discussion from 2-3 PM. "
+                "I start at Home at 8 AM and must return by 10 PM."
+            ),
+        }],
+        base_version=envelope["version"],
+    )
+
+    updated_consultation = _activity_by_title(result["envelope"], "FYP Consultation")
+    assert updated_consultation["location"] == "Campus Office"
+    assert updated_consultation["location_label"] == "Campus Office"
+    assert updated_consultation["location_source"] == "event_confirmed"
+    assert updated_consultation["resolved_location"]["latitude"] == 2.9275
+    assert "PRESERVE_LOCATION" in capsys.readouterr().out
+
+
+def test_existing_fixed_event_duration_not_overwritten_by_unrelated_parser_duration():
+    engine = SchedulingEngine(DummyClient())
+    envelope = {
+        "schema_version": 5,
+        "scheduleId": "fixed-duration-test",
+        "date": "2026-05-02",
+        "version": 1,
+        "status": "ok",
+        "schedule_status": "ok",
+        "travel_validation_status": "not_requested",
+        "planning_mode": "feasibility_first",
+        "allow_clash": False,
+        "preferences": {"allow_clash": False},
+        "activities": [{
+            "id": "act-fyp-consultation",
+            "stable_activity_id": "act-fyp-consultation",
+            "type": "activity",
+            "title": "FYP Consultation",
+            "timing_mode": TimingMode.FIXED,
+            "original_timing_mode": TimingMode.FIXED,
+            "is_user_fixed": True,
+            "can_move_for_repair": False,
+            "repair_protection": "fixed",
+            "scheduled_start": parse_clock("10:00 AM"),
+            "scheduled_end": parse_clock("11:00 AM"),
+            "fixed_start": parse_clock("10:00 AM"),
+            "fixed_end": parse_clock("11:00 AM"),
+            "duration_minutes": 60,
+            "location": "school",
+            "location_label": "school",
+            "status": "active",
+        }],
+        "schedule_blocks": [],
+        "explanations": [],
+        "conflicts": [],
+        "warnings": [],
+        "location_resolution_requests": [],
+    }
+
+    result = engine.apply_operations(
+        envelope=envelope,
+        operations=[{
+            "op": "update",
+            "title": "FYP Consultation",
+            "target_title": "FYP Consultation",
+            "preserve_existing_fields": True,
+            "duration_minutes": 120,
+            "_user_message": (
+                "Please plan my day around FYP consultation from 10-11 AM. "
+                "I need to study at School for 2 hours and go to the gym."
+            ),
+        }],
+        base_version=envelope["version"],
+    )
+
+    updated_consultation = _activity_by_title(result["envelope"], "FYP Consultation")
+    assert updated_consultation["duration_minutes"] == 60
+    assert updated_consultation["fixed_start"] == parse_clock("10:00 AM")
+    assert updated_consultation["fixed_end"] == parse_clock("11:00 AM")
+    assert updated_consultation["scheduled_start"] == parse_clock("10:00 AM")
+    assert updated_consultation["scheduled_end"] == parse_clock("11:00 AM")
+
+
+def test_module_c_fixed_event_uses_fixed_end_over_stale_duration():
+    engine = SchedulingEngine(DummyClient())
+    planned = engine._plan_schedule(
+        "2026-05-02",
+        [{
+            "id": "act-fyp-consultation",
+            "stable_activity_id": "act-fyp-consultation",
+            "title": "FYP Consultation",
+            "timing_mode": TimingMode.FIXED,
+            "fixed_start": parse_clock("10:00 AM"),
+            "fixed_end": parse_clock("11:00 AM"),
+            "duration_minutes": 120,
+            "is_user_fixed": True,
+            "repair_protection": "fixed",
+            "status": "active",
+        }],
+        {"allow_clash": False},
+    )
+
+    consultation = _activity_by_title(planned, "FYP Consultation")
+    assert consultation["duration_minutes"] == 60
+    assert consultation["scheduled_start"] == parse_clock("10:00 AM")
+    assert consultation["scheduled_end"] == parse_clock("11:00 AM")
+
+
+def test_existing_fixed_event_location_not_overwritten_by_start_location_clause(capsys):
+    engine = SchedulingEngine(DummyClient())
+    envelope = _custom_envelope([
+        {
+            "op": "add",
+            "title": "Group discussion",
+            "timing_mode": TimingMode.FIXED,
+            "fixed_start": "14:00",
+            "duration_minutes": 60,
+            "location": "Library",
+        },
+    ])
+    discussion = _activity_by_title(envelope, "Group discussion")
+    discussion["location"] = "Library"
+    discussion["location_label"] = "Library"
+    discussion["location_normalized"] = "library"
+    discussion["location_category"] = "library"
+    discussion["location_source"] = "event_confirmed"
+    discussion["location_status"] = "resolved"
+    discussion["resolved_location"] = {
+        "display_name": "Library",
+        "latitude": 2.9301,
+        "longitude": 101.6420,
+        "source": "event_confirmed",
+    }
+
+    result = engine.apply_operations(
+        envelope=envelope,
+        operations=[{
+            "op": "update",
+            "title": "Group discussion",
+            "target_title": "Group discussion",
+            "preserve_existing_fields": True,
+            "location": "Home at 8 AM",
+            "location_label": "Home at 8 AM",
+            "location_category": "home",
+            "location_status": "resolved",
+            "location_source": "explicit_user",
+            "explicit_user_location": True,
+            "_user_message": (
+                "Please plan my day around two fixed Google Calendar events: "
+                "FYP consultation from 10-11 AM and group discussion from 2-3 PM. "
+                "I start at Home at 8 AM and must return by 10 PM."
+            ),
+        }],
+        base_version=envelope["version"],
+    )
+
+    updated_discussion = _activity_by_title(result["envelope"], "Group discussion")
+    assert updated_discussion["location"] == "Library"
+    assert updated_discussion["location_label"] == "Library"
+    assert updated_discussion["location_source"] == "event_confirmed"
+    assert updated_discussion["resolved_location"]["latitude"] == 2.9301
     assert "PRESERVE_LOCATION" in capsys.readouterr().out
 
 

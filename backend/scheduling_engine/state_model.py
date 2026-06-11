@@ -180,6 +180,7 @@ class StateModelMixin:
             )
         )
         exact_time = fixed_start is not None or fixed_end is not None
+        raw_fixed_lock = bool(raw.get("is_user_fixed") or clean_title(raw.get("repair_protection") or "") == "fixed")
 
         if anchor_relation:
             return (
@@ -191,6 +192,15 @@ class StateModelMixin:
             )
 
         if exact_time:
+            if raw_fixed_lock:
+                return (
+                    TimingMode.FIXED,
+                    fixed_start,
+                    fixed_end,
+                    preferred_start,
+                    "Smart timing: fixed because this activity was already locked.",
+                )
+
             if self._contains_any_keyword(evidence_text, FIXED_EVENT_KEYWORDS):
                 return (
                     TimingMode.FIXED,
@@ -481,6 +491,28 @@ class StateModelMixin:
             if location_category_clean in {"", "home_or_online", "none", "no_location"}:
                 location_category = (resolved_location or {}).get("category") or "manual_place"
                 location_category_clean = clean_title(location_category or "")
+            confirmed_label = clean_optional_text(
+                (resolved_location or {}).get("saved_location_label")
+                or (resolved_location or {}).get("label")
+                or (resolved_location or {}).get("display_name")
+                or (resolved_location or {}).get("address")
+            )
+            if confirmed_label:
+                current_label_clean = clean_title(location_label or location or "")
+                confirmed_label_clean = clean_title(confirmed_label)
+                labels_match = bool(
+                    current_label_clean
+                    and confirmed_label_clean
+                    and (
+                        current_label_clean == confirmed_label_clean
+                        or current_label_clean in confirmed_label_clean
+                        or confirmed_label_clean in current_label_clean
+                    )
+                )
+                if not labels_match:
+                    location = confirmed_label
+                    location_label = confirmed_label
+                    location_normalized = _normalize_location(confirmed_label)
         preferred_window_start = self._coerce_minutes(
             raw.get("preferred_window_start"),
             raw.get("preferredWindowStart"),

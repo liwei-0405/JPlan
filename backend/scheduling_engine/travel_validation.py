@@ -1248,6 +1248,14 @@ class TravelValidationMixin:
         unfit = accounting["unfit_activities"]
         optional_skipped = accounting["optional_skipped"]
         missing_after_accounting = accounting["missing_after_accounting"]
+        if self._repair_candidate_drops_currently_scheduled_items(
+            envelope,
+            repaired,
+            unfit,
+            remaining_conflicts,
+            route_repair_actions,
+        ):
+            return None
         repaired["unfit_activities"] = unfit
         repaired["optional_skipped"] = optional_skipped
         route_efficiency = planned.get("route_efficiency") or {}
@@ -1343,6 +1351,70 @@ class TravelValidationMixin:
             existing_keys.add(key)
             jlog("UNFIT", f"title={item.get('title')} source=envelope", "PRESERVE")
         return self._dedupe_route_repair_items(preserved, item_type="unfit")[0]
+
+    def _repair_candidate_drops_currently_scheduled_items(
+        self,
+        current: Dict[str, Any],
+        repaired: Dict[str, Any],
+        unfit: List[Dict[str, Any]],
+        route_conflicts: Optional[List[Dict[str, Any]]] = None,
+        route_repair_actions: Optional[List[Dict[str, Any]]] = None,
+    ) -> bool:
+        if not unfit:
+            return False
+        if route_repair_actions is not None and not route_repair_actions:
+            return False
+        if route_conflicts:
+            return False
+        current_scheduled = {
+            self._route_repair_activity_key(item)
+            for item in (current.get("schedule_blocks") or current.get("activities") or [])
+            if isinstance(item, dict)
+            and self._is_activity_schedule_block(item)
+            and self._route_repair_activity_key(item)
+        }
+        repaired_scheduled = {
+            self._route_repair_activity_key(item)
+            for item in (repaired.get("schedule_blocks") or repaired.get("activities") or [])
+            if isinstance(item, dict)
+            and self._is_activity_schedule_block(item)
+            and self._route_repair_activity_key(item)
+        }
+        unfit_keys = {
+            self._route_repair_activity_key(item)
+            for item in unfit or []
+            if isinstance(item, dict) and self._route_repair_activity_key(item)
+        }
+        conflict_keys: set[str] = set()
+        for conflict in route_conflicts or []:
+            if not isinstance(conflict, dict):
+                continue
+            for field in (
+                "activity_id",
+                "destination_activity_id",
+                "blocker_activity_id",
+                "from_activity_id",
+                "to_activity_id",
+            ):
+                value = conflict.get(field)
+                if value:
+                    conflict_keys.add(f"id:{value}")
+            for field in ("from", "to", "from_activity", "to_activity", "blocker_activity_title"):
+                value = conflict.get(field)
+                if value:
+                    conflict_keys.add(f"title:{clean_title(value)}")
+            for value in conflict.get("activity_ids") or []:
+                if value:
+                    conflict_keys.add(f"id:{value}")
+        dropped = ((current_scheduled - repaired_scheduled) & unfit_keys) - conflict_keys
+        if dropped:
+            jlog(
+                "TRAVEL_REPAIR",
+                f"dropped_scheduled_items={sorted(dropped)}",
+                "REJECT_WORSE_CANDIDATE",
+            )
+            return True
+        return False
 
     def _original_repair_accounting_records(
         self,
@@ -4909,8 +4981,11 @@ class TravelValidationMixin:
             return False
         if self._embedded_activity_coordinate(block):
             return False
+        lookup_label = clean_optional_text(block.get("location_label") or block.get("location"))
+        if not lookup_label:
+            return True
         saved = self.travel_service.confirmed_saved_location(
-            block.get("location_label") or block.get("location"),
+            lookup_label,
             block.get("location_category"),
             saved_locations,
         )
@@ -5068,8 +5143,11 @@ class TravelValidationMixin:
             resolved["latitude"] = embedded[0]
             resolved["longitude"] = embedded[1]
             return embedded, resolved
+        lookup_label = clean_optional_text(block.get("location_label") or block.get("location"))
+        if not lookup_label:
+            return None, None
         saved = self.travel_service.confirmed_saved_location(
-            block.get("location_label") or block.get("location"),
+            lookup_label,
             block.get("location_category"),
             saved_locations,
         )

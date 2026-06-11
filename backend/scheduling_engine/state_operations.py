@@ -257,6 +257,41 @@ class StateOperationsMixin:
             flags=re.IGNORECASE,
         ))
 
+    def _operation_has_explicit_duration_change(self, operation: Dict[str, Any]) -> bool:
+        if operation.get("duration_minutes") is None and operation.get("duration") is None:
+            return False
+        message = clean_title(operation.get("_user_message") or operation.get("_source_text") or "")
+        if not message:
+            return not bool(operation.get("preserve_existing_fields"))
+        target = clean_title(
+            operation.get("resolved_target_title")
+            or operation.get("target_title")
+            or operation.get("title")
+            or ""
+        )
+        if not target:
+            return self._message_mentions_duration(message)
+        target_pattern = re.escape(target)
+        target_clauses = [
+            clause.strip()
+            for clause in re.split(r"[.;\n]", message)
+            if re.search(rf"\b{target_pattern}\b", clause)
+        ]
+        if not target_clauses:
+            return False
+        scoped_message = " ".join(target_clauses)
+        duration_pattern = (
+            r"(?:\b(?:for|to|as|duration)\s+)?"
+            r"\d{1,3}\s*(?:-| )?\s*(?:minutes?|mins?|min|hours?|hrs?|hr)\b|"
+            r"\b(?:half[-\s]*hour|half\s+an\s+hour)\b"
+        )
+        direct_patterns = (
+            rf"\b(?:change|update|set|switch|make)\s+(?:the\s+)?(?:duration|length)\s+(?:of|for)\s+(?:my\s+|the\s+)?{target_pattern}\b.{{0,80}}{duration_pattern}",
+            rf"\b(?:change|update|set|switch|make)\s+(?:my\s+|the\s+)?{target_pattern}\b.{{0,80}}(?:duration|length|for)\b.{{0,80}}{duration_pattern}",
+            rf"\b{target_pattern}\b.{{0,80}}\b(?:for|duration|length)\b.{{0,40}}{duration_pattern}",
+        )
+        return any(re.search(pattern, scoped_message) for pattern in direct_patterns)
+
     def _location_field_names(self) -> Tuple[str, ...]:
         return (
             "location",
@@ -316,9 +351,56 @@ class StateOperationsMixin:
             return True
         return False
 
-    def _operation_has_explicit_location_change(self, operation: Dict[str, Any]) -> bool:
-        if operation.get("explicit_user_location") is True:
+    def _message_has_explicit_location_change_for_operation(self, operation: Dict[str, Any]) -> bool:
+        message = clean_title(operation.get("_user_message") or "")
+        if not message:
+            return False
+
+        target = clean_title(
+            operation.get("resolved_target_title")
+            or operation.get("target_title")
+            or operation.get("title")
+            or ""
+        )
+        location = clean_title(
+            operation.get("location_label")
+            or operation.get("location")
+            or operation.get("raw_location_text")
+            or operation.get("raw_llm_location")
+            or ""
+        )
+        if not target:
+            return self._message_has_explicit_location_or_modality_change(message)
+
+        target_pattern = re.escape(target)
+        direct_patterns = (
+            rf"\b(?:change|update|set|switch)\s+(?:the\s+)?(?:location|place|venue)\s+(?:of|for)\s+(?:my\s+|the\s+)?{target_pattern}\b",
+            rf"\b(?:change|update|set|switch)\s+(?:my\s+|the\s+)?{target_pattern}\s+(?:location|place|venue)\b",
+            rf"\b(?:make|set|change|switch)\s+(?:my\s+|the\s+)?{target_pattern}\s+(?:to\s+)?(?:online|virtual|remote|at\s+home|home)\b",
+            rf"\b(?:change|update|set|switch)\s+(?:my\s+|the\s+)?{target_pattern}\b.{{0,80}}\b(?:to|at|near|inside|around)\b",
+        )
+        if any(re.search(pattern, message) for pattern in direct_patterns):
             return True
+
+        if location:
+            if (
+                re.match(r"^home(?:\s+at\s+\d|$)", location)
+                and re.search(r"\b(?:i|we)\s+start\s+at\s+home\b", message)
+            ):
+                return False
+            location_pattern = re.escape(location)
+            target_then_location = (
+                rf"\b{target_pattern}\b.{{0,80}}\b(?:at|near|inside|around)\s+(?:the\s+)?{location_pattern}\b"
+            )
+            location_then_target = (
+                rf"\b(?:at|near|inside|around)\s+(?:the\s+)?{location_pattern}\b.{{0,80}}\b{target_pattern}\b"
+            )
+            if re.search(target_then_location, message) or re.search(location_then_target, message):
+                return True
+
+        return False
+
+    def _operation_has_explicit_location_change(self, operation: Dict[str, Any]) -> bool:
         if self._payload_has_coordinates(operation.get("resolved_location")):
             return True
         if operation.get("latitude") is not None and operation.get("longitude") is not None:
@@ -343,6 +425,8 @@ class StateOperationsMixin:
             return True
         if operation.get("same_location_as") and source != "inferred_from_anchor":
             return True
+        if operation.get("preserve_existing_fields") or operation.get("target_id") or operation.get("target_title"):
+            return self._message_has_explicit_location_change_for_operation(operation)
         return self._message_has_explicit_location_or_modality_change(operation.get("_user_message") or "")
 
     def _copy_operation_location_fields(self, target: Dict[str, Any], operation: Dict[str, Any]) -> None:
@@ -494,6 +578,8 @@ class StateOperationsMixin:
 
         message = converted.get("_user_message") or ""
         if not self._message_mentions_duration(message):
+            converted.pop("duration_minutes", None)
+        elif not self._operation_has_explicit_duration_change(converted):
             converted.pop("duration_minutes", None)
         if not re.search(r"\bpriority\b", clean_title(message)):
             converted.pop("priority", None)
@@ -910,6 +996,10 @@ class StateOperationsMixin:
             bool(operation.get("preserve_existing_fields"))
             and not self._operation_has_explicit_location_change(operation)
         )
+        preserve_duration_metadata = (
+            bool(operation.get("preserve_existing_fields"))
+            and not self._operation_has_explicit_duration_change(operation)
+        )
         preserved_location_fields = {
             field: deepcopy(existing.get(field))
             for field in self._location_field_names()
@@ -947,7 +1037,7 @@ class StateOperationsMixin:
                     )
                 updated[field] = operation.get(field)
 
-        if operation.get("duration_minutes") is not None:
+        if operation.get("duration_minutes") is not None and not preserve_duration_metadata:
             updated["duration_minutes"] = parse_duration_minutes(operation.get("duration_minutes"))
 
         if operation.get("is_mandatory") is not None:

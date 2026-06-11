@@ -823,12 +823,37 @@ class LocationNormalizerMixin:
                     "confirmed_by_user": bool(saved_home.get("confirmed_by_user", True)),
                 }
                 status = "resolved_coordinates"
+        elif travel_required:
+            saved_match = self._match_saved_location_by_label(label, saved_locations)
+            if not saved_match and category not in {"unknown", "home_or_online", "no_location", "none"}:
+                saved_match = self._match_saved_location_for_category(category, saved_locations)
+            if (
+                saved_match
+                and saved_match.get("latitude") is not None
+                and saved_match.get("longitude") is not None
+            ):
+                label = saved_match.get("label") or label
+                updated["resolved_location"] = {
+                    "label": saved_match.get("label") or label,
+                    "display_name": saved_match.get("display_name") or saved_match.get("label") or label,
+                    "address": saved_match.get("address") or saved_match.get("display_name") or label,
+                    "latitude": saved_match.get("latitude"),
+                    "longitude": saved_match.get("longitude"),
+                    "source": saved_match.get("source") or "saved_profile",
+                    "confirmed_by_user": bool(saved_match.get("confirmed_by_user", True)),
+                    "saved_location_label": saved_match.get("label") or label,
+                }
+                updated["saved_location_label"] = saved_match.get("label") or label
+                source = "saved_profile"
+                status = "resolved_coordinates"
 
         has_coordinates = self._operation_has_coordinates(updated)
         legacy_status = self._semantic_legacy_status(status, kind, has_coordinates)
         if kind == "home":
             legacy_status = "resolved" if has_coordinates else "resolved"
         source = self._semantic_source(explicit_user_location, status)
+        if isinstance(updated.get("resolved_location"), dict) and updated["resolved_location"].get("source") in {"saved_profile", "saved_location"}:
+            source = "saved_profile"
         if label and kind == "home":
             source = "explicit_user"
 
@@ -1291,18 +1316,22 @@ class LocationNormalizerMixin:
         if self._is_no_location_required_activity(title, scoped_evidence, raw_location, explicit_location):
             category = "home_or_online"
         area_preference = self._infer_area_preference(title, scoped_evidence or evidence, raw_location)
+        saved: Optional[Dict[str, Any]] = None
 
         if explicit_location:
             label = explicit_location["label"]
             category = explicit_location.get("category") or category
             source = "explicit_user"
             known_generic = clean_title(label) in {"home", "school", "campus", "office", "library", "gym", "restaurant"}
-            status = "resolved" if known_generic else "needs_resolution"
+            saved = None if category in {"home_or_online", "none"} else self._match_saved_location_for_category(category, saved_locations)
+            if not saved:
+                saved = self._match_saved_location_by_label(label, saved_locations)
+            status = "resolved" if known_generic or saved else "needs_resolution"
             confidence = 0.95
         else:
             saved = None if category in {"home_or_online", "none"} else self._match_saved_location_for_category(category, saved_locations)
             if saved:
-                label = saved["label"]
+                label = saved.get("label") or saved.get("display_name") or saved.get("address")
                 source = "saved_profile"
                 status = "resolved"
                 confidence = 0.9
@@ -1334,6 +1363,21 @@ class LocationNormalizerMixin:
             "explicit_user_location": bool(explicit_location),
             "travel_required": travel_required,
         }
+        if saved and saved.get("latitude") is not None and saved.get("longitude") is not None:
+            payload["resolved_location"] = {
+                "label": saved.get("label") or label,
+                "display_name": saved.get("display_name") or saved.get("label") or label,
+                "address": saved.get("address") or saved.get("display_name") or label,
+                "latitude": saved.get("latitude"),
+                "longitude": saved.get("longitude"),
+                "source": saved.get("source") or "saved_profile",
+                "confirmed_by_user": bool(saved.get("confirmed_by_user", True)),
+                "saved_location_label": saved.get("label") or label,
+            }
+            payload["location_status"] = "resolved"
+            payload["location_resolution_status"] = "resolved"
+            payload["location_source"] = "saved_profile"
+            payload["saved_location_label"] = saved.get("label") or label
         if area_preference:
             payload["area_preference"] = area_preference
         if status in {"needs_resolution", "fallback_used", "resolved_default"}:
@@ -1867,7 +1911,29 @@ class LocationNormalizerMixin:
         for saved in saved_locations or []:
             haystack = clean_title(" ".join(str(saved.get(field) or "") for field in ("label", "address", "category", "type")))
             if any(keyword in haystack for keyword in keywords):
-                return {"label": saved.get("label") or saved.get("address") or next(iter(keywords))}
+                return saved
+        return None
+
+    def _match_saved_location_by_label(
+        self,
+        label: Optional[str],
+        saved_locations: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        label_key = clean_title(label or "")
+        if not label_key:
+            return None
+        for saved in saved_locations or []:
+            saved_label = clean_title(saved.get("label") or "")
+            saved_display = clean_title(saved.get("display_name") or "")
+            saved_address = clean_title(saved.get("address") or "")
+            if label_key in {saved_label, saved_display}:
+                return saved
+            if saved_label and (label_key in saved_label or saved_label in label_key):
+                return saved
+            if saved_display and (label_key in saved_display or saved_display in label_key):
+                return saved
+            if saved_address and label_key in saved_address:
+                return saved
         return None
 
     def _deterministic_location_default(
