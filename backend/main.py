@@ -26,6 +26,8 @@ from travel_service import TravelService
 # load environment variables from .env file
 load_dotenv()
 
+BACKEND_VERSION = "2026.06.11-2"
+
 def _parse_allowed_origins() -> List[str]:
     raw = os.getenv("ALLOWED_ORIGINS", "")
     configured = [origin.strip().rstrip("/") for origin in raw.split(",") if origin.strip()]
@@ -63,6 +65,7 @@ app.add_middleware(
 async def health():
     return {
         "status": "ok",
+        "version": BACKEND_VERSION,
         "configured": {
             "supabase": bool(database.supabase),
             "google_api": bool(os.getenv("GOOGLE_API_KEY")),
@@ -1236,6 +1239,12 @@ async def sync_calendar(request: Dict[str, Any]):
     except Exception as e:
         error_msg = str(e)
         jlog("API", f"Sync error: {error_msg}", "CALENDAR")
+        if "GOOGLE_OAUTH_CONFIG_MISSING" in error_msg:
+            raise HTTPException(status_code=503, detail="GOOGLE_OAUTH_CONFIG_MISSING")
+        if "GOOGLE_OAUTH_CONFIG_MISMATCH" in error_msg:
+            raise HTTPException(status_code=503, detail="GOOGLE_OAUTH_CONFIG_MISMATCH")
+        if "GOOGLE_TOKEN_REFRESH_FAILED" in error_msg:
+            raise HTTPException(status_code=502, detail="GOOGLE_TOKEN_REFRESH_FAILED")
         if "TOKEN_EXPIRED" in error_msg:
             try:
                 database.supabase.table('profiles').update({
@@ -1324,6 +1333,12 @@ async def export_calendar(request: ExportRequest):
     except Exception as e:
         error_msg = str(e)
         jlog("API", f"Export error: {error_msg}", "CALENDAR")
+        if "GOOGLE_OAUTH_CONFIG_MISSING" in error_msg:
+            raise HTTPException(status_code=503, detail="GOOGLE_OAUTH_CONFIG_MISSING")
+        if "GOOGLE_OAUTH_CONFIG_MISMATCH" in error_msg:
+            raise HTTPException(status_code=503, detail="GOOGLE_OAUTH_CONFIG_MISMATCH")
+        if "GOOGLE_TOKEN_REFRESH_FAILED" in error_msg:
+            raise HTTPException(status_code=502, detail="GOOGLE_TOKEN_REFRESH_FAILED")
         if "TOKEN_EXPIRED" in error_msg:
             try:
                 database.supabase.table('profiles').update({

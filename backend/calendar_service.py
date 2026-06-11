@@ -418,7 +418,7 @@ class CalendarService:
         """
         if not self.client_id or not self.client_secret:
             _calendar_log("GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET not set", "ERROR")
-            return None
+            raise Exception("GOOGLE_OAUTH_CONFIG_MISSING")
 
         url = "https://oauth2.googleapis.com/token"
         data = {
@@ -430,13 +430,33 @@ class CalendarService:
 
         try:
             response = requests.post(url, data=data)
-            response.raise_for_status()
+            if not response.ok:
+                try:
+                    error_payload = response.json()
+                except Exception:
+                    error_payload = {}
+                google_error = error_payload.get("error")
+                google_description = error_payload.get("error_description") or response.text
+                _calendar_log(
+                    f"Error refreshing access token: status={response.status_code} error={google_error} description={google_description}",
+                    "ERROR",
+                )
+                if google_error in {"invalid_client", "unauthorized_client"}:
+                    raise Exception("GOOGLE_OAUTH_CONFIG_MISMATCH")
+                if google_error == "invalid_grant":
+                    raise Exception("TOKEN_EXPIRED")
+                raise Exception("GOOGLE_TOKEN_REFRESH_FAILED")
             return response.json().get("access_token")
         except Exception as e:
+            if str(e) in {
+                "GOOGLE_OAUTH_CONFIG_MISSING",
+                "GOOGLE_OAUTH_CONFIG_MISMATCH",
+                "GOOGLE_TOKEN_REFRESH_FAILED",
+                "TOKEN_EXPIRED",
+            }:
+                raise e
             _calendar_log(f"Error refreshing access token: {e}", "ERROR")
-            if hasattr(e, 'response') and getattr(e.response, 'status_code', None) == 400:
-                raise Exception("TOKEN_EXPIRED")
-            return None
+            raise Exception("GOOGLE_TOKEN_REFRESH_FAILED")
 
     def get_calendar_events(self, access_token: str, time_min: str, time_max: str) -> List[Dict[str, Any]]:
         """
@@ -582,11 +602,12 @@ class CalendarService:
             res = self.supabase.table("profiles").select("google_refresh_token").eq("id", user_id).execute()
             if not res.data or len(res.data) == 0:
                 _calendar_log(f"No profile found for user {user_id}", "ERROR")
-                return {}
+                raise Exception("TOKEN_EXPIRED")
             
             refresh_token = res.data[0].get("google_refresh_token")
             if not refresh_token:
-                return {}
+                _calendar_log(f"Profile found but no refresh token for user {user_id}", "WARNING")
+                raise Exception("TOKEN_EXPIRED")
 
             # 2. Get access token
             try:
@@ -594,9 +615,15 @@ class CalendarService:
                 if not access_token:
                     raise Exception("TOKEN_EXPIRED")
             except Exception as e:
-                if str(e) == "TOKEN_EXPIRED":
+                _calendar_log(f"Access token refresh failed for user {user_id}: {e}", "ERROR")
+                if str(e) in {
+                    "GOOGLE_OAUTH_CONFIG_MISSING",
+                    "GOOGLE_OAUTH_CONFIG_MISMATCH",
+                    "GOOGLE_TOKEN_REFRESH_FAILED",
+                    "TOKEN_EXPIRED",
+                }:
                     raise e
-                return {}
+                raise Exception("TOKEN_EXPIRED")
 
             # 3. Time range. Start from the beginning of the selected/local day
             # instead of "now" so importing today's calendar does not miss
@@ -664,7 +691,12 @@ class CalendarService:
                 if not access_token:
                     raise Exception("TOKEN_EXPIRED")
             except Exception as e:
-                if str(e) == "TOKEN_EXPIRED":
+                if str(e) in {
+                    "GOOGLE_OAUTH_CONFIG_MISSING",
+                    "GOOGLE_OAUTH_CONFIG_MISMATCH",
+                    "GOOGLE_TOKEN_REFRESH_FAILED",
+                    "TOKEN_EXPIRED",
+                }:
                     raise e
                 raise Exception("TOKEN_EXPIRED")
 

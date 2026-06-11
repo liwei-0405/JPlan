@@ -2,6 +2,18 @@ import React, { createContext, useContext, useEffect, useState } from 'react';
 import { Session, User } from '@supabase/supabase-js';
 import { supabase } from '../lib/supabase';
 
+// Capture OAuth provider refresh token before Supabase clears the URL hash.
+const initialHashParams = typeof window !== 'undefined' ? window.location.hash : '';
+let extractedProviderRefreshToken: string | null = null;
+if (initialHashParams) {
+  try {
+    const params = new URLSearchParams(initialHashParams.substring(1));
+    extractedProviderRefreshToken = params.get('provider_refresh_token');
+  } catch (e) {
+    extractedProviderRefreshToken = null;
+  }
+}
+
 export type UserRole = 'user' | 'admin';
 
 interface Profile {
@@ -11,6 +23,7 @@ interface Profile {
   avatar_url: string | null;
   role: UserRole;
   status: 'active' | 'suspended' | 'pending';
+  calendar_sync_enabled?: boolean | null;
 }
 
 interface AuthContextType {
@@ -67,16 +80,24 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             setProfile(data as Profile);
           }
 
-          // NEW: Capture Google Refresh Token for background calendar sync
-          // Supabase provides this ONLY when offline access is requested and granted
-          if (session.provider_refresh_token) {
-            await supabase
+          let providerRefreshToken = session.provider_refresh_token || extractedProviderRefreshToken;
+          if (providerRefreshToken) {
+            extractedProviderRefreshToken = null;
+          }
+
+          if (providerRefreshToken) {
+            const { error: updateError } = await supabase
               .from('profiles')
               .update({ 
-                google_refresh_token: session.provider_refresh_token,
+                google_refresh_token: providerRefreshToken,
                 calendar_sync_enabled: true 
               })
               .eq('id', session.user.id);
+            if (updateError) {
+              console.error('[AuthContext] Failed to save provider_refresh_token:', updateError);
+            } else {
+              setProfile((current) => current ? { ...current, calendar_sync_enabled: true } : current);
+            }
           }
         } catch (err) {
           console.error('[AuthContext] Background sync failed:', err);
@@ -109,7 +130,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   };
 
   const isAdmin = profile?.role === 'admin';
-  const isGoogleLinked = user?.app_metadata?.providers?.includes('google') || 
+  const isGoogleLinked = Boolean(profile?.calendar_sync_enabled) ||
+                        user?.app_metadata?.providers?.includes('google') || 
                         user?.identities?.some(id => id.provider === 'google') ||
                         false;
 

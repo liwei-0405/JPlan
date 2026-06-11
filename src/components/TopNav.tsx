@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import { Button } from "./ui/button";
 import { Settings, RefreshCw, LogOut, User as UserIcon } from "lucide-react";
 import { useAuth } from "../context/AuthContext";
@@ -13,7 +14,7 @@ import { Avatar, AvatarFallback, AvatarImage } from "./ui/avatar";
 import { toast } from "sonner";
 import { supabase } from "../lib/supabase";
 import { apiUrl } from "../services/apiConfig";
-import { APP_VERSION, jplanLogoUrl } from "../brand";
+import { FRONTEND_VERSION, jplanLogoUrl } from "../brand";
 
 type TopNavProps = {
   onSettingsClick?: () => void;
@@ -35,6 +36,12 @@ const addDays = (date: Date, days: number) => {
   return next;
 };
 
+const getVersionBuildNumber = (version?: string | null) => {
+  if (!version) return null;
+  const parts = version.replace(/^v/, "").split("-");
+  return parts[parts.length - 1] || null;
+};
+
 export function TopNav({ 
   onSettingsClick, 
   showSyncButton = true, 
@@ -42,6 +49,31 @@ export function TopNav({
   syncDate 
 }: TopNavProps) {
   const { profile, signOut, isAdmin, isGoogleLinked } = useAuth();
+  const [backendVersion, setBackendVersion] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    fetch(apiUrl("/health"), { cache: "no-store" })
+      .then((response) => response.ok ? response.json() : null)
+      .then((data) => {
+        if (!cancelled && data?.version) {
+          setBackendVersion(String(data.version));
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setBackendVersion(null);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const backendBuildNumber = getVersionBuildNumber(backendVersion);
+  const combinedVersion = `v${FRONTEND_VERSION}${backendBuildNumber ? `-${backendBuildNumber}` : ""}`;
 
   const handleSignOut = async () => {
     if (typeof signOut === 'function') {
@@ -51,7 +83,6 @@ export function TopNav({
 
   const handleLinkGoogle = async () => {
     try {
-      // Link Google account with Calendar scopes
       const { error } = await supabase.auth.signInWithOAuth({
         provider: 'google',
         options: {
@@ -60,7 +91,7 @@ export function TopNav({
             prompt: 'consent',
           },
           scopes: 'https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile',
-          redirectTo: window.location.href,
+          redirectTo: window.location.origin + window.location.pathname,
         }
       });
       if (error) throw error;
@@ -72,7 +103,6 @@ export function TopNav({
   const handleSync = async () => {
     if (!profile?.id) return;
 
-    // Get target date
     const today = new Date();
     const todayStr = formatLocalDate(today);
     const defaultRangeEnd = formatLocalDate(addDays(today, 60));
@@ -95,14 +125,44 @@ export function TopNav({
 
       if (!response.ok) {
         const errData = await response.json().catch(() => ({}));
-        if (errData.detail === 'TOKEN_EXPIRED') {
-          toast.error("Google Session Expired. Re-linking...", {
+        const detail = errData.detail || "";
+
+        if (detail === "GOOGLE_OAUTH_CONFIG_MISSING") {
+          toast.error("Google Calendar import is not configured on the backend. Check Render GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET.", {
             id: syncToast,
-            duration: 3000
+            duration: 7000
           });
-          setTimeout(() => {
-            handleLinkGoogle();
-          }, 1500);
+          return;
+        }
+
+        if (detail === "GOOGLE_OAUTH_CONFIG_MISMATCH") {
+          toast.error("Google Calendar import cannot refresh this link. Make sure Render uses the same Google OAuth client as Supabase, then link Google again.", {
+            id: syncToast,
+            duration: 9000
+          });
+          return;
+        }
+
+        if (detail === "GOOGLE_TOKEN_REFRESH_FAILED") {
+          toast.error("Google Calendar import could not refresh the Google session. Please try again in a moment.", {
+            id: syncToast,
+            duration: 6000
+          });
+          return;
+        }
+
+        if (response.status === 401) {
+          toast.error("Google Calendar session expired. Please click Link Google Calendar again.", {
+            id: syncToast,
+            duration: 7000
+          });
+          return;
+        }
+        if (detail === 'TOKEN_EXPIRED') {
+          toast.error("Google Calendar session expired. Please click Link Google Calendar again.", {
+            id: syncToast,
+            duration: 7000
+          });
           return;
         }
         throw new Error(errData.detail || 'Sync failed');
@@ -127,11 +187,9 @@ export function TopNav({
         }
       );
 
-      // Trigger refresh-less update if possible
       if (onSyncComplete) {
         onSyncComplete();
       } else {
-        // Fallback to reload if for some reason the callback isn't passed
         setTimeout(() => {
           window.location.reload();
         }, 1500);
@@ -156,7 +214,7 @@ export function TopNav({
           />
           <h3 className="text-xl font-bold text-primary">JPlan</h3>
           <span className="text-[10px] px-2 py-0.5 rounded-full bg-primary/10 text-primary font-medium uppercase tracking-wider">
-            {isAdmin ? 'Admin' : 'Beta'} <span className="text-[8px] font-semibold opacity-70">{APP_VERSION}</span>
+            {isAdmin ? 'Admin' : 'Beta'} <span className="text-[8px] font-semibold opacity-70">{combinedVersion}</span>
           </span>
         </div>
 

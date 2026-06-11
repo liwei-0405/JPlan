@@ -79,7 +79,7 @@ export function ScheduleViewPage({
                   prompt: 'consent',
                 },
                 scopes: 'https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile',
-                redirectTo: window.location.href,
+                redirectTo: window.location.origin + window.location.pathname,
               }
             });
           }, 1500);
