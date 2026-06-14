@@ -3,7 +3,7 @@ import { ArrowLeft, Clock, MapPin, History, Settings, Sparkles, Edit2, Calendar 
 import type { DailySchedule, ActivityBlock } from "../App";
 import { useAuth } from "../context/AuthContext";
 import { toast } from "sonner";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   exportPlanToGoogle,
   importCalendarEvents,
@@ -19,6 +19,7 @@ import {
   type ScheduleViewMode,
 } from "../utils/scheduleDisplayUtils";
 import { jplanLogoUrl } from "../brand";
+import { apiUrl } from "../services/apiConfig";
 
 type ScheduleViewPageProps = {
   schedule: DailySchedule;
@@ -42,6 +43,7 @@ export function ScheduleViewPage({
   onUpdateSchedule
 }: ScheduleViewPageProps) {
   const { user, isGoogleLinked } = useAuth();
+  const [calendarLinked, setCalendarLinked] = useState(isGoogleLinked);
   const [isExporting, setIsExporting] = useState(false);
   const [isCalendarActionBusy, setIsCalendarActionBusy] = useState(false);
   const [showConfirmDialog, setShowConfirmDialog] = useState(false);
@@ -59,6 +61,34 @@ export function ScheduleViewPage({
   const googleEvents = schedule.external_calendar_events || [];
   const hasGoogleEvents = hasGoogleCalendarLayer(schedule);
   const timelineBlocks = getBlocksForView(schedule, activeView);
+
+  useEffect(() => {
+    setCalendarLinked(isGoogleLinked);
+  }, [isGoogleLinked]);
+
+  useEffect(() => {
+    if (!user?.id) return;
+    let cancelled = false;
+
+    fetch(apiUrl(`/api/google-calendar/link-status?user_id=${encodeURIComponent(user.id)}`), {
+      cache: "no-store",
+    })
+      .then(response => response.ok ? response.json() : null)
+      .then(data => {
+        if (!cancelled && typeof data?.linked === "boolean") {
+          setCalendarLinked(data.linked);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setCalendarLinked(isGoogleLinked);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [user?.id, isGoogleLinked]);
 
   const handleExportToGoogle = async (replaceGoogleDay = false) => {
     if (!user) return;
@@ -250,7 +280,7 @@ export function ScheduleViewPage({
           <Button onClick={onViewExplanation} variant="outline" className="rounded-xl">
             View Explanation
           </Button>
-          {isGoogleLinked && (
+          {calendarLinked && (
             <Button
               onClick={() => {
                 setConfirmReplaceGoogleDay(false);
