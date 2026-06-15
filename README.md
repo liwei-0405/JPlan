@@ -1,14 +1,18 @@
 # JPlan Daily Planning Interface
 
-JPlan is a modern daily planning interface designed to help users manage their schedules efficiently. Originally developed as a Final Year Project (FYP), it features a sleek UI with integration for AI-powered planning and Supabase for data management.
+JPlan is a feasibility-aware daily planning and calendar scheduling prototype. It helps users create, edit, optimize, validate, save, import, and export daily schedules with AI assistance, Google Calendar integration, Supabase persistence, and optional travel-time validation.
+
+This project was developed as a Final Year Project (FYP) prototype and is shared publicly for portfolio and review purposes. A hosted demo is not public because the backend depends on quota-limited APIs; demo access can be provided on request.
 
 ## 🚀 Features
 
-- **Modern UI**: Built with React and Tailwind CSS for a responsive, premium experience.
-- **AI-Powered Planning**: Integration with Google Gemini AI for intelligent scheduling assistance.
-- **Real-time Sync**: Uses Supabase for robust and fast data persistence.
-- **FastAPI Backend**: A high-performance Python backend for handling logic and API integrations.
-- **Accurate Travel Time Mode**: Optional OpenRouteService-based route validation with confirmed saved locations.
+- **AI-assisted daily planning**: Natural-language chat can create and modify draft schedules.
+- **Manual planning controls**: Users can add, edit, delete, and adjust fixed/flexible events.
+- **Schedule optimization**: Backend scheduling logic places flexible work around fixed events, day boundaries, dependencies, travel buffers, and feasibility constraints.
+- **Google Calendar integration**: Calendar events can be imported into a separate external layer, selected events can be imported into JPlan, and JPlan schedules can be exported back to Google Calendar.
+- **Location-aware planning**: Users can save locations, pick exact map points, and validate schedules with optional route-aware travel checks.
+- **Supabase Auth/DB**: Supabase handles user authentication and stores user profiles, preferences, saved locations, and daily schedule envelopes.
+- **Responsive React UI**: Built with React, Vite, Tailwind CSS, Lucide React, and Radix UI.
 
 ## 🛠️ Tech Stack
 
@@ -57,14 +61,15 @@ Before running the app, go to your **Supabase Dashboard**:
    - Go to **Authentication** -> **Providers** -> **Google**.
    - Enable Google provider.
    - Enter your **Client ID** and **Client Secret** (from Google Cloud Console).
-   - In **Additional Scopes**, add: `https://www.googleapis.com/auth/calendar.readonly`.
+   - In **Additional Scopes**, add:
+     `https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile`
    - (Optional but recommended) Enable **Skip nonce check**.
 
 ### 3.1 Google Cloud Console Setup
 
 1. Enable **Google Calendar API**.
 2. Configure **OAuth consent screen**:
-   - Add `.../auth/calendar.readonly` to **Scopes**.
+   - Add the Google Calendar read/write scopes used above to **Scopes**.
    - Add your test email address to **Test users** (important while in Testing mode).
 3. Create **OAuth 2.0 Client ID** (Web application type).
    - Add Supabase Redirect URI to **Authorized redirect URIs**.
@@ -185,7 +190,8 @@ The frontend will typically run on `http://localhost:3000`.
 > [!IMPORTANT]
 > **Never commit your `.env` files.** They contain sensitive API keys and database credentials. This project is configured with a `.gitignore` to prevent these files from being uploaded.
 
-- **Private Repository**: If you are using this for FYP, it is recommended to keep your repository **Private** until you are ready to reveal it.
+- **No secrets included**: This public repository only includes placeholder `.env.example` files. Real API keys, OAuth secrets, Supabase service role keys, Render environment variables, and provider refresh tokens are not included.
+- **Demo access**: The hosted deployment is not linked here because Gemini, Google Calendar, OpenRouteService, and geocoding services have usage quotas.
 - **Rotation**: If you ever accidentally commit a secret, rotate (change) your API keys immediately.
 - **RLS**: Ensure Supabase Row Level Security (RLS) is enabled for data protection.
 
