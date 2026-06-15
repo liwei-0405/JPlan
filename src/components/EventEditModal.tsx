@@ -98,11 +98,7 @@ export function EventEditModal({
     let diff = endMins - startMins;
     if (diff < 0) diff += 1440;
 
-    const h = Math.floor(diff / 60);
-    const m = diff % 60;
-    const durStr = `${h > 0 ? h + 'h ' : ''}${m > 0 ? m + 'm' : ''}` || '0m';
-
-    setFormData({ ...formData, endTime: newEndTime12h, duration: durStr });
+    setFormData({ ...formData, endTime: newEndTime12h, duration: formatDurationFromMinutes(diff) });
   };
 
   const handleStartTimeChange = (newStartTime12h: string) => {
@@ -119,21 +115,14 @@ export function EventEditModal({
     let diff = endMins - startMins;
     if (diff < 0) diff += 1440;
 
-    const h = Math.floor(diff / 60);
-    const m = diff % 60;
-    const durStr = `${h > 0 ? h + 'h ' : ''}${m > 0 ? m + 'm' : ''}` || '0m';
-
-    setFormData({ ...formData, startTime: newStartTime12h, duration: durStr });
+    setFormData({ ...formData, startTime: newStartTime12h, duration: formatDurationFromMinutes(diff) });
   };
 
-  const handleDurationChange = (durStr: string) => {
-    let totalMins = 0;
-    const hourMatch = durStr.match(/(\d+)h/);
-    const minMatch = durStr.match(/(\d+)m/);
-    if (hourMatch) totalMins += parseInt(hourMatch[1]) * 60;
-    if (minMatch) totalMins += parseInt(minMatch[1]);
-    if (!hourMatch && !minMatch) totalMins = parseFloat(durStr) * 60 || 0;
-
+  const handleDurationPartsChange = (hoursValue: string, minutesValue: string) => {
+    const hours = clampDurationPart(hoursValue, 23);
+    const minutes = clampDurationPart(minutesValue, 59);
+    const totalMins = Math.max(1, Number(hours) * 60 + Number(minutes));
+    const durStr = formatDurationFromMinutes(totalMins);
     if (!formData.startTime) {
       setFormData({ ...formData, duration: durStr });
       return;
@@ -148,6 +137,7 @@ export function EventEditModal({
   const existingLocationCandidate = resolvedLocationToCandidate(formData);
   const existingLocationPoint = candidateToMapPoint(existingLocationCandidate);
   const isFixedTime = String(formData.timing_mode || "").toLowerCase() === "fixed";
+  const durationParts = parseDurationToParts(formData.duration || deriveDuration(formData.startTime || "", formData.endTime || ""));
 
   const handleConfirmPickedLocation = async (candidate: GeocodeCandidate) => {
     const displayName = candidate.display_name || candidate.address || formData.location || formData.title;
@@ -275,13 +265,34 @@ export function EventEditModal({
           {/* Duration */}
           <div>
             <Label htmlFor="duration">Duration</Label>
-            <Input
-              id="duration"
-              value={formData.duration}
-              onChange={(e) => handleDurationChange(e.target.value)}
-              placeholder="e.g., 2 hours"
-              className="mt-1.5 rounded-xl"
-            />
+            <div className="mt-1.5 flex max-w-[210px] gap-2">
+              <div className="relative w-[96px]">
+                <Input
+                  id="duration-hours"
+                  type="number"
+                  min={0}
+                  max={23}
+                  step={1}
+                  value={durationParts.hours}
+                  onChange={(e) => handleDurationPartsChange(e.target.value, String(durationParts.minutes))}
+                  className="h-9 rounded-xl pr-7 text-sm"
+                />
+                <span className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 whitespace-nowrap text-[11px] text-muted-foreground">hr</span>
+              </div>
+              <div className="relative w-[104px]">
+                <Input
+                  id="duration-minutes"
+                  type="number"
+                  min={0}
+                  max={59}
+                  step={1}
+                  value={durationParts.minutes}
+                  onChange={(e) => handleDurationPartsChange(String(durationParts.hours), e.target.value)}
+                  className="h-9 rounded-xl pr-9 text-sm"
+                />
+                <span className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 whitespace-nowrap text-[11px] text-muted-foreground">min</span>
+              </div>
+            </div>
           </div>
 
           {/* Location */}
@@ -456,6 +467,37 @@ function deriveDuration(startTime: string, endTime: string): string {
   if (hours === 0) return `${minutes}m`;
   if (minutes === 0) return `${hours}h`;
   return `${hours}h ${minutes}m`;
+}
+
+function parseDurationToParts(duration: string): { hours: number; minutes: number } {
+  const text = String(duration || "").trim().toLowerCase();
+  if (!text) return { hours: 1, minutes: 0 };
+  const hourMatch = text.match(/(\d+(?:\.\d+)?)\s*h/);
+  const minuteMatch = text.match(/(\d+(?:\.\d+)?)\s*m/);
+  if (hourMatch || minuteMatch) {
+    const total = Math.max(1, Math.round(Number(hourMatch?.[1] || 0) * 60 + Number(minuteMatch?.[1] || 0)));
+    return { hours: Math.floor(total / 60), minutes: total % 60 };
+  }
+  const numeric = Number(text);
+  if (Number.isFinite(numeric) && numeric > 0) {
+    const total = Math.max(1, Math.round(numeric * 60));
+    return { hours: Math.floor(total / 60), minutes: total % 60 };
+  }
+  return { hours: 1, minutes: 0 };
+}
+
+function formatDurationFromMinutes(totalMinutes: number): string {
+  const total = Math.max(1, Math.floor(Number(totalMinutes) || 60));
+  const hours = Math.floor(total / 60);
+  const minutes = total % 60;
+  if (hours && minutes) return `${hours}h ${minutes}m`;
+  if (hours) return `${hours}h`;
+  return `${minutes}m`;
+}
+
+function clampDurationPart(value: string, max: number): string {
+  const numeric = Math.max(0, Math.min(max, Math.floor(Number(value || 0))));
+  return String(Number.isFinite(numeric) ? numeric : 0);
 }
 
 function convertTo24Hour(time12h: string): string {

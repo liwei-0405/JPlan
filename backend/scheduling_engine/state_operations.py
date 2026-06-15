@@ -114,6 +114,93 @@ class StateOperationsMixin:
                 identities.add(identity)
         return identities
 
+    def _normalize_move_back_conflict_operations(
+        self,
+        operations: List[Dict[str, Any]],
+        active_activities: List[Dict[str, Any]],
+        preferences: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        if not operations:
+            return operations
+        day_start = parse_clock(preferences.get("day_start") or preferences.get("day_start_time")) or DEFAULT_DAY_START
+        day_end = parse_clock(preferences.get("day_end") or preferences.get("day_end_time")) or DEFAULT_DAY_END
+        normalized: List[Dict[str, Any]] = []
+
+        for operation in operations:
+            message = clean_title(operation.get("_user_message") or operation.get("_latest_request") or "")
+            if not re.search(r"\b(?:move|put|shift|change)\b", message) or not re.search(r"\bback\b", message):
+                normalized.append(operation)
+                continue
+
+            target_ref = operation.get("target_id") or operation.get("target_title") or operation.get("title")
+            resolution = self._resolve_activity_reference(target_ref, active_activities)
+            if resolution.get("status") != "resolved":
+                normalized.append(operation)
+                continue
+            target = resolution["activity"]
+            if not (target.get("is_conflict") or target.get("is_conflicting") or target.get("conflict_with")):
+                normalized.append(operation)
+                continue
+
+            duration = int(target.get("duration_minutes") or operation.get("duration_minutes") or DEFAULT_DURATION)
+            other_blocks = [
+                item for item in active_activities
+                if item.get("stable_activity_id") != target.get("stable_activity_id")
+                and item.get("status") == "active"
+                and item.get("scheduled_start") is not None
+                and item.get("scheduled_end") is not None
+            ]
+            preferred_start = self._nearest_non_overlapping_start(
+                int(target.get("scheduled_start") or day_start),
+                duration,
+                other_blocks,
+                day_start,
+                day_end,
+            )
+            if preferred_start is None:
+                normalized.append(operation)
+                continue
+
+            adjusted = deepcopy(operation)
+            adjusted["fixed_start"] = preferred_start
+            adjusted["fixed_end"] = preferred_start + duration
+            adjusted["duration_minutes"] = duration
+            adjusted["timing_mode"] = TimingMode.FIXED
+            adjusted["target_id"] = target.get("stable_activity_id") or target.get("id")
+            adjusted["target_title"] = target.get("title")
+            adjusted["resolved_target_title"] = target.get("title")
+            adjusted["preserve_existing_fields"] = True
+            adjusted.setdefault("notes", "Moved back to the nearest non-clashing time.")
+            jlog(
+                "STATE",
+                f"title={target.get('title')} from={format_clock(target.get('scheduled_start'))} to={format_clock(preferred_start)}",
+                "MOVE_BACK_CONFLICT",
+            )
+            normalized.append(adjusted)
+        return normalized
+
+    def _nearest_non_overlapping_start(
+        self,
+        preferred_start: int,
+        duration: int,
+        blocks: List[Dict[str, Any]],
+        day_start: int,
+        day_end: int,
+    ) -> Optional[int]:
+        candidates = sorted({
+            max(day_start, preferred_start),
+            *[int(block.get("scheduled_end") or day_start) for block in blocks],
+            *[max(day_start, int(block.get("scheduled_start") or day_start) - duration) for block in blocks],
+        }, key=lambda value: (abs(value - preferred_start), value))
+        for candidate in candidates:
+            candidate_end = candidate + duration
+            if candidate < day_start or candidate_end > day_end:
+                continue
+            if any(candidate < int(block.get("scheduled_end") or 0) and candidate_end > int(block.get("scheduled_start") or 0) for block in blocks):
+                continue
+            return candidate
+        return None
+
     def _message_explicitly_targets_activity(self, message: str, title: str) -> bool:
         clean_message = clean_title(message)
         clean_activity = clean_title(title)
@@ -1357,6 +1444,40 @@ class StateOperationsMixin:
         schedule_date = new_date or working_envelope.get("date") or str(date.today())
         source_turn = current_version + 1
 
+        raw_explicit_shift_requested = any(
+            clean_title((operation or {}).get("op") or "") == "shift_plan_date"
+            for operation in operations or []
+            if isinstance(operation, dict)
+        )
+        source_plan_date = working_envelope.get("date")
+        is_cross_date_new_plan = bool(
+            source_plan_date
+            and schedule_date
+            and source_plan_date != schedule_date
+            and not raw_explicit_shift_requested
+        )
+        if is_cross_date_new_plan:
+            target_context = self._load_canonical_activities(target_date_envelope)
+            canonical_activities = target_context
+            working_envelope = deepcopy(target_date_envelope) if target_date_envelope else {
+                **deepcopy(working_envelope),
+                "activities": [],
+                "schedule_blocks": [],
+                "committed_schedule_blocks": [],
+                "external_calendar_events": [],
+                "sync_links": [],
+                "active_view": "jplan",
+                "conflicts": [],
+                "conflict": None,
+                "unmet_items": [],
+                "validation_issues": [],
+            }
+            working_envelope["date"] = schedule_date
+            self._debug(
+                f"[STATE] Starting cross-date plan for {schedule_date} from target context "
+                f"({len([item for item in canonical_activities if item.get('status') == 'active'])} active activities)"
+            )
+
         updated_activities: List[Dict[str, Any]] = []
         removed_activities: List[Dict[str, Any]] = []
         deleted_activity_ids: List[str] = []
@@ -1410,6 +1531,11 @@ class StateOperationsMixin:
         operations_to_apply, ignored_operations = self._prepare_operations_for_apply(
             sanitized_operations,
             active_pool_for_prepare,
+        )
+        operations_to_apply = self._normalize_move_back_conflict_operations(
+            operations_to_apply,
+            active_pool_for_prepare,
+            preferences,
         )
         self._configure_module_d_run_policy(
             preferences,

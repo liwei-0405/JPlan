@@ -26,7 +26,7 @@ from travel_service import TravelService
 # load environment variables from .env file
 load_dotenv()
 
-BACKEND_VERSION = "2026.06.11-5"
+BACKEND_VERSION = "2026.06.15-1"
 
 def _parse_allowed_origins() -> List[str]:
     raw = os.getenv("ALLOWED_ORIGINS", "")
@@ -426,8 +426,9 @@ def _mark_unsaved_draft(envelope: Dict[str, Any]) -> Dict[str, Any]:
     updated = dict(envelope)
     if updated.get("schedule_blocks"):
         updated["has_unsaved_draft"] = True
-        updated["draft_dirty"] = True
         updated["active_view"] = "jplan"
+        if not updated.get("needs_reschedule"):
+            updated["draft_dirty"] = False
     return updated
 
 
@@ -957,8 +958,9 @@ async def chat_with_llm(request: ChatRequest):
 
                 target_date_envelope = None
                 shift_target_date = extract_shift_target_date(ops)
-                if request.user_id and shift_target_date and shift_target_date != request.current_schedule.date:
-                    target_date_envelope = database.get_plan_by_date(shift_target_date, request.user_id)
+                target_date_for_context = shift_target_date or parsed.get("date")
+                if request.user_id and target_date_for_context and target_date_for_context != request.current_schedule.date:
+                    target_date_envelope = database.get_plan_by_date(target_date_for_context, request.user_id)
                 
                 apply_started = time.perf_counter()
                 patch_result = scheduling_engine.apply_operations(

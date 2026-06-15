@@ -154,7 +154,7 @@ function derivePlanStatus(schedule: DailySchedule | undefined, realEventCount: n
   if (schedule.travel_validation_status === "pending_locations" || schedule.needs_travel_validation) {
     return "Needs locations";
   }
-  if (schedule.needs_reschedule || schedule.draft_dirty || schedule.has_unsaved_draft) {
+  if (schedule.needs_reschedule || schedule.draft_dirty) {
     return "Not re-optimized";
   }
   if ((schedule.route_conflicts || []).length > 0 || statusText.includes("route_conflict") || statusText.includes("route conflict")) {

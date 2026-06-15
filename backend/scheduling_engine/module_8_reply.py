@@ -46,7 +46,7 @@ class Module8ReplyMixin:
         status = result.get("status") or envelope.get("status") or ("partial" if conflicts else "success")
         if status == "success" and envelope.get("status") == "warning":
             status = "warning"
-        if envelope.get("schedule_status") in {"location_pending", "route_conflict"}:
+        if result.get("status") not in {"conflict", "no_operation", "clarification_needed"} and envelope.get("schedule_status") in {"location_pending", "route_conflict"}:
             status = envelope.get("schedule_status")
 
         allowed_times = set(self._allowed_reply_times(referenced_blocks, warnings))
@@ -444,6 +444,19 @@ class Module8ReplyMixin:
                 "reply_reason": summary.get("reply_reason") or "no_operation",
             }
 
+        if status == "conflict" and not applied and not allow_clash:
+            suggestion_text = f" A possible option is: {suggestions[0]}." if suggestions else ""
+            return {
+                "reply": (
+                    f"I couldn't apply that change because {reason} "
+                    f"Your existing plan was kept unchanged for feasibility.{suggestion_text} "
+                    "If you want to force the overlap, turn on Allow Clash and send the request again."
+                ),
+                "reply_status": "conflict",
+                "recommend_allow_clash": True,
+                "reply_reason": reason,
+            }
+
         if status == "location_pending":
             requests = summary.get("location_resolution_requests") or []
             request_titles = [str(req.get("title") or "an activity") for req in requests]
@@ -472,19 +485,6 @@ class Module8ReplyMixin:
                 "reply_status": "conflict",
                 "recommend_allow_clash": False,
                 "reply_reason": reason_text,
-            }
-
-        if status == "conflict" and not applied and not allow_clash:
-            suggestion_text = f" A possible option is: {suggestions[0]}." if suggestions else ""
-            return {
-                "reply": (
-                    f"I couldn't apply that change because {reason} "
-                    f"Your existing plan was kept unchanged for feasibility.{suggestion_text} "
-                    "If you want to force the overlap, turn on Allow Clash and send the request again."
-                ),
-                "reply_status": "conflict",
-                "recommend_allow_clash": True,
-                "reply_reason": reason,
             }
 
         success_sentence = self._success_reply_sentence(summary)

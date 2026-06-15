@@ -2218,6 +2218,71 @@ def test_whole_plan_shift_moves_active_activities_to_target_date():
     assert _count_title(shifted["envelope"], "Lunch") == 1
 
 
+def test_cross_date_new_plan_does_not_copy_source_day_activities():
+    engine = SchedulingEngine(DummyClient())
+    source = engine.build_schedule_response(
+        parsed={
+            "intent": "schedule",
+            "reply": "Source draft.",
+            "transcription": "source",
+            "date": "2026-05-05",
+            "preferences": {"allow_clash": False},
+            "operations": [
+                {
+                    "op": "add",
+                    "title": "FYP Consultation",
+                    "timing_mode": TimingMode.FIXED,
+                    "fixed_start": "10:00",
+                    "duration_minutes": 60,
+                    "location": "school",
+                },
+                {
+                    "op": "add",
+                    "title": "Group discussion",
+                    "timing_mode": TimingMode.FIXED,
+                    "fixed_start": "14:00",
+                    "duration_minutes": 60,
+                    "location": "school",
+                },
+            ],
+        },
+        current_schedule=None,
+        latest_request="source",
+    )["schedule_data"]
+
+    tomorrow = engine.apply_operations(
+        envelope=source,
+        operations=[
+            {
+                "op": "add",
+                "title": "FYP Consultation",
+                "timing_mode": TimingMode.FIXED,
+                "fixed_start": "10:00",
+                "duration_minutes": 60,
+                "location": "school",
+                "_user_message": "Plan my day tomorrow with FYP consultation at school from 10am to 11am.",
+            },
+            {
+                "op": "add",
+                "title": "Lunch",
+                "timing_mode": TimingMode.FIXED,
+                "fixed_start": "12:30",
+                "duration_minutes": 60,
+                "location": "SS15",
+                "_user_message": "Plan my day tomorrow with lunch around 12:30pm.",
+            },
+        ],
+        base_version=source["version"],
+        new_date="2026-05-06",
+    )
+
+    assert tomorrow["status"] == "success"
+    assert tomorrow["envelope"]["date"] == "2026-05-06"
+    assert _count_title(tomorrow["envelope"], "FYP Consultation") == 1
+    assert _count_title(tomorrow["envelope"], "Group discussion") == 0
+    assert not tomorrow["envelope"].get("conflicts")
+
+
 def test_whole_plan_shift_with_target_day_conflict_respects_allow_clash():
     engine = SchedulingEngine(DummyClient())
     source = engine.build_schedule_response(

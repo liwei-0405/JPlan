@@ -215,6 +215,36 @@ function clearRouteRepairPreview<T extends DailySchedule>(schedule: T): T {
   } as T;
 }
 
+function sanitizeTravelStateForMode<T extends DailySchedule>(schedule: T, accurateTravelEnabled: boolean): T {
+  if (accurateTravelEnabled) return schedule;
+  const base = clearRouteRepairPreview(schedule);
+  const status = String(base.status || "");
+  const scheduleStatus = String(base.schedule_status || "");
+  return {
+    ...base,
+    accurate_travel_time: false,
+    travel_intent: false,
+    needs_travel_validation: false,
+    travel_validation_status: "not_requested",
+    location_resolution_requests: [],
+    pending_repair_suggestions: [],
+    route_conflicts: [],
+    route_repair_actions: [],
+    unfit_activities: [],
+    blocked_activities: [],
+    start_route_summary: null,
+    status: ["location_pending", "route_conflict"].includes(status) ? "ok" : base.status,
+    schedule_status: ["location_pending", "route_conflict"].includes(scheduleStatus)
+      ? (["location_pending", "route_conflict"].includes(status) ? "ok" : base.status || "ok")
+      : base.schedule_status,
+    preferences: {
+      ...(base.preferences || {}),
+      accurate_travel_time: false,
+      travel_intent: false,
+    },
+  } as T;
+}
+
 function displayScheduleForTimeline(schedule: DailySchedule): DailySchedule {
   if (!hasRouteRepairPreview(schedule)) return schedule;
   const preview = schedule.preview_schedule || {};
@@ -299,9 +329,11 @@ export function PlanningInputPage({
         try {
           const data = await getPlanByDate(isoDateStr, user.id);
           if (data) {
-            setPreviewSchedule(data as DailySchedule);
-            setAllowClash(Boolean((data as DailySchedule).allow_clash));
-            setAccurateTravelTime(isAccurateTravelEnabled(data as DailySchedule));
+            const loadedSchedule = data as DailySchedule;
+            const loadedAccurate = isAccurateTravelEnabled(loadedSchedule);
+            setPreviewSchedule(loadedSchedule);
+            setAllowClash(Boolean(loadedSchedule.allow_clash));
+            setAccurateTravelTime(loadedAccurate);
           }
         } catch (err) {
           console.error("Failed to auto-load schedule:", err);
@@ -399,7 +431,8 @@ export function PlanningInputPage({
   // Manual form state
   const [activityName, setActivityName] = useState("");
   const [activityTime, setActivityTime] = useState("");
-  const [activityDuration, setActivityDuration] = useState("");
+  const [activityDurationHours, setActivityDurationHours] = useState("1");
+  const [activityDurationMinutes, setActivityDurationMinutes] = useState("0");
   const [activityLocation, setActivityLocation] = useState("");
   const [manualResolvedLocation, setManualResolvedLocation] = useState<ResolvedLocationSnapshot | null>(null);
   const [isManualLocationPickerOpen, setIsManualLocationPickerOpen] = useState(false);
@@ -532,18 +565,20 @@ export function PlanningInputPage({
   ): DailySchedule => {
     console.debug(`[JPLAN][DIRTY] reason=${reason} activity=${activityTitle || "(plan)"}`);
     const baseDraft = clearRouteRepairPreview(schedule);
+    const travelDisabled = !accurateTravelTime;
     return {
       ...baseDraft,
-      travel_validation_status: accurateTravelTime ? "not_requested" : baseDraft.travel_validation_status,
+      travel_validation_status: "not_requested",
       route_repair_actions: [],
       route_conflicts: [],
       pending_repair_suggestions: [],
       unfit_activities: [],
       blocked_activities: [],
       start_route_summary: null,
+      location_resolution_requests: travelDisabled ? [] : (baseDraft.location_resolution_requests || []),
       needs_reschedule: true,
       reschedule_reason: reason,
-      needs_travel_validation: accurateTravelTime ? true : Boolean(baseDraft.needs_travel_validation),
+      needs_travel_validation: accurateTravelTime,
       has_unsaved_draft: true,
       draft_dirty: true,
       active_view: "jplan",
@@ -669,17 +704,24 @@ export function PlanningInputPage({
     };
   };
 
-  const parseManualDurationMinutes = (value: string): number => {
-    const text = String(value || "").trim().toLowerCase();
-    if (!text) return 60;
-    const hourMatch = text.match(/(\d+(?:\.\d+)?)\s*h/);
-    const minuteMatch = text.match(/(\d+(?:\.\d+)?)\s*m/);
-    if (hourMatch || minuteMatch) {
-      return Math.max(1, Math.round(Number(hourMatch?.[1] || 0) * 60 + Number(minuteMatch?.[1] || 0)));
-    }
-    const numeric = Number(text);
-    if (Number.isFinite(numeric) && numeric > 0) return Math.max(1, Math.round(numeric * 60));
-    return 60;
+  const clampDurationPart = (value: string, max: number) => {
+    const numeric = Math.max(0, Math.min(max, Math.floor(Number(value || 0))));
+    return Number.isFinite(numeric) ? String(numeric) : "0";
+  };
+
+  const manualDurationMinutes = (): number => {
+    const hours = Number(activityDurationHours || 0);
+    const minutes = Number(activityDurationMinutes || 0);
+    const total = Math.max(1, Math.floor(hours) * 60 + Math.floor(minutes));
+    return Number.isFinite(total) ? total : 60;
+  };
+
+  const formatDurationDisplay = (totalMinutes: number): string => {
+    const hours = Math.floor(totalMinutes / 60);
+    const minutes = totalMinutes % 60;
+    if (hours && minutes) return `${hours}h ${minutes}m`;
+    if (hours) return `${hours}h`;
+    return `${minutes}m`;
   };
 
   const compareActivityTimeForManual = (a: ActivityBlock, b: ActivityBlock) => {
@@ -698,14 +740,11 @@ export function PlanningInputPage({
 
     const hasManualStart = Boolean(activityTime.trim());
     const formattedStartTime = hasManualStart ? formatTo12Hour(activityTime) : "";
-    // standardize duration display for example "1" -> "1 hour"
-    const rawDuration = activityDuration.trim() || (manualActivityType === "buffer" ? "5m" : "1h");
-    const displayDuration = rawDuration.includes('h') || rawDuration.includes('m')
-      ? rawDuration
-      : `${rawDuration} hour`;
+    const durationMinutes = manualDurationMinutes();
+    const displayDuration = formatDurationDisplay(durationMinutes);
 
     const newStartTimeMins = hasManualStart ? timeToMinutes(formattedStartTime) : null;
-    const endTimeStr = hasManualStart ? calculateEndTime(activityTime, rawDuration) : "";
+    const endTimeStr = hasManualStart ? minutesTo12Hour((timeToMinutes(formattedStartTime) + durationMinutes) % (24 * 60)) : "";
     let newEndTimeMins = hasManualStart ? timeToMinutes(endTimeStr) : null;
 
     // Handle overnight activity (e.g. 11 PM to 1 AM)
@@ -748,7 +787,7 @@ export function PlanningInputPage({
       start: formattedStartTime,
       end: endTimeStr,
       duration: displayDuration,
-      duration_minutes: parseManualDurationMinutes(rawDuration),
+      duration_minutes: durationMinutes,
       timing_mode: isManualFixed ? "fixed" : (hasManualStart ? "preferred" : "unspecified"),
       original_timing_mode: isManualFixed ? "fixed" : (hasManualStart ? "preferred" : "unspecified"),
       fixed_start: isManualFixed && newStartTimeMins != null ? newStartTimeMins : null,
@@ -778,7 +817,7 @@ export function PlanningInputPage({
     setSaveWithoutRerunNotice(false);
 
     // Reset form
-    setActivityName(""); setActivityTime(""); setActivityDuration(""); setActivityLocation("");
+    setActivityName(""); setActivityTime(""); setActivityDurationHours("1"); setActivityDurationMinutes("0"); setActivityLocation("");
     setManualResolvedLocation(null);
     setManualActivityType("activity");
     setManualTimingMode("fixed");
@@ -1766,7 +1805,7 @@ export function PlanningInputPage({
       setAccurateTravelTime(false);
       setPreviewSchedule(prev => {
         if (!prev) return prev;
-        const next = clearRouteRepairPreview(prev);
+        const next = sanitizeTravelStateForMode(prev, false);
         return {
           ...next,
           accurate_travel_time: false,
@@ -2489,6 +2528,10 @@ export function PlanningInputPage({
                           onClick={() => {
                             setManualActivityType("activity");
                             if (!activityName) setActivityName("");
+                            if (activityDurationHours === "0" && activityDurationMinutes === "5") {
+                              setActivityDurationHours("1");
+                              setActivityDurationMinutes("0");
+                            }
                           }}
                           className="rounded-xl text-xs"
                         >
@@ -2503,6 +2546,8 @@ export function PlanningInputPage({
                             setManualTimingMode("fixed");
                             setActivityLocation("");
                             setManualResolvedLocation(null);
+                            setActivityDurationHours("0");
+                            setActivityDurationMinutes("5");
                           }}
                           className="rounded-xl text-xs"
                         >
@@ -2568,13 +2613,40 @@ export function PlanningInputPage({
                       </div>
                       <div className="space-y-1.5">
                         <Label>Duration</Label>
-                        <Input
-                          value={activityDuration}
-                          disabled={isScheduleBusy}
-                          onChange={e => { setActivityDuration(e.target.value); setIsConflict(false); }}
-                          placeholder="1h 30m"
-                          className={`rounded-xl ${isConflict ? "border-destructive focus-visible:ring-destructive" : ""}`}
-                        />
+                        <div className="flex max-w-[210px] gap-2">
+                          <div className="relative w-[96px]">
+                            <Input
+                              type="number"
+                              min={0}
+                              max={23}
+                              step={1}
+                              value={activityDurationHours}
+                              disabled={isScheduleBusy}
+                              onChange={e => {
+                                setActivityDurationHours(clampDurationPart(e.target.value, 23));
+                                setIsConflict(false);
+                              }}
+                              className={`h-9 rounded-xl pr-7 text-sm ${isConflict ? "border-destructive focus-visible:ring-destructive" : ""}`}
+                            />
+                            <span className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 whitespace-nowrap text-[11px] text-muted-foreground">hr</span>
+                          </div>
+                          <div className="relative w-[104px]">
+                            <Input
+                              type="number"
+                              min={0}
+                              max={59}
+                              step={1}
+                              value={activityDurationMinutes}
+                              disabled={isScheduleBusy}
+                              onChange={e => {
+                                setActivityDurationMinutes(clampDurationPart(e.target.value, 59));
+                                setIsConflict(false);
+                              }}
+                              className={`h-9 rounded-xl pr-9 text-sm ${isConflict ? "border-destructive focus-visible:ring-destructive" : ""}`}
+                            />
+                            <span className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 whitespace-nowrap text-[11px] text-muted-foreground">min</span>
+                          </div>
+                        </div>
                       </div>
                     </div>
                     {manualActivityType === "activity" && (
