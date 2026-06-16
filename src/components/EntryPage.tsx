@@ -1,6 +1,6 @@
 import { Button } from "./ui/button";
 import { TopNav } from "./TopNav";
-import { CalendarWidget } from "./CalendarWidget";
+import { CalendarWidget, calendarPlanStatusMeta, type CalendarPlanStatus } from "./CalendarWidget";
 import { Sparkles, Calendar as CalendarIcon } from "lucide-react";
 import type { ActivityBlock, DailySchedule } from "../App";
 import { useState } from "react";
@@ -173,6 +173,21 @@ function derivePlanStatus(schedule: DailySchedule | undefined, realEventCount: n
   return "Optimized";
 }
 
+function deriveCalendarPlanStatus(schedule: DailySchedule): CalendarPlanStatus {
+  const blocks = getBlocksForView(schedule, "jplan");
+  const realEventCount = countRealEventBlocks(blocks);
+  const googleEventCount = schedule.external_calendar_events?.length || 0;
+  if (realEventCount === 0 && googleEventCount > 0) return "google_only";
+
+  const status = derivePlanStatus(schedule, realEventCount);
+  if (status === "Needs locations") return "needs_locations";
+  if (status === "Not re-optimized") return "not_reoptimized";
+  if (status === "Route warning") return "route_warning";
+  if (status === "Partially fit") return "partial";
+  if (status === "Optimized") return "optimized";
+  return "saved";
+}
+
 export function EntryPage({
   onStartPlanning,
   onViewSchedule,
@@ -185,6 +200,10 @@ export function EntryPage({
   const [selectedDate, setSelectedDate] = useState<Date>(new Date());
 
   const scheduleDates = scheduleHistory.map(s => s.date);
+  const scheduleStatusByDate = scheduleHistory.reduce<Record<string, CalendarPlanStatus>>((acc, schedule) => {
+    if (schedule.date) acc[schedule.date] = deriveCalendarPlanStatus(schedule);
+    return acc;
+  }, {});
 
   const handleDateSelect = (date: Date) => {
     setSelectedDate(date);
@@ -239,6 +258,7 @@ export function EntryPage({
           <div className="min-w-0">
             <CalendarWidget
               scheduleDates={scheduleDates}
+              scheduleStatusByDate={scheduleStatusByDate}
               onDateSelect={handleDateSelect}
               selectedDate={selectedDate}
             />
@@ -333,6 +353,20 @@ export function EntryPage({
                   </>
                 )}
               </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="entry-calendar-legend-row">
+          <div className="min-w-0">
+            <p className="text-sm text-muted-foreground">Calendar Status</p>
+            <div className="calendar-legend-list mt-2 text-sm text-muted-foreground">
+              {(["optimized", "needs_locations", "not_reoptimized", "route_warning", "partial", "google_only"] as CalendarPlanStatus[]).map((status) => (
+                <span key={status} className="calendar-legend-item">
+                  <span className={`calendar-legend-dot ${calendarPlanStatusMeta[status].className}`} aria-hidden="true" />
+                  <span>{calendarPlanStatusMeta[status].label}</span>
+                </span>
+              ))}
             </div>
           </div>
         </div>

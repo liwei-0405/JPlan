@@ -52,6 +52,7 @@ import {
   mergePlanningPreferences,
   normalizePlanningPreferences,
   normalizeBufferMinutes,
+  isValidDayWindow,
   savePlanningPreferences,
   saveRecentLocations,
   savedLocationToPlanningLocation,
@@ -1921,12 +1922,6 @@ export function PlanningInputPage({
       ?? (previewSchedule?.preferences || {}).default_buffer_minutes
       ?? planningPreferences.default_buffer_minutes,
   );
-  const baseTimeOptions = ["06:00", "07:00", "08:00", "09:00", "10:00", "20:00", "21:00", "22:00", "23:00"];
-  const timeOptions = Array.from(new Set([
-    ...baseTimeOptions,
-    toCanonicalTime(activeDayStart) || "08:00",
-    toCanonicalTime(activeDayEnd) || "22:00",
-  ])).sort();
   const savedStartLocationOptions = savedLocationsForPicker.filter((location) => hasLocationCoordinates(location as PlanningLocation));
   const locationOptionKey = (location?: Partial<PlanningLocation> | null) => {
     if (!location) return "__none__";
@@ -1944,6 +1939,7 @@ export function PlanningInputPage({
   const displayedDayEnd = isEditingPlanSettings ? draftDayEnd : (toCanonicalTime(activeDayEnd) || "22:00");
   const displayedStartLocationKey = isEditingPlanSettings ? draftStartLocationKey : activeStartLocationKey;
   const displayedBufferMinutes = isEditingPlanSettings ? draftBufferMinutes : activeBufferMinutes;
+  const hasInvalidPlanWindow = isEditingPlanSettings && !isValidDayWindow(draftDayStart, draftDayEnd);
   const planSettingControlClass = `h-8 rounded-xl border border-border px-2 text-xs transition ${
     isEditingPlanSettings
       ? "bg-background text-foreground"
@@ -1963,6 +1959,7 @@ export function PlanningInputPage({
   };
   const applyPlanSettingsEdit = () => {
     if (isScheduleBusy) return;
+    if (!isValidDayWindow(draftDayStart, draftDayEnd)) return;
     setPreviewSchedule((prev) => {
       if (!prev) return prev;
       const selectedSavedLocation = savedStartLocationOptions.find((location) => locationOptionKey(location) === draftStartLocationKey);
@@ -2077,29 +2074,23 @@ export function PlanningInputPage({
                     ))}
                   </select>
                   <Clock className="h-3.5 w-3.5 text-muted-foreground" />
-                  <select
+                  <input
+                    type="time"
                     value={displayedDayStart}
                     onChange={(event) => setDraftDayStart(event.target.value)}
                     disabled={!isEditingPlanSettings || isScheduleBusy}
-                    className={planSettingControlClass}
+                    className={`${planSettingControlClass} w-[92px] ${hasInvalidPlanWindow ? "border-destructive focus-visible:outline-destructive" : ""}`}
                     aria-label="Plan start time"
-                  >
-                    {timeOptions.map((time) => (
-                      <option key={`start-${time}`} value={time}>{toDisplayTime(time)}</option>
-                    ))}
-                  </select>
+                  />
                   <span className="text-muted-foreground">to</span>
-                  <select
+                  <input
+                    type="time"
                     value={displayedDayEnd}
                     onChange={(event) => setDraftDayEnd(event.target.value)}
                     disabled={!isEditingPlanSettings || isScheduleBusy}
-                    className={planSettingControlClass}
+                    className={`${planSettingControlClass} w-[92px] ${hasInvalidPlanWindow ? "border-destructive focus-visible:outline-destructive" : ""}`}
                     aria-label="Plan end time"
-                  >
-                    {timeOptions.map((time) => (
-                      <option key={`end-${time}`} value={time}>{toDisplayTime(time)}</option>
-                    ))}
-                  </select>
+                  />
                   <span className="text-muted-foreground">Buffer</span>
                   <input
                     type="number"
@@ -2119,7 +2110,7 @@ export function PlanningInputPage({
                     size="sm"
                     className="h-7 rounded-full px-2 text-xs"
                     onClick={isEditingPlanSettings ? applyPlanSettingsEdit : beginPlanSettingsEdit}
-                    disabled={isScheduleBusy}
+                    disabled={isScheduleBusy || hasInvalidPlanWindow}
                   >
                     {isEditingPlanSettings ? "Apply" : "Edit"}
                   </Button>
@@ -2129,6 +2120,11 @@ export function PlanningInputPage({
                     </Button>
                   )}
                 </div>
+                {hasInvalidPlanWindow && (
+                  <p className="mt-1 max-w-full text-[11px] leading-snug text-destructive">
+                    Start must be before end.
+                  </p>
+                )}
               </div>
               <div className="planning-live-actions flex shrink-0 flex-col items-end gap-2">
                 {showRunSchedulerButton && (

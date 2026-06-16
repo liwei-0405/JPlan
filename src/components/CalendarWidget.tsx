@@ -2,14 +2,42 @@ import { ChevronLeft, ChevronRight } from "lucide-react";
 import { Button } from "./ui/button";
 import { useState } from "react";
 
+export type CalendarPlanStatus =
+  | "optimized"
+  | "needs_locations"
+  | "not_reoptimized"
+  | "route_warning"
+  | "partial"
+  | "google_only"
+  | "saved";
+
 type CalendarWidgetProps = {
-  scheduleDates: string[]; // Array of dates that have schedules
+  scheduleDates: string[]; // ISO dates that have schedules
+  scheduleStatusByDate?: Record<string, CalendarPlanStatus>;
   onDateSelect: (date: Date) => void;
   selectedDate?: Date;
 };
 
-export function CalendarWidget({ scheduleDates, onDateSelect, selectedDate }: CalendarWidgetProps) {
+export const calendarPlanStatusMeta: Record<CalendarPlanStatus, { label: string; className: string }> = {
+  optimized: { label: "Optimized", className: "calendar-plan-optimized" },
+  needs_locations: { label: "Needs locations", className: "calendar-plan-needs-locations" },
+  not_reoptimized: { label: "Not re-optimized", className: "calendar-plan-not-reoptimized" },
+  route_warning: { label: "Route warning", className: "calendar-plan-route-warning" },
+  partial: { label: "Partially fit", className: "calendar-plan-partial" },
+  google_only: { label: "Google only", className: "calendar-plan-google-only" },
+  saved: { label: "Saved", className: "calendar-plan-saved" },
+};
+
+function formatDateToISO(date: Date): string {
+  const yyyy = date.getFullYear();
+  const mm = String(date.getMonth() + 1).padStart(2, "0");
+  const dd = String(date.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+export function CalendarWidget({ scheduleDates, scheduleStatusByDate = {}, onDateSelect, selectedDate }: CalendarWidgetProps) {
   const [currentMonth, setCurrentMonth] = useState(new Date());
+  const scheduleDateSet = new Set(scheduleDates);
   
   const today = new Date();
   today.setHours(0, 0, 0, 0);
@@ -45,15 +73,14 @@ export function CalendarWidget({ scheduleDates, onDateSelect, selectedDate }: Ca
     calendarDays.push(null);
   }
 
-  const hasScheduleOnDate = (day: number): boolean => {
-    const date = new Date(year, month, day);
-    const dateStr = date.toLocaleDateString('en-US', { 
-      weekday: 'long', 
-      day: 'numeric', 
-      month: 'long', 
-      year: 'numeric' 
-    });
-    return scheduleDates.includes(dateStr);
+  const dateKeyForDay = (day: number): string => {
+    return formatDateToISO(new Date(year, month, day));
+  };
+
+  const planStatusForDate = (day: number): CalendarPlanStatus | null => {
+    const dateKey = dateKeyForDay(day);
+    if (scheduleStatusByDate[dateKey]) return scheduleStatusByDate[dateKey];
+    return scheduleDateSet.has(dateKey) ? "saved" : null;
   };
 
   const isToday = (day: number): boolean => {
@@ -130,36 +157,46 @@ export function CalendarWidget({ scheduleDates, onDateSelect, selectedDate }: Ca
 
       {/* Calendar Grid */}
       <div className="jplan-calendar-grid grid grid-cols-7 gap-1.5 sm:gap-2">
-        {calendarDays.map((day, index) => (
-          <div key={index} className="jplan-calendar-day-cell">
-            {day !== null ? (
+        {calendarDays.map((day, index) => {
+          const planStatus = day !== null ? planStatusForDate(day) : null;
+          const meta = planStatus ? calendarPlanStatusMeta[planStatus] : null;
+          const selected = day !== null && isSelected(day);
+          const todayDate = day !== null && isToday(day);
+          return (
+            <div key={index} className="jplan-calendar-day-cell">
+              {day !== null ? (
               <button
                 onClick={() => handleDayClick(day)}
+                title={meta ? `${dateKeyForDay(day)} · ${meta.label}` : dateKeyForDay(day)}
+                aria-label={meta ? `${dateKeyForDay(day)}, ${meta.label}` : dateKeyForDay(day)}
                 className={`
                   w-full h-full rounded-lg sm:rounded-xl flex flex-col items-center justify-center
-                  transition-all duration-200 relative
-                  ${isToday(day) 
+                  transition-all duration-200 relative calendar-day-button
+                  ${meta && !selected && !todayDate ? meta.className : ""}
+                  ${todayDate 
                     ? 'bg-primary text-primary-foreground shadow-md ring-2 ring-primary/20' 
-                    : isSelected(day)
+                    : selected
                     ? 'bg-secondary text-secondary-foreground'
                     : 'hover:bg-muted'
                   }
                 `}
               >
                 <span className="text-xs sm:text-sm">{day}</span>
-                {hasScheduleOnDate(day) && (
-                  <div className={`
-                    w-1.5 h-1.5 rounded-full mt-0.5
-                    ${isToday(day) ? 'bg-white' : 'bg-primary'}
-                  `} />
+                {meta && (
+                  <span
+                    className={`calendar-status-dot mt-0.5 ${meta.className} ${todayDate ? "calendar-status-dot-on-primary" : ""}`}
+                    aria-hidden="true"
+                  />
                 )}
               </button>
-            ) : (
+              ) : (
               <div />
-            )}
-          </div>
-        ))}
+              )}
+            </div>
+          );
+        })}
       </div>
+
     </div>
   );
 }

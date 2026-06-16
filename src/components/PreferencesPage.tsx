@@ -27,8 +27,8 @@ import {
   saveRecentLocations,
   savedLocationToPlanningLocation,
   normalizeBufferMinutes,
+  isValidDayWindow,
   toCanonicalTime,
-  toDisplayTime,
   type PlanningLocation,
 } from "../utils/planningPreferences";
 
@@ -63,8 +63,8 @@ function preferenceSnapshot(
 
 export function PreferencesPage({ onBack }: PreferencesPageProps) {
   const { user } = useAuth();
-  const [dayStart, setDayStart] = useState("8:00 AM");
-  const [dayEnd, setDayEnd] = useState("10:00 PM");
+  const [dayStart, setDayStart] = useState("08:00");
+  const [dayEnd, setDayEnd] = useState("22:00");
   const [useDayBoundaries, setUseDayBoundaries] = useState(true);
   const [defaultStartLocation, setDefaultStartLocation] = useState<PlanningLocation | null>(null);
   const [defaultBufferMinutes, setDefaultBufferMinutes] = useState(5);
@@ -85,14 +85,14 @@ export function PreferencesPage({ onBack }: PreferencesPageProps) {
   useEffect(() => {
     if (user) {
       const prefs = loadPlanningPreferences(user.id);
-      setDayStart(toDisplayTime(prefs.day_start_time) || "8:00 AM");
-      setDayEnd(toDisplayTime(prefs.day_end_time) || "10:00 PM");
+      setDayStart(toCanonicalTime(prefs.day_start_time) || "08:00");
+      setDayEnd(toCanonicalTime(prefs.day_end_time) || "22:00");
       setUseDayBoundaries(prefs.use_day_boundary_preferences ?? true);
       setDefaultStartLocation(prefs.default_start_location || null);
       setDefaultBufferMinutes(normalizeBufferMinutes(prefs.default_buffer_minutes));
       setOriginalPreferencesJson(preferenceSnapshot(
-        toDisplayTime(prefs.day_start_time) || "8:00 AM",
-        toDisplayTime(prefs.day_end_time) || "10:00 PM",
+        toCanonicalTime(prefs.day_start_time) || "08:00",
+        toCanonicalTime(prefs.day_end_time) || "22:00",
         prefs.use_day_boundary_preferences ?? true,
         prefs.default_start_location || null,
         normalizeBufferMinutes(prefs.default_buffer_minutes),
@@ -103,14 +103,14 @@ export function PreferencesPage({ onBack }: PreferencesPageProps) {
           if (!remotePrefs) return;
           const normalized = normalizePlanningPreferences(remotePrefs);
           savePlanningPreferences(user.id, normalized);
-          setDayStart(toDisplayTime(normalized.day_start_time) || "8:00 AM");
-          setDayEnd(toDisplayTime(normalized.day_end_time) || "10:00 PM");
+          setDayStart(toCanonicalTime(normalized.day_start_time) || "08:00");
+          setDayEnd(toCanonicalTime(normalized.day_end_time) || "22:00");
           setUseDayBoundaries(normalized.use_day_boundary_preferences ?? true);
           setDefaultStartLocation(normalized.default_start_location || null);
           setDefaultBufferMinutes(normalizeBufferMinutes(normalized.default_buffer_minutes));
           setOriginalPreferencesJson(preferenceSnapshot(
-            toDisplayTime(normalized.day_start_time) || "8:00 AM",
-            toDisplayTime(normalized.day_end_time) || "10:00 PM",
+            toCanonicalTime(normalized.day_start_time) || "08:00",
+            toCanonicalTime(normalized.day_end_time) || "22:00",
             normalized.use_day_boundary_preferences ?? true,
             normalized.default_start_location || null,
             normalizeBufferMinutes(normalized.default_buffer_minutes),
@@ -218,8 +218,8 @@ export function PreferencesPage({ onBack }: PreferencesPageProps) {
         const normalized = normalizePlanningPreferences(saved);
         savePlanningPreferences(user.id, normalized);
         setOriginalPreferencesJson(preferenceSnapshot(
-          toDisplayTime(normalized.day_start_time) || "8:00 AM",
-          toDisplayTime(normalized.day_end_time) || "10:00 PM",
+          toCanonicalTime(normalized.day_start_time) || "08:00",
+          toCanonicalTime(normalized.day_end_time) || "22:00",
           normalized.use_day_boundary_preferences ?? true,
           normalized.default_start_location || null,
           normalizeBufferMinutes(normalized.default_buffer_minutes),
@@ -272,6 +272,8 @@ export function PreferencesPage({ onBack }: PreferencesPageProps) {
       Number(pendingDefaultStartLocation.longitude).toFixed(6) === Number(loc.longitude).toFixed(6)
     );
   };
+
+  const hasInvalidDayWindow = useDayBoundaries && !isValidDayWindow(dayStart, dayEnd);
 
   return (
     <div className="min-h-screen bg-gradient-to-b from-background to-secondary/20">
@@ -332,43 +334,43 @@ export function PreferencesPage({ onBack }: PreferencesPageProps) {
                 <Label htmlFor="day-start" className="mb-2 block text-xs">
                   Start time
                 </Label>
-                <select
+                <input
                   id="day-start"
+                  type="time"
                   value={dayStart}
                   onChange={(e) => setDayStart(e.target.value)}
                   disabled={!useDayBoundaries}
-                  className={`w-full px-3 py-2 border border-border rounded-xl text-sm ${
+                  className={`h-10 w-full rounded-xl border px-3 text-sm ${
+                    hasInvalidDayWindow ? "border-destructive focus-visible:outline-destructive" : "border-border"
+                  } ${
                     useDayBoundaries ? "bg-background" : "cursor-not-allowed bg-muted text-muted-foreground"
                   }`}
-                >
-                  <option>6:00 AM</option>
-                  <option>7:00 AM</option>
-                  <option>8:00 AM</option>
-                  <option>9:00 AM</option>
-                  <option>10:00 AM</option>
-                </select>
+                />
               </div>
 
               <div>
                 <Label htmlFor="day-end" className="mb-2 block text-xs">
                   End time
                 </Label>
-                <select
+                <input
                   id="day-end"
+                  type="time"
                   value={dayEnd}
                   onChange={(e) => setDayEnd(e.target.value)}
                   disabled={!useDayBoundaries}
-                  className={`w-full px-3 py-2 border border-border rounded-xl text-sm ${
+                  className={`h-10 w-full rounded-xl border px-3 text-sm ${
+                    hasInvalidDayWindow ? "border-destructive focus-visible:outline-destructive" : "border-border"
+                  } ${
                     useDayBoundaries ? "bg-background" : "cursor-not-allowed bg-muted text-muted-foreground"
                   }`}
-                >
-                  <option>8:00 PM</option>
-                  <option>9:00 PM</option>
-                  <option>10:00 PM</option>
-                  <option>11:00 PM</option>
-                </select>
+                />
               </div>
             </div>
+            {hasInvalidDayWindow && (
+              <p className="mt-2 text-xs text-destructive">
+                Start time must be earlier than end time.
+              </p>
+            )}
 
             <div className="mt-4 rounded-2xl border border-border/60 bg-background/70 p-3">
               <div className="flex flex-wrap items-center justify-between gap-3">
@@ -557,7 +559,7 @@ export function PreferencesPage({ onBack }: PreferencesPageProps) {
 
         {/* Save Button */}
         <div className="mt-6 flex gap-3 sm:mt-8">
-          <Button onClick={handleSave} className="flex-1 rounded-xl shadow-sm" disabled={isSavingPreferences}>
+          <Button onClick={handleSave} className="flex-1 rounded-xl shadow-sm" disabled={isSavingPreferences || hasInvalidDayWindow}>
             {isSavingPreferences ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
             Save Preferences
           </Button>
@@ -602,7 +604,7 @@ export function PreferencesPage({ onBack }: PreferencesPageProps) {
               <Button
                 className="rounded-xl"
                 onClick={handleSave}
-                disabled={isSavingPreferences}
+                disabled={isSavingPreferences || hasInvalidDayWindow}
               >
                 {isSavingPreferences ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
                 Save

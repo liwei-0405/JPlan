@@ -26,7 +26,7 @@ from travel_service import TravelService
 # load environment variables from .env file
 load_dotenv()
 
-BACKEND_VERSION = "2026.06.15-1"
+BACKEND_VERSION = "2026.06.17-2"
 
 def _parse_allowed_origins() -> List[str]:
     raw = os.getenv("ALLOWED_ORIGINS", "")

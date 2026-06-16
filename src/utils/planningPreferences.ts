@@ -65,6 +65,22 @@ export function toDisplayTime(value?: string | null): string {
   return `${hour12}:${minute} ${meridiem}`;
 }
 
+export function timeToMinutesOfDay(value?: string | null): number | null {
+  const canonical = toCanonicalTime(value);
+  const match = canonical.match(/^(\d{2}):(\d{2})$/);
+  if (!match) return null;
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  if (!Number.isFinite(hour) || !Number.isFinite(minute) || hour > 23 || minute > 59) return null;
+  return hour * 60 + minute;
+}
+
+export function isValidDayWindow(start?: string | null, end?: string | null): boolean {
+  const startMinutes = timeToMinutesOfDay(start);
+  const endMinutes = timeToMinutesOfDay(end);
+  return startMinutes !== null && endMinutes !== null && startMinutes < endMinutes;
+}
+
 export function hasLocationCoordinates(location?: PlanningLocation | null): boolean {
   if (!location) return false;
   const lat = Number(location.latitude);

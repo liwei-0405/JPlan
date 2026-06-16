@@ -2461,6 +2461,37 @@ html {
   margin-top: 1.5rem;
 }
 
+.entry-calendar-legend-row {
+  width: 100%;
+  margin-top: 1.5rem;
+  padding: 0.9rem 1rem;
+  border: 1px solid color-mix(in srgb, var(--border) 82%, transparent);
+  border-radius: 0.75rem;
+  background: linear-gradient(135deg, rgb(255 255 255 / 0.8), rgb(248 250 252 / 0.72));
+  box-shadow: 0 8px 24px rgb(15 23 42 / 0.04);
+}
+
+.calendar-legend-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 0.65rem;
+  min-width: 0;
+}
+
+.calendar-legend-item {
+  display: inline-grid;
+  grid-template-columns: 0.5rem max-content;
+  align-items: center;
+  column-gap: 0.45rem;
+  min-width: 0;
+  padding: 0.28rem 0.5rem;
+  border: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+  border-radius: 999px;
+  background: rgb(255 255 255 / 0.72);
+  line-height: 1;
+  white-space: nowrap;
+}
+
 .jplan-calendar-card {
   width: 100%;
   min-width: 0;
@@ -2473,6 +2504,102 @@ html {
 
 .jplan-calendar-day-cell {
   min-height: 3.35rem;
+}
+
+.calendar-day-button {
+  border: 1px solid transparent;
+}
+
+.calendar-day-button.calendar-plan-optimized {
+  background: color-mix(in srgb, #22c55e 12%, transparent);
+  border-color: color-mix(in srgb, #22c55e 28%, transparent);
+}
+
+.calendar-day-button.calendar-plan-needs-locations {
+  background: color-mix(in srgb, #f59e0b 14%, transparent);
+  border-color: color-mix(in srgb, #f59e0b 34%, transparent);
+}
+
+.calendar-day-button.calendar-plan-not-reoptimized {
+  background: color-mix(in srgb, #64748b 13%, transparent);
+  border-color: color-mix(in srgb, #64748b 32%, transparent);
+}
+
+.calendar-day-button.calendar-plan-route-warning {
+  background: color-mix(in srgb, #ef4444 12%, transparent);
+  border-color: color-mix(in srgb, #ef4444 32%, transparent);
+}
+
+.calendar-day-button.calendar-plan-partial {
+  background: color-mix(in srgb, #a855f7 12%, transparent);
+  border-color: color-mix(in srgb, #a855f7 30%, transparent);
+}
+
+.calendar-day-button.calendar-plan-google-only {
+  background: color-mix(in srgb, #38bdf8 12%, transparent);
+  border-color: color-mix(in srgb, #38bdf8 32%, transparent);
+}
+
+.calendar-day-button.calendar-plan-saved {
+  background: color-mix(in srgb, var(--primary) 10%, transparent);
+  border-color: color-mix(in srgb, var(--primary) 24%, transparent);
+}
+
+.calendar-status-dot,
+.calendar-legend-dot {
+  display: inline-block;
+  width: 0.44rem;
+  height: 0.44rem;
+  border-radius: 999px;
+  background: var(--primary);
+  box-shadow: 0 0 0 2px rgb(255 255 255 / 0.72);
+}
+
+.calendar-status-dot-on-primary {
+  background: #fff;
+  box-shadow: 0 0 0 2px rgb(255 255 255 / 0.28);
+}
+
+.calendar-legend-dot {
+  width: 0.5rem;
+  height: 0.5rem;
+  box-shadow: none;
+  flex: 0 0 auto;
+}
+
+.calendar-status-dot.calendar-plan-optimized,
+.calendar-legend-dot.calendar-plan-optimized {
+  background: #22c55e;
+}
+
+.calendar-status-dot.calendar-plan-needs-locations,
+.calendar-legend-dot.calendar-plan-needs-locations {
+  background: #f59e0b;
+}
+
+.calendar-status-dot.calendar-plan-not-reoptimized,
+.calendar-legend-dot.calendar-plan-not-reoptimized {
+  background: #64748b;
+}
+
+.calendar-status-dot.calendar-plan-route-warning,
+.calendar-legend-dot.calendar-plan-route-warning {
+  background: #ef4444;
+}
+
+.calendar-status-dot.calendar-plan-partial,
+.calendar-legend-dot.calendar-plan-partial {
+  background: #a855f7;
+}
+
+.calendar-status-dot.calendar-plan-google-only,
+.calendar-legend-dot.calendar-plan-google-only {
+  background: #0ea5e9;
+}
+
+.calendar-status-dot.calendar-plan-saved,
+.calendar-legend-dot.calendar-plan-saved {
+  background: var(--primary);
 }
 
 .planning-workspace {
@@ -2504,6 +2631,7 @@ html {
 
 .planning-settings-row {
   max-width: 100%;
+  min-width: 0;
 }
 
 .planning-live-actions {
@@ -2568,6 +2696,13 @@ html {
   .entry-metrics-grid {
     gap: .75rem;
     margin-top: 1rem;
+  }
+
+  .calendar-legend-list {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    padding-bottom: .1rem;
+    scrollbar-width: thin;
   }
 
   .jplan-calendar-card {
@@ -2635,6 +2770,11 @@ html {
 
   .planning-settings-row select {
     max-width: 8rem;
+  }
+
+  .planning-settings-row input[type="time"] {
+    width: 5.75rem;
+    min-width: 5.75rem;
   }
 
   .planning-settings-row input[type="number"] {
