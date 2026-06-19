@@ -6,6 +6,10 @@ import { X, AlertCircle, MapPin } from "lucide-react";
 import type { ActivityBlock } from "../App";
 import { LocationPickerDialog, candidateToMapPoint } from "./LocationPickerDialog";
 import type { GeocodeCandidate, SavedLocation } from "../services/planService";
+import {
+  formatDurationMinutes,
+  getCanonicalDurationMinutes,
+} from "../utils/durationUtils";
 
 type EventEditModalProps = {
   event: ActivityBlock;
@@ -31,6 +35,7 @@ export function EventEditModal({
   const [formData, setFormData] = useState(() => normalizeEventForEdit(event));
   const [isConflict, setIsConflict] = useState(false);
   const [isLocationPickerOpen, setIsLocationPickerOpen] = useState(false);
+  const isBuffer = isBufferBlock(event);
 
   useEffect(() => {
     setFormData(normalizeEventForEdit(event));
@@ -62,16 +67,21 @@ export function EventEditModal({
 
   const handleSave = () => {
     const confirmedLocationName = formData.resolved_location?.display_name || formData.resolved_location?.address;
-    const mode = String(formData.timing_mode || "").toLowerCase() === "fixed" ? "fixed" : "preferred";
+    const mode = isBuffer || String(formData.timing_mode || "").toLowerCase() === "fixed" ? "fixed" : "preferred";
     const hasStart = Boolean(formData.startTime);
     const startMinutes = hasStart ? timeToMinutes(formData.startTime) : null;
     const endMinutes = hasStart && formData.endTime ? normalizeEndMinutes(startMinutes ?? 0, timeToMinutes(formData.endTime)) : null;
+    const durationMinutes = startMinutes != null && endMinutes != null
+      ? Math.max(1, endMinutes - startMinutes)
+      : getCanonicalDurationMinutes(formData);
     onSave({
       ...formData,
-      title: formData.title.trim(),
-      location: confirmedLocationName || formData.location?.trim() || undefined,
-      location_label: confirmedLocationName || formData.location_label || formData.location,
-      location_status: formData.resolved_location ? "resolved" : formData.location_status,
+      title: isBuffer ? "Buffer" : formData.title.trim(),
+      duration: formatDurationMinutes(durationMinutes),
+      duration_minutes: durationMinutes,
+      location: isBuffer ? undefined : (confirmedLocationName || formData.location?.trim() || undefined),
+      location_label: isBuffer ? undefined : (confirmedLocationName || formData.location_label || formData.location),
+      location_status: isBuffer ? undefined : (formData.resolved_location ? "resolved" : formData.location_status),
       start: formData.startTime,
       end: formData.endTime,
       timing_mode: mode,
@@ -98,7 +108,12 @@ export function EventEditModal({
     let diff = endMins - startMins;
     if (diff < 0) diff += 1440;
 
-    setFormData({ ...formData, endTime: newEndTime12h, duration: formatDurationFromMinutes(diff) });
+    setFormData({
+      ...formData,
+      endTime: newEndTime12h,
+      duration: formatDurationMinutes(diff),
+      duration_minutes: diff,
+    });
   };
 
   const handleStartTimeChange = (newStartTime12h: string) => {
@@ -115,29 +130,34 @@ export function EventEditModal({
     let diff = endMins - startMins;
     if (diff < 0) diff += 1440;
 
-    setFormData({ ...formData, startTime: newStartTime12h, duration: formatDurationFromMinutes(diff) });
+    setFormData({
+      ...formData,
+      startTime: newStartTime12h,
+      duration: formatDurationMinutes(diff),
+      duration_minutes: diff,
+    });
   };
 
   const handleDurationPartsChange = (hoursValue: string, minutesValue: string) => {
     const hours = clampDurationPart(hoursValue, 23);
     const minutes = clampDurationPart(minutesValue, 59);
     const totalMins = Math.max(1, Number(hours) * 60 + Number(minutes));
-    const durStr = formatDurationFromMinutes(totalMins);
+    const durStr = formatDurationMinutes(totalMins);
     if (!formData.startTime) {
-      setFormData({ ...formData, duration: durStr });
+      setFormData({ ...formData, duration: durStr, duration_minutes: totalMins });
       return;
     }
     const startMins = timeToMinutes(formData.startTime);
     const newEndMins = (startMins + totalMins) % 1440;
 
     const formattedEnd = minutesTo12Hour(newEndMins);
-    setFormData({ ...formData, duration: durStr, endTime: formattedEnd });
+    setFormData({ ...formData, duration: durStr, duration_minutes: totalMins, endTime: formattedEnd });
   };
 
   const existingLocationCandidate = resolvedLocationToCandidate(formData);
   const existingLocationPoint = candidateToMapPoint(existingLocationCandidate);
-  const isFixedTime = String(formData.timing_mode || "").toLowerCase() === "fixed";
-  const durationParts = parseDurationToParts(formData.duration || deriveDuration(formData.startTime || "", formData.endTime || ""));
+  const isFixedTime = isBuffer || String(formData.timing_mode || "").toLowerCase() === "fixed";
+  const durationParts = durationMinutesToParts(getCanonicalDurationMinutes(formData));
 
   const handleConfirmPickedLocation = async (candidate: GeocodeCandidate) => {
     const displayName = candidate.display_name || candidate.address || formData.location || formData.title;
@@ -173,9 +193,9 @@ export function EventEditModal({
         {/* Header */}
         <div className="flex items-center justify-between p-4 border-b border-border sm:p-5">
           <div>
-            <h3>Manual Edit</h3>
+            <h3>{isBuffer ? "Edit Buffer" : "Manual Edit"}</h3>
             <p className="text-sm text-muted-foreground mt-1">
-              Edit activity details directly
+              {isBuffer ? "Adjust or remove this buffer block" : "Edit activity details directly"}
             </p>
           </div>
           <Button
@@ -191,7 +211,7 @@ export function EventEditModal({
         {/* Content */}
         <div className="p-4 space-y-4 sm:p-5">
           {/* Activity Title */}
-          <div>
+          {!isBuffer && <div>
             <Label htmlFor="title">Activity Title</Label>
             <Input
               id="title"
@@ -200,10 +220,10 @@ export function EventEditModal({
               placeholder="Activity name"
               className="mt-1.5 rounded-xl"
             />
-          </div>
+          </div>}
 
           {/* Time Fields */}
-          <div className="space-y-1.5">
+          {!isBuffer && <div className="space-y-1.5">
             <Label>Time behavior</Label>
             <div className="grid grid-cols-2 gap-2 rounded-xl border border-border bg-secondary/20 p-1">
               <Button
@@ -238,7 +258,7 @@ export function EventEditModal({
             <p className="text-xs text-muted-foreground">
               Flexible events can move. A start time becomes a preference, not a lock.
             </p>
-          </div>
+          </div>}
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
             <div>
               <Label htmlFor="start-time">{isFixedTime ? "Start Time" : "Preferred Start (optional)"}</Label>
@@ -296,7 +316,7 @@ export function EventEditModal({
           </div>
 
           {/* Location */}
-          <div>
+          {!isBuffer && <div>
             <Label>Location (optional)</Label>
             <div className="mt-1.5 rounded-xl border border-border bg-secondary/20 p-3">
               {formData.resolved_location ? (
@@ -349,7 +369,7 @@ export function EventEditModal({
                 </Button>
               )}
             </div>
-          </div>
+          </div>}
 
           {/* Conflict Warning */}
           {isConflict && (
@@ -389,7 +409,7 @@ export function EventEditModal({
           <Button
             onClick={handleSave}
             className={`min-w-[136px] rounded-xl px-4 whitespace-nowrap ${isConflict ? "bg-destructive hover:bg-destructive/90" : ""}`}
-            disabled={!formData.title.trim() || (isFixedTime && (!formData.startTime || !formData.endTime))}
+            disabled={(!isBuffer && !formData.title.trim()) || (isFixedTime && (!formData.startTime || !formData.endTime))}
           >
             {isConflict ? "Save Anyway" : "Save Changes"}
           </Button>
@@ -434,7 +454,16 @@ function normalizeEventForEdit(event: ActivityBlock): ActivityBlock {
     end: endTime,
     timing_mode: fixed ? "fixed" : (event.timing_mode || (startTime ? "preferred" : "unspecified")),
     original_timing_mode: fixed ? "fixed" : (event.original_timing_mode || event.timing_mode || (startTime ? "preferred" : "unspecified")),
-    duration: event.duration || deriveDuration(startTime, endTime),
+    duration: formatDurationMinutes(getCanonicalDurationMinutes({
+      ...event,
+      startTime,
+      endTime,
+    })),
+    duration_minutes: getCanonicalDurationMinutes({
+      ...event,
+      startTime,
+      endTime,
+    }),
   };
 }
 
@@ -452,47 +481,9 @@ function resolvedLocationToCandidate(event: ActivityBlock): GeocodeCandidate | n
   };
 }
 
-function deriveDuration(startTime: string, endTime: string): string {
-  if (!startTime || !endTime) return "";
-
-  const startMins = timeToMinutes(startTime);
-  const endMins = timeToMinutes(endTime);
-  let diff = endMins - startMins;
-  if (diff < 0) diff += 1440;
-
-  const hours = Math.floor(diff / 60);
-  const minutes = diff % 60;
-
-  if (hours === 0 && minutes === 0) return "0m";
-  if (hours === 0) return `${minutes}m`;
-  if (minutes === 0) return `${hours}h`;
-  return `${hours}h ${minutes}m`;
-}
-
-function parseDurationToParts(duration: string): { hours: number; minutes: number } {
-  const text = String(duration || "").trim().toLowerCase();
-  if (!text) return { hours: 1, minutes: 0 };
-  const hourMatch = text.match(/(\d+(?:\.\d+)?)\s*h/);
-  const minuteMatch = text.match(/(\d+(?:\.\d+)?)\s*m/);
-  if (hourMatch || minuteMatch) {
-    const total = Math.max(1, Math.round(Number(hourMatch?.[1] || 0) * 60 + Number(minuteMatch?.[1] || 0)));
-    return { hours: Math.floor(total / 60), minutes: total % 60 };
-  }
-  const numeric = Number(text);
-  if (Number.isFinite(numeric) && numeric > 0) {
-    const total = Math.max(1, Math.round(numeric * 60));
-    return { hours: Math.floor(total / 60), minutes: total % 60 };
-  }
-  return { hours: 1, minutes: 0 };
-}
-
-function formatDurationFromMinutes(totalMinutes: number): string {
-  const total = Math.max(1, Math.floor(Number(totalMinutes) || 60));
-  const hours = Math.floor(total / 60);
-  const minutes = total % 60;
-  if (hours && minutes) return `${hours}h ${minutes}m`;
-  if (hours) return `${hours}h`;
-  return `${minutes}m`;
+function durationMinutesToParts(totalMinutes: number): { hours: number; minutes: number } {
+  const total = Math.max(1, Math.round(totalMinutes || 60));
+  return { hours: Math.floor(total / 60), minutes: total % 60 };
 }
 
 function clampDurationPart(value: string, max: number): string {
@@ -536,6 +527,12 @@ function timeToMinutes(timeStr: string): number {
 
 function normalizeEndMinutes(startMinutes: number, endMinutes: number): number {
   return endMinutes < startMinutes ? endMinutes + 1440 : endMinutes;
+}
+
+function isBufferBlock(event: ActivityBlock): boolean {
+  const blockType = String(event.block_type || event.type || "").toLowerCase();
+  const title = String(event.title || "").trim().toLowerCase();
+  return blockType === "buffer" || blockType === "prep_buffer" || title === "buffer" || title.includes("prep / buffer");
 }
 
 function minutesTo12Hour(totalMinutes: number): string {

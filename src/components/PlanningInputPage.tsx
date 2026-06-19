@@ -66,6 +66,7 @@ import {
   hasGoogleCalendarLayer,
   type ScheduleViewMode,
 } from "../utils/scheduleDisplayUtils";
+import { formatDurationMinutes } from "../utils/durationUtils";
 
 const CHAT_INPUT_MAX_LENGTH = 500;
 
@@ -717,14 +718,6 @@ export function PlanningInputPage({
     return Number.isFinite(total) ? total : 60;
   };
 
-  const formatDurationDisplay = (totalMinutes: number): string => {
-    const hours = Math.floor(totalMinutes / 60);
-    const minutes = totalMinutes % 60;
-    if (hours && minutes) return `${hours}h ${minutes}m`;
-    if (hours) return `${hours}h`;
-    return `${minutes}m`;
-  };
-
   const compareActivityTimeForManual = (a: ActivityBlock, b: ActivityBlock) => {
     const aTime = a.startTime || a.start;
     const bTime = b.startTime || b.start;
@@ -742,7 +735,7 @@ export function PlanningInputPage({
     const hasManualStart = Boolean(activityTime.trim());
     const formattedStartTime = hasManualStart ? formatTo12Hour(activityTime) : "";
     const durationMinutes = manualDurationMinutes();
-    const displayDuration = formatDurationDisplay(durationMinutes);
+    const displayDuration = formatDurationMinutes(durationMinutes);
 
     const newStartTimeMins = hasManualStart ? timeToMinutes(formattedStartTime) : null;
     const endTimeStr = hasManualStart ? minutesTo12Hour((timeToMinutes(formattedStartTime) + durationMinutes) % (24 * 60)) : "";
@@ -806,13 +799,21 @@ export function PlanningInputPage({
       resolved_location: manualActivityType === "activity" ? (manualResolvedLocation || undefined) : undefined,
     };
 
-    const updatedActivities = [...currentActivities, newActivity].sort(compareActivityTimeForManual);
+    const updatedActivities = manualActivityType === "buffer"
+      ? currentActivities
+      : [...currentActivities, newActivity].sort(compareActivityTimeForManual);
+    const currentBlocks = baseDraft?.schedule_blocks?.length
+      ? baseDraft.schedule_blocks
+      : (baseDraft?.committed_schedule_blocks || currentActivities);
+    const updatedScheduleBlocks = manualActivityType === "buffer"
+      ? [...currentBlocks, newActivity].sort(compareActivityTimeForManual)
+      : syncActivityBlocks(currentBlocks, updatedActivities);
 
     setPreviewSchedule(markDirtySchedule({
       ...(baseDraft || {}),
       date: isoDateStr,
       activities: updatedActivities,
-      schedule_blocks: syncActivityBlocks(baseDraft?.schedule_blocks, updatedActivities),
+      schedule_blocks: updatedScheduleBlocks,
       travel_validation_status: baseDraft?.travel_validation_status,
     } as DailySchedule, "event_added", newActivity.title));
     setSaveWithoutRerunNotice(false);
@@ -836,6 +837,32 @@ export function PlanningInputPage({
     if (!previewSchedule) return;
     const baseDraft = clearRouteRepairPreview(previewSchedule);
     const originalEvent = editingEvent || baseDraft.activities.find(a => a.id === updatedEvent.id) || updatedEvent;
+    if (isEditableBufferBlock(originalEvent)) {
+      const sourceBlocks = baseDraft.schedule_blocks?.length
+        ? baseDraft.schedule_blocks
+        : (baseDraft.committed_schedule_blocks || []);
+      const updatedScheduleBlocks = sourceBlocks
+        .map((block) => sameTimelineBlock(block, originalEvent) ? {
+          ...block,
+          ...updatedEvent,
+          type: "buffer" as const,
+          block_type: "buffer" as const,
+          title: "Buffer",
+          start: updatedEvent.startTime || updatedEvent.start,
+          end: updatedEvent.endTime || updatedEvent.end,
+          duration: formatDurationMinutes(updatedEvent.duration_minutes || 1),
+        } : block)
+        .sort(compareActivityTimeForManual);
+
+      setPreviewSchedule(markDirtySchedule({
+        ...baseDraft,
+        schedule_blocks: updatedScheduleBlocks,
+      }, "manual_edit", "Buffer"));
+      setSaveWithoutRerunNotice(false);
+      setEditingEvent(null);
+      setIsConflict(false);
+      return;
+    }
     const timeChanged = Boolean(
       originalEvent.startTime !== updatedEvent.startTime ||
       originalEvent.endTime !== updatedEvent.endTime
@@ -937,6 +964,19 @@ export function PlanningInputPage({
     if (isScheduleBusy) return;
     if (!editingEvent || !previewSchedule) return;
     const baseDraft = clearRouteRepairPreview(previewSchedule);
+    if (isEditableBufferBlock(editingEvent)) {
+      const sourceBlocks = baseDraft.schedule_blocks?.length
+        ? baseDraft.schedule_blocks
+        : (baseDraft.committed_schedule_blocks || []);
+      const updatedScheduleBlocks = sourceBlocks.filter((block) => !sameTimelineBlock(block, editingEvent));
+      setPreviewSchedule(markDirtySchedule({
+        ...baseDraft,
+        schedule_blocks: updatedScheduleBlocks,
+      }, "event_deleted", "Buffer"));
+      setSaveWithoutRerunNotice(false);
+      setEditingEvent(null);
+      return;
+    }
     const deleteKeys = activityDeleteKeys(editingEvent);
     const updatedActivities = baseDraft.activities.filter(activity => !blockMatchesDeletedActivity(activity, deleteKeys));
     const updatedScheduleBlocks = removeDeletedActivityBlock(baseDraft.schedule_blocks, deleteKeys);
@@ -2181,6 +2221,7 @@ export function PlanningInputPage({
                   interactive={calendarView === "jplan" && !hasPendingRoutePreview && !isScheduleBusy}
                   onActivityClick={handleEventClick}
                   showEditIcon={calendarView === "jplan" && !hasPendingRoutePreview && !isScheduleBusy}
+                  editableBuffers={calendarView === "jplan" && !hasPendingRoutePreview && !isScheduleBusy}
                 />
               ) : (
                 <div className="h-full flex flex-col items-center justify-center text-muted-foreground opacity-30 italic">
@@ -3166,6 +3207,7 @@ function removeDeletedActivityBlock(
 function activityDeleteKeys(block: Partial<ActivityBlock>): Set<string> {
   const keys = [
     block.id,
+    block.block_id,
     block.stable_activity_id,
     block.activity_id,
     block.related_activity_id,
@@ -3173,6 +3215,25 @@ function activityDeleteKeys(block: Partial<ActivityBlock>): Set<string> {
   const title = String(block.title || "").trim().toLowerCase();
   if (title) keys.push(`title:${title}`);
   return new Set(keys);
+}
+
+function isEditableBufferBlock(block: Partial<ActivityBlock>): boolean {
+  const blockType = String(block.block_type || block.type || "").toLowerCase();
+  const title = String(block.title || "").trim().toLowerCase();
+  return blockType === "buffer"
+    || blockType === "prep_buffer"
+    || title === "buffer"
+    || title.includes("prep / buffer");
+}
+
+function sameTimelineBlock(left: Partial<ActivityBlock>, right: Partial<ActivityBlock>): boolean {
+  const leftId = String(left.block_id || left.id || "").trim();
+  const rightId = String(right.block_id || right.id || "").trim();
+  if (leftId && rightId) return leftId === rightId;
+
+  return String(left.title || "").trim().toLowerCase() === String(right.title || "").trim().toLowerCase()
+    && String(left.startTime || left.start || "") === String(right.startTime || right.start || "")
+    && String(left.endTime || left.end || "") === String(right.endTime || right.end || "");
 }
 
 function blockMatchesDeletedActivity(block: Partial<ActivityBlock>, deleteKeys: Set<string>): boolean {

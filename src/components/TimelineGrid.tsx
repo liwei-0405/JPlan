@@ -8,6 +8,7 @@ import {
   getDurationMinutes,
   type CollisionGroup,
 } from "../utils/collisionUtils";
+import { formatActivityDuration } from "../utils/durationUtils";
 
 const PIXELS_PER_MINUTE = 1.8; 
 const MIN_BLOCK_HEIGHT = 65;   
@@ -32,6 +33,8 @@ type TimelineGridProps = {
   showEditIcon?: boolean;
   /** Compact mode for entry page preview */
   compact?: boolean;
+  /** Allow editable buffer support blocks to use the activity click handler. */
+  editableBuffers?: boolean;
 };
 
 export function TimelineGrid({
@@ -40,6 +43,7 @@ export function TimelineGrid({
   onActivityClick,
   showEditIcon = false,
   compact = false,
+  editableBuffers = false,
 }: TimelineGridProps) {
   const visibleActivities = useMemo(
     () => dedupeSupportBlocks(activities).filter((activity) => getTimelineBlockKind(activity) !== "free_time"),
@@ -118,6 +122,7 @@ export function TimelineGrid({
             onActivityClick={onActivityClick}
             showEditIcon={showEditIcon}
             compact={compact}
+            editableBuffers={editableBuffers}
           />
         )
       ))}
@@ -132,6 +137,7 @@ function CollisionGroupRow({
   onActivityClick,
   showEditIcon,
   compact,
+  editableBuffers,
 }: {
   group: CollisionGroup;
   collidingIds: Set<string>;
@@ -139,6 +145,7 @@ function CollisionGroupRow({
   onActivityClick?: (activity: ActivityBlock) => void;
   showEditIcon: boolean;
   compact: boolean;
+  editableBuffers: boolean;
 }) {
   const isCollision = group.activities.length > 1 || group.activities.some((activity) => activity.isConflict);
 
@@ -150,7 +157,14 @@ function CollisionGroupRow({
       return null;
     }
     if (blockKind !== "activity") {
-      return <SupportTimelineBlock activity={act} kind={blockKind} />;
+      return (
+        <SupportTimelineBlock
+          activity={act}
+          kind={blockKind}
+          interactive={editableBuffers && blockKind === "buffer" && interactive}
+          onClick={onActivityClick}
+        />
+      );
     }
     return (
       <ActivityCard
@@ -213,7 +227,15 @@ function CollisionGroupRow({
               return null;
             }
             if (blockKind !== "activity") {
-              return <SupportTimelineBlock key={act.id || act.title} activity={act} kind={blockKind} />;
+              return (
+                <SupportTimelineBlock
+                  key={act.id || act.title}
+                  activity={act}
+                  kind={blockKind}
+                  interactive={editableBuffers && blockKind === "buffer" && interactive}
+                  onClick={onActivityClick}
+                />
+              );
             }
 
             return (
@@ -261,7 +283,12 @@ function CollisionGroupRow({
               return (
                 <div key={act.id || act.title} style={{ position: "relative", height: `${containerHeight}px` }}>
                   <div style={{ position: "absolute", top: `${topOffset}px`, width: "100%" }}>
-                    <SupportTimelineBlock activity={act} kind={blockKind} />
+                    <SupportTimelineBlock
+                      activity={act}
+                      kind={blockKind}
+                      interactive={editableBuffers && blockKind === "buffer" && interactive}
+                      onClick={onActivityClick}
+                    />
                   </div>
                 </div>
               );
@@ -453,7 +480,7 @@ function ActivityCard({
               ⚡ Clash
             </span>
           )}
-          {activity.duration && (
+          {(activity.duration || activity.duration_minutes) && (
             <span
               style={{
                 background: isClashing ? "#fee2e2" : "#f1f5f9",
@@ -465,7 +492,7 @@ function ActivityCard({
                 whiteSpace: "nowrap",
               }}
             >
-              {activity.duration}
+              {formatActivityDuration(activity)}
             </span>
           )}
           {showEditIcon && (
@@ -756,7 +783,17 @@ function shouldPreferSupportBlock(candidate: ActivityBlock, existing: ActivityBl
   return score(candidate) > score(existing);
 }
 
-function SupportTimelineBlock({ activity, kind }: { activity: ActivityBlock; kind: Exclude<TimelineBlockKind, "activity" | "free_time"> }) {
+function SupportTimelineBlock({
+  activity,
+  kind,
+  interactive = false,
+  onClick,
+}: {
+  activity: ActivityBlock;
+  kind: Exclude<TimelineBlockKind, "activity" | "free_time">;
+  interactive?: boolean;
+  onClick?: (activity: ActivityBlock) => void;
+}) {
   const st = activity.startTime || activity.start;
   const et = activity.endTime || activity.end;
   const duration = activity.duration_minutes || getDurationMinutes(activity);
@@ -802,6 +839,15 @@ function SupportTimelineBlock({ activity, kind }: { activity: ActivityBlock; kin
 
   return (
     <div
+      role={interactive ? "button" : undefined}
+      tabIndex={interactive ? 0 : undefined}
+      onClick={interactive && onClick ? () => onClick(activity) : undefined}
+      onKeyDown={interactive && onClick ? (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          onClick(activity);
+        }
+      } : undefined}
       style={{
         borderRadius: "10px",
         border: "1px solid",
@@ -812,6 +858,7 @@ function SupportTimelineBlock({ activity, kind }: { activity: ActivityBlock; kin
         justifyContent: "space-between",
         gap: "12px",
         boxShadow: "0 1px 3px rgba(0,0,0,0.05)",
+        cursor: interactive ? "pointer" : "default",
       }}
     >
       <div style={{ display: "flex", alignItems: "center", gap: "7px", minWidth: 0, flex: 1 }}>

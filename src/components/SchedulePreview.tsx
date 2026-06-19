@@ -1,6 +1,7 @@
 import { Button } from "./ui/button";
 import { Clock, MapPin, CheckCircle, Bot } from "lucide-react";
 import type { DailySchedule } from "../App";
+import { formatActivityDuration } from "../utils/durationUtils";
 
 type SchedulePreviewProps = {
   schedule: DailySchedule;
@@ -43,9 +44,9 @@ export function SchedulePreview({ schedule, onAccept, onReject }: SchedulePrevie
                   <div className="bg-secondary/30 border border-secondary rounded-xl p-4">
                     <div className="flex items-start justify-between mb-2">
                       <h4 className="text-sm">{activity.title}</h4>
-                      {activity.duration && (
+                      {(activity.duration || activity.duration_minutes) && (
                         <span className="text-xs px-2 py-1 rounded-full bg-background">
-                          {activity.duration}
+                          {formatActivityDuration(activity)}
                         </span>
                       )}
                     </div>
