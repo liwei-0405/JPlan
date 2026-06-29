@@ -54,7 +54,7 @@ class TravelValidationMixin:
             self._travel_perf_timers = timers
         timers[key] = float(timers.get(key) or 0.0) + max(0.0, float(seconds or 0.0))
 
-    def _log_travel_perf_summary(self) -> None:
+    def _travel_perf_summary(self) -> Dict[str, Any]:
         timers = dict(getattr(self, "_travel_perf_timers", {}) or {})
         stats = self.travel_service.stats_snapshot() if hasattr(self.travel_service, "stats_snapshot") else {}
         if stats.get("geocode_seconds") is not None:
@@ -67,6 +67,30 @@ class TravelValidationMixin:
                 float(timers.get("route_fetch_seconds") or 0.0),
                 float(stats.get("route_fetch_seconds") or 0.0),
             )
+        return {
+            "timers": {
+                key: round(float(timers.get(key) or 0.0), 2)
+                for key in (
+                    "geocoding_seconds",
+                    "route_matrix_seconds",
+                    "route_fetch_seconds",
+                    "route_aware_refit_seconds",
+                    "cluster_reorder_seconds",
+                    "final_validation_seconds",
+                )
+            },
+            "route_stats": {
+                "api_calls": int(stats.get("route_api_calls") or 0),
+                "cache_hits": int(stats.get("route_cache_hits") or 0),
+                "cache_misses": int(stats.get("route_cache_misses") or 0),
+                "persistent_cache_hits": int(stats.get("route_persistent_cache_hits") or 0),
+            },
+        }
+
+    def _log_travel_perf_summary(self) -> Dict[str, Any]:
+        summary = self._travel_perf_summary()
+        timers = summary.get("timers") or {}
+        stats = summary.get("route_stats") or {}
         for key in (
             "geocoding_seconds",
             "route_matrix_seconds",
@@ -76,12 +100,21 @@ class TravelValidationMixin:
             "final_validation_seconds",
         ):
             jlog("TIMER", f"{key}={float(timers.get(key) or 0.0):.2f}", None)
-        jlog("PERF", f"count={int(stats.get('route_api_calls') or 0)}", "ROUTE_API_CALLS")
+        jlog("PERF", f"count={int(stats.get('api_calls') or 0)}", "ROUTE_API_CALLS")
         jlog(
             "PERF",
-            f"hits={int(stats.get('route_cache_hits') or 0)} misses={int(stats.get('route_cache_misses') or 0)}",
+            f"hits={int(stats.get('cache_hits') or 0)} misses={int(stats.get('cache_misses') or 0)}",
             "ROUTE_CACHE",
         )
+        return summary
+
+    def _attach_travel_perf_summary(self, envelope: Dict[str, Any], validation_started: float) -> None:
+        summary = self._log_travel_perf_summary()
+        summary["total_seconds"] = round(max(0.0, time.perf_counter() - validation_started), 2)
+        if not isinstance(envelope.get("performance_summary"), dict):
+            envelope["performance_summary"] = {}
+        envelope["performance_summary"]["travel"] = summary
+        jlog("TIMER", f"accurate_travel_validation_seconds={summary['total_seconds']:.2f}", None)
 
     def _apply_accurate_travel_if_requested(
         self,
@@ -127,15 +160,13 @@ class TravelValidationMixin:
                     )
                     self._clear_route_preview_metadata(updated)
                     self._mark_transition_estimate_source(updated, "heuristic_pending_locations")
-                    self._log_travel_perf_summary()
-                    jlog("TIMER", f"accurate_travel_validation_seconds={time.perf_counter() - validation_started:.2f}", None)
+                    self._attach_travel_perf_summary(updated, validation_started)
                     return updated
             updated["travel_validation_status"] = "not_requested"
             updated["location_resolution_requests"] = []
             self._clear_route_preview_metadata(updated)
             self._mark_transition_estimate_source(updated, "heuristic")
-            self._log_travel_perf_summary()
-            jlog("TIMER", f"accurate_travel_validation_seconds={time.perf_counter() - validation_started:.2f}", None)
+            self._attach_travel_perf_summary(updated, validation_started)
             return updated
 
         self._sync_activity_locations_to_schedule_blocks(updated)
@@ -161,8 +192,7 @@ class TravelValidationMixin:
                 ["Accurate travel time is pending until the requested locations are confirmed."],
             )
             self._clear_route_preview_metadata(updated)
-            self._log_travel_perf_summary()
-            jlog("TIMER", f"accurate_travel_validation_seconds={time.perf_counter() - validation_started:.2f}", None)
+            self._attach_travel_perf_summary(updated, validation_started)
             return updated
 
         if updated.get("schedule_status") == "location_pending":
@@ -192,14 +222,23 @@ class TravelValidationMixin:
                 repaired_conflicts = list((repaired_validation or {}).get("route_conflicts") or [])
                 residual_fixed_route_conflicts = self._fixed_route_conflicts(repaired_conflicts)
                 blocking_repaired_conflicts = self._blocking_route_conflicts(repaired_conflicts)
+                repair_status = repair_meta.get("travel_validation_status")
+                repaired_chronology_is_renderable = self._has_renderable_repaired_chronology(repaired_validation)
+                allow_clash_repair_candidate = bool(
+                    self._resolve_allow_clash(updated.get("preferences") or {}, updated)
+                    and repaired_envelope
+                    and repaired_validation
+                    and repaired_chronology_is_renderable
+                    and repair_status == "partial_feasible_with_fixed_route_conflicts"
+                )
                 has_usable_repair_candidate = bool(
                     repaired_envelope
                     and repaired_validation
-                    and self._has_renderable_repaired_chronology(repaired_validation)
+                    and repaired_chronology_is_renderable
                     and not blocking_repaired_conflicts
                     and (not pending_suggestions or residual_fixed_route_conflicts)
-                    and (not residual_fixed_route_conflicts or repair_meta.get("travel_validation_status") == "partial_feasible_with_fixed_route_conflicts")
-                )
+                    and (not residual_fixed_route_conflicts or repair_status == "partial_feasible_with_fixed_route_conflicts")
+                ) or allow_clash_repair_candidate
                 validation["pending_repair_suggestions"] = pending_suggestions
                 validation["unfit_activities"] = repair_meta.get("unfit_activities", [])
                 validation["optional_skipped"] = repair_meta.get("optional_skipped", [])
@@ -237,7 +276,7 @@ class TravelValidationMixin:
                     if repaired_validation.get("start_route_summary"):
                         validation["start_route_summary"] = repaired_validation.get("start_route_summary")
                     validation["route_repair_actions"] = repair_meta.get("route_repair_actions", [])
-                    if residual_fixed_route_conflicts:
+                    if residual_fixed_route_conflicts or allow_clash_repair_candidate:
                         validation["travel_validation_status"] = "partial_feasible_with_fixed_route_conflicts"
                     else:
                         validation["travel_validation_status"] = repair_meta.get(
@@ -422,8 +461,7 @@ class TravelValidationMixin:
         self._debug(
             f"[TRAVEL][COMPLETE] Updated transition blocks: {updated.get('updated_transition_count', 0)}"
         )
-        self._log_travel_perf_summary()
-        jlog("TIMER", f"accurate_travel_validation_seconds={time.perf_counter() - validation_started:.2f}", None)
+        self._attach_travel_perf_summary(updated, validation_started)
         return updated
 
     def _set_return_home_deadline_status(
@@ -1134,10 +1172,19 @@ class TravelValidationMixin:
             "MODULE_D",
         )
         planned_activities = list(planned.get("activities", []))
-        conflict_unfit = [
+        allow_clash = self._resolve_allow_clash(preferences, envelope)
+        if allow_clash:
+            planned_activities = self._rescue_auto_movable_route_repair_conflicts(
+                planned_activities,
+                planned,
+                preferences,
+            )
+        conflict_unfit = [] if allow_clash else [
             item for item in planned_activities
             if item.get("is_conflict") and self._activity_can_auto_move_for_route_repair(item)
         ]
+        if allow_clash and any(item.get("is_conflict") for item in planned_activities):
+            jlog("TRAVEL_REPAIR", "allow_clash=true preserving conflict activities in schedule", "CLASH")
         if conflict_unfit:
             removed_ids = {
                 str(item.get("stable_activity_id") or item.get("id") or "")
@@ -1312,6 +1359,90 @@ class TravelValidationMixin:
         self._add_travel_perf_time("route_aware_refit_seconds", elapsed)
         jlog("TIMER", f"route_aware_refit_seconds={elapsed:.2f}", None)
         return result
+
+    def _rescue_auto_movable_route_repair_conflicts(
+        self,
+        planned_activities: List[Dict[str, Any]],
+        planned: Dict[str, Any],
+        preferences: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """Try non-overlapping slots before preserving allow-clash flex repairs."""
+        conflict_items = [
+            deepcopy(item)
+            for item in planned_activities or []
+            if item.get("is_conflict") and self._activity_can_auto_move_for_route_repair(item)
+        ]
+        if not conflict_items:
+            return planned_activities
+
+        conflict_keys = {
+            self._route_repair_activity_key(item)
+            for item in conflict_items
+            if self._route_repair_activity_key(item)
+        }
+        timeline = [
+            deepcopy(item)
+            for item in planned_activities or []
+            if self._route_repair_activity_key(item) not in conflict_keys
+        ]
+        day_start = parse_clock(
+            planned.get("day_start")
+            or preferences.get("day_start")
+            or preferences.get("day_start_time")
+            or ""
+        ) or DEFAULT_DAY_START
+        day_end = parse_clock(
+            planned.get("day_end")
+            or preferences.get("day_end")
+            or preferences.get("day_end_time")
+            or ""
+        ) or DEFAULT_DAY_END
+        min_travel = int(preferences.get("min_travel_buffer_minutes") or 0)
+
+        for item in sorted(conflict_items, key=self._calculate_activity_base_score, reverse=True):
+            candidate = deepcopy(item)
+            for field in (
+                "is_conflict",
+                "is_conflicting",
+                "conflict_with",
+                "conflict_ids",
+                "conflict_reason",
+                "conflict_priority",
+                "conflict_severity",
+                "reason_codes",
+            ):
+                candidate.pop(field, None)
+            candidate["scheduled_start"] = None
+            candidate["scheduled_end"] = None
+            candidate.pop("startTime", None)
+            candidate.pop("endTime", None)
+            candidate.pop("start", None)
+            candidate.pop("end", None)
+
+            inserted, reason = self._insert_best_position(
+                candidate,
+                timeline,
+                day_start,
+                day_end,
+                min_travel,
+            )
+            if inserted:
+                timeline = inserted
+                jlog(
+                    "TRAVEL_REPAIR",
+                    f"title={item.get('title')} reason=auto_movable_conflict_rescued",
+                    "NONCLASH_RESCUE",
+                )
+                continue
+            timeline.append(item)
+            timeline.sort(key=lambda entry: self._activity_time_bounds(entry)[0] or 0)
+            jlog(
+                "TRAVEL_REPAIR",
+                f"title={item.get('title')} reason={reason or 'no_nonclash_slot'}",
+                "NONCLASH_RESCUE][MISS",
+            )
+
+        return sorted(timeline, key=lambda entry: self._activity_time_bounds(entry)[0] or 0)
 
     def _preserve_existing_unfit_activities(
         self,
@@ -3256,18 +3387,14 @@ class TravelValidationMixin:
             if item.get("duration_minutes"):
                 suggested_resolution.append(f"Shorten {item.get('title') or 'this activity'} below {item.get('duration_minutes')} minutes.")
             suggested_resolution.append(f"Change {item.get('title') or 'this activity'} to flexible/optional or schedule it another day.")
-            metadata = {
-                "activity_id": item.get("stable_activity_id") or item.get("id"),
-                "title": item.get("title"),
-                "duration_minutes": item.get("duration_minutes"),
-                "reason": reason,
-                "reason_code": reason_code,
-                "blocking_constraint": blocking_constraint,
-                "suggested_resolution": list(dict.fromkeys(suggested_resolution)),
-                "priority": item.get("priority", "medium"),
-                "timing_mode": item.get("timing_mode") or item.get("original_timing_mode") or TimingMode.UNSPECIFIED,
-                "score": round(float(score), 2),
-            }
+            metadata = self._route_repair_activity_metadata(
+                item,
+                reason=reason,
+                reason_code=reason_code,
+                blocking_constraint=blocking_constraint,
+                suggested_resolution=list(dict.fromkeys(suggested_resolution)),
+            )
+            metadata["score"] = round(float(score), 2)
             unfit.append(metadata)
             jlog("TRAVEL_REPAIR", f"title={metadata['title']} score={metadata['score']} reason={reason}", "UNFIT")
         return unfit
@@ -3341,11 +3468,80 @@ class TravelValidationMixin:
         for key, value in (incoming or {}).items():
             if value is None or value == "" or value == []:
                 continue
-            if key in {"reason", "reason_code", "blocking_constraint", "suggested_resolution", "duration_minutes", "title"}:
+            if key == "duration_minutes":
+                merged_duration = int(merged.get("duration_minutes") or 0)
+                incoming_duration = int(value or 0)
+                if incoming_duration >= merged_duration:
+                    merged[key] = deepcopy(value)
+            elif key in {"reason", "reason_code", "blocking_constraint", "suggested_resolution", "title"}:
                 merged[key] = deepcopy(value)
             else:
                 merged.setdefault(key, deepcopy(value))
         return merged
+
+    def _route_repair_activity_metadata(
+        self,
+        item: Dict[str, Any],
+        *,
+        reason: str,
+        reason_code: str,
+        blocking_constraint: Optional[Dict[str, Any]] = None,
+        suggested_resolution: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        preserved = deepcopy(item)
+        self._strip_route_repair_transient_timing(preserved)
+        stable_id = item.get("stable_activity_id") or item.get("activity_id") or item.get("id")
+        preserved["activity_id"] = stable_id
+        if stable_id:
+            preserved.setdefault("stable_activity_id", stable_id)
+            preserved.setdefault("id", stable_id)
+        preserved["type"] = "activity"
+        preserved["block_type"] = "activity"
+        preserved["status"] = "active"
+        preserved["title"] = item.get("title") or "Activity"
+        preserved["duration_minutes"] = item.get("duration_minutes")
+        preserved["priority"] = item.get("priority", "medium")
+        preserved["timing_mode"] = item.get("timing_mode") or item.get("original_timing_mode") or TimingMode.UNSPECIFIED
+        preserved["reason"] = reason
+        preserved["reason_code"] = reason_code
+        preserved["blocking_constraint"] = blocking_constraint or {"reason_code": reason_code}
+        preserved["suggested_resolution"] = list(dict.fromkeys(suggested_resolution or []))
+        return preserved
+
+    def _strip_route_repair_transient_timing(self, item: Dict[str, Any]) -> None:
+        """Unfit/retry metadata should not carry a failed scheduled placement."""
+        for key in (
+            "start",
+            "end",
+            "startTime",
+            "endTime",
+            "scheduled_start",
+            "scheduled_end",
+            "_repair_start",
+            "_repair_end",
+            "is_system_scheduled",
+            "is_conflict",
+            "is_conflicting",
+            "conflict_with",
+            "conflict_ids",
+            "conflict_reason",
+            "conflict_priority",
+            "conflict_severity",
+        ):
+            item.pop(key, None)
+        timing_mode = str(item.get("timing_mode") or "").strip().lower()
+        is_user_fixed = bool(item.get("is_user_fixed") or item.get("user_fixed_start") is not None)
+        if timing_mode != TimingMode.FIXED and not is_user_fixed:
+            for key in (
+                "fixed_start",
+                "fixed_end",
+                "user_fixed_start",
+                "user_fixed_end",
+                "requested_fixed_start",
+                "requested_fixed_end",
+                "locked_fixed",
+            ):
+                item.pop(key, None)
 
     def _route_repair_item_is_optional(self, item: Dict[str, Any]) -> bool:
         if item.get("optional_reason"):
@@ -3370,16 +3566,13 @@ class TravelValidationMixin:
                 or item.get("reason")
                 or "Optional activity skipped because no good route-safe slot was available."
             )
-            skipped.append({
-                "activity_id": item.get("stable_activity_id") or item.get("id"),
-                "title": item.get("title"),
-                "duration_minutes": item.get("duration_minutes"),
-                "reason": reason,
-                "reason_code": reason_code,
-                "priority": item.get("priority", "low"),
-                "timing_mode": item.get("timing_mode") or item.get("original_timing_mode") or TimingMode.UNSPECIFIED,
-                "optional_reason": item.get("optional_reason") or "optional",
-            })
+            skipped.append(self._route_repair_activity_metadata(
+                item,
+                reason=reason,
+                reason_code=reason_code,
+                blocking_constraint={"reason_code": reason_code},
+                suggested_resolution=[f"Schedule {item.get('title') or 'this activity'} another day or free up a larger route-safe slot."],
+            ) | {"optional_reason": item.get("optional_reason") or "optional"})
         return skipped
 
     def _route_repair_unfit_metadata(
@@ -3391,20 +3584,16 @@ class TravelValidationMixin:
     ) -> Dict[str, Any]:
         title = item.get("title") or "Activity"
         duration = item.get("duration_minutes")
-        return {
-            "activity_id": item.get("stable_activity_id") or item.get("id"),
-            "title": title,
-            "duration_minutes": duration,
-            "reason": reason,
-            "reason_code": reason_code,
-            "blocking_constraint": {"reason_code": reason_code},
-            "suggested_resolution": list(dict.fromkeys([
+        return self._route_repair_activity_metadata(
+            item,
+            reason=reason,
+            reason_code=reason_code,
+            blocking_constraint={"reason_code": reason_code},
+            suggested_resolution=list(dict.fromkeys([
                 f"Shorten {title} below {duration} minutes." if duration else f"Shorten {title}.",
                 f"Schedule {title} another day or free up a larger route-safe slot.",
             ])),
-            "priority": item.get("priority", "medium"),
-            "timing_mode": item.get("timing_mode") or item.get("original_timing_mode") or TimingMode.UNSPECIFIED,
-        }
+        )
 
     def _account_for_route_repair_activities(
         self,
@@ -3849,6 +4038,14 @@ class TravelValidationMixin:
             transition_index = self._transition_index_between(blocks, left_pos, right_pos)
             transition = blocks[transition_index] if transition_index is not None else None
             transition_end = parse_clock((transition or {}).get("end") or (transition or {}).get("endTime") or "")
+            available_gap = max(0, right_start - route_gap_start)
+            tight_transition_covers_route = bool(
+                transition
+                and transition.get("is_tight")
+                and transition_end is not None
+                and transition_end <= right_start
+                and available_gap >= route_minutes
+            )
             if transition_end is not None and transition_end > right_start:
                 route_conflicts.append({
                     "type": "route_conflict",
@@ -3858,11 +4055,11 @@ class TravelValidationMixin:
                     "to_start": format_clock(right_start),
                     "required_route_minutes": route_minutes,
                     "required_travel_minutes": route_minutes,
-                    "available_gap_minutes": max(0, right_start - route_gap_start),
+                    "available_gap_minutes": available_gap,
                     "reason": f"Travel to {right.get('title')} overlaps the destination activity.",
                     "reason_code": "travel_overlaps_destination",
                 })
-            if right_start < required_start:
+            if right_start < required_start and not tight_transition_covers_route:
                 if not self._activity_can_move_for_route_repair(left) and not self._activity_can_move_for_route_repair(right):
                     route_conflicts.append({
                         "type": "route_conflict",
@@ -3874,7 +4071,7 @@ class TravelValidationMixin:
                         "to_start": format_clock(right_start),
                         "required_route_minutes": route_minutes,
                         "required_travel_minutes": route_minutes,
-                        "available_gap_minutes": max(0, right_start - route_gap_start),
+                        "available_gap_minutes": available_gap,
                         "destination_movable": False,
                         "destination_activity_id": right.get("stable_activity_id") or right.get("id"),
                         "reason": f"Your {left.get('title')} ends at {left.get('location')} at {format_clock(left_end)}, but {right.get('title')} starts in {right.get('location')} at {format_clock(right_start)}. Accurate travel requires about {route_minutes} minutes, so this fixed sequence is not physically feasible.",
@@ -3891,7 +4088,7 @@ class TravelValidationMixin:
                         "to_start": format_clock(right_start),
                         "required_route_minutes": route_minutes,
                         "required_travel_minutes": route_minutes,
-                        "available_gap_minutes": max(0, right_start - route_gap_start),
+                        "available_gap_minutes": available_gap,
                         "destination_movable": self._activity_can_move_for_route_repair(right),
                         "destination_activity_id": right.get("stable_activity_id") or right.get("id"),
                         "reason": (

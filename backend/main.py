@@ -26,7 +26,7 @@ from travel_service import TravelService
 # load environment variables from .env file
 load_dotenv()
 
-BACKEND_VERSION = "2026.06.20-1"
+BACKEND_VERSION = "2026.06.29-2"
 
 def _parse_allowed_origins() -> List[str]:
     raw = os.getenv("ALLOWED_ORIGINS", "")
@@ -239,6 +239,7 @@ class ScheduleEnvelope(BaseModel):
     unmet_items: Optional[List[Dict[str, Any]]] = []
     validation_issues: Optional[List[str]] = []
     export_warning: Optional[str] = None
+    performance_summary: Optional[Dict[str, Any]] = None
 
 class SchedulePatchOperation(BaseModel):
     op: str # add, update, remove, move, replace, update_priority
@@ -284,6 +285,7 @@ class ChatResponse(BaseModel):
     recommend_allow_clash: bool = False
     reply_reason: Optional[str] = None
     llm_fallback_reason: Optional[str] = None
+    performance_summary: Optional[Dict[str, Any]] = None
 
 class PlanRequest(BaseModel):
     date: str
@@ -409,6 +411,49 @@ def debug_log(message: str) -> None:
     jlog("API", message)
 
 
+def _performance_source_payload(payload: Any) -> Dict[str, Any]:
+    if isinstance(payload, BaseModel):
+        return payload.model_dump()
+    return payload if isinstance(payload, dict) else {}
+
+
+def _build_performance_summary(
+    source: str,
+    started_at: float,
+    phases: Optional[List[Dict[str, Any]]] = None,
+    envelope: Optional[Any] = None,
+) -> Dict[str, Any]:
+    envelope_dict = _performance_source_payload(envelope)
+    summary = dict(envelope_dict.get("performance_summary") or {})
+    clean_phases = []
+    for phase in phases or []:
+        name = str(phase.get("name") or "").strip()
+        if not name:
+            continue
+        try:
+            seconds = round(float(phase.get("seconds") or 0.0), 2)
+        except (TypeError, ValueError):
+            seconds = 0.0
+        clean_phases.append({"name": name, "seconds": seconds})
+    summary["last_action"] = {
+        "source": source,
+        "total_seconds": round(max(0.0, time.perf_counter() - started_at), 2),
+        "phases": clean_phases,
+    }
+    return summary
+
+
+def _attach_performance_summary(
+    envelope: Dict[str, Any],
+    source: str,
+    started_at: float,
+    phases: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    updated = dict(envelope)
+    updated["performance_summary"] = _build_performance_summary(source, started_at, phases, updated)
+    return updated
+
+
 def _preserve_calendar_state(envelope: Dict[str, Any], source: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Keep Google layer/link state around scheduler responses that rebuild drafts."""
     if not source:
@@ -513,6 +558,148 @@ def _travel_validation_accounted_for_all(original: Dict[str, Any], validated: Di
             if key:
                 accounted.add(key)
     return original_keys.issubset(accounted)
+
+
+def _restore_retryable_items_for_allow_clash(envelope: Dict[str, Any]) -> Dict[str, Any]:
+    """When Allow Clash is enabled, retry previously unfit items during rerun."""
+    allow_clash = bool(
+        envelope.get("allow_clash")
+        or (envelope.get("preferences") or {}).get("allow_clash")
+    )
+    if not allow_clash:
+        return envelope
+
+    restored = deepcopy(envelope)
+    activities = list(restored.get("activities") or [])
+    existing_keys = {
+        _activity_key_for_accounting(item)
+        for item in activities
+        if isinstance(item, dict)
+    }
+    existing_semantic_keys = {
+        _retryable_activity_semantic_key(item)
+        for item in activities
+        if isinstance(item, dict)
+    }
+    existing_title_keys = {
+        _retryable_activity_title_key(item)
+        for item in activities
+        if isinstance(item, dict)
+    }
+    retry_by_title: Dict[str, Dict[str, Any]] = {}
+    for collection_name in ("unfit_activities", "unscheduled_activities", "optional_skipped"):
+        for raw in restored.get(collection_name) or []:
+            if not isinstance(raw, dict):
+                continue
+            if _is_schedule_constraint_for_accounting(raw):
+                continue
+            if not scheduling_engine._is_activity_entry(raw):
+                continue
+            if scheduling_engine._is_generic_system_activity_payload(raw):
+                continue
+            key = _activity_key_for_accounting(raw)
+            semantic_key = _retryable_activity_semantic_key(raw)
+            title_key = _retryable_activity_title_key(raw)
+            if title_key and title_key in existing_title_keys:
+                continue
+            if (key and key in existing_keys) or (semantic_key and semantic_key in existing_semantic_keys):
+                continue
+            item = _sanitize_retryable_activity_for_reschedule(raw)
+            item["type"] = "activity"
+            item["block_type"] = "activity"
+            item["status"] = "active"
+            if title_key:
+                existing = retry_by_title.get(title_key)
+                if existing and _retryable_item_score(existing) >= _retryable_item_score(item):
+                    continue
+                retry_by_title[title_key] = item
+            else:
+                retry_by_title[f"__untitled_{len(retry_by_title)}"] = item
+            if key:
+                existing_keys.add(key)
+            if semantic_key:
+                existing_semantic_keys.add(semantic_key)
+
+    retry_items = list(retry_by_title.values())
+
+    if not retry_items:
+        return restored
+
+    restored["activities"] = activities + retry_items
+    restored["unfit_activities"] = []
+    restored["unscheduled_activities"] = []
+    restored["optional_skipped"] = []
+    restored["unmet_items"] = []
+    restored["blocked_activities"] = []
+    restored["validation_issues"] = []
+    jlog(
+        "RUN_SCHEDULER",
+        f"retry_count={len(retry_items)} titles={[item.get('title') for item in retry_items]}",
+        "ALLOW_CLASH_RETRY",
+    )
+    return restored
+
+
+def _sanitize_retryable_activity_for_reschedule(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep retry identity/details, but remove stale placement from failed attempts."""
+    sanitized = deepcopy(item)
+    for key in (
+        "start",
+        "end",
+        "startTime",
+        "endTime",
+        "scheduled_start",
+        "scheduled_end",
+        "_repair_start",
+        "_repair_end",
+        "is_system_scheduled",
+        "is_conflict",
+        "is_conflicting",
+        "conflict_with",
+        "conflict_ids",
+        "conflict_reason",
+        "conflict_priority",
+        "conflict_severity",
+        "reason",
+        "reason_code",
+        "blocking_constraint",
+        "suggested_resolution",
+    ):
+        sanitized.pop(key, None)
+    timing_mode = str(sanitized.get("timing_mode") or "").strip().lower()
+    is_user_fixed = bool(sanitized.get("is_user_fixed") or sanitized.get("user_fixed_start") is not None)
+    if timing_mode != "fixed" and not is_user_fixed:
+        for key in (
+            "fixed_start",
+            "fixed_end",
+            "user_fixed_start",
+            "user_fixed_end",
+            "requested_fixed_start",
+            "requested_fixed_end",
+            "locked_fixed",
+        ):
+            sanitized.pop(key, None)
+    return sanitized
+
+
+def _retryable_activity_semantic_key(item: Dict[str, Any]) -> str:
+    title = str(item.get("title") or "").strip().lower()
+    if not title:
+        return ""
+    duration = item.get("duration_minutes") or item.get("duration") or ""
+    timing_mode = str(item.get("timing_mode") or item.get("original_timing_mode") or "").strip().lower()
+    return f"{title}|{duration}|{timing_mode}"
+
+
+def _retryable_activity_title_key(item: Dict[str, Any]) -> str:
+    return str(item.get("title") or "").strip().lower()
+
+
+def _retryable_item_score(item: Dict[str, Any]) -> int:
+    duration_score = int(item.get("duration_minutes") or 0)
+    coordinate_score = 30 if _location_has_coordinates(item.get("resolved_location")) else 0
+    id_score = 10 if item.get("stable_activity_id") or item.get("id") else 0
+    return duration_score + coordinate_score + id_score
 
 
 def _merge_user_preferences_into_envelope(
@@ -684,15 +871,58 @@ def travel_validation_reply_meta(envelope: Dict[str, Any]) -> Dict[str, Any]:
         "reply_reason": status,
     }
 
+
+def _run_travel_aware_scheduler_for_validation(
+    envelope: Dict[str, Any],
+    user_id: str,
+    source: str = "travel_complete",
+) -> Dict[str, Any]:
+    working = cleanDirtySchedule(deepcopy(envelope or {}))
+    working["accurate_travel_time"] = True
+    working["travel_intent"] = True
+    working.setdefault("preferences", {})
+    working["preferences"]["accurate_travel_time"] = True
+    working["preferences"]["travel_intent"] = True
+    working = _restore_retryable_items_for_allow_clash(working)
+    saved_locations = database.get_user_locations(user_id)
+    updated = scheduling_engine.run_manual_scheduler(
+        envelope=working,
+        saved_locations=saved_locations,
+        source=source,
+    )
+    updated = _mark_unsaved_draft(_preserve_calendar_state(updated, working))
+    validate_state_invariants(updated, context=source)
+    return updated
+
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat_with_llm(request: ChatRequest):
     chat_started = time.perf_counter()
+    performance_phases: List[Dict[str, Any]] = []
 
+    def elapsed_value(started: float) -> float:
+        return max(0.0, time.perf_counter() - started)
+    
     def elapsed_seconds(started: float) -> str:
-        return f"{time.perf_counter() - started:.2f}"
+        return f"{elapsed_value(started):.2f}"
+
+    def record_phase(name: str, started: float) -> float:
+        seconds = round(elapsed_value(started), 2)
+        performance_phases.append({"name": name, "seconds": seconds})
+        return seconds
 
     def log_total_timer() -> None:
         jlog("TIMER", f"total_chat_request_seconds={elapsed_seconds(chat_started)}")
+
+    def chat_response(**kwargs: Any) -> ChatResponse:
+        envelope = kwargs.get("schedule_data") or kwargs.get("full_schedule")
+        kwargs["performance_summary"] = _build_performance_summary(
+            "chat",
+            chat_started,
+            performance_phases,
+            envelope,
+        )
+        return ChatResponse(**kwargs)
 
     debug_log(f"Received chat | user={request.user_id} | message={request.message!r}")
     jlog(
@@ -729,7 +959,7 @@ async def chat_with_llm(request: ChatRequest):
                 envelope_dict = _mark_unsaved_draft(_preserve_calendar_state(envelope_dict, current_envelope))
                 full_envelope = ScheduleEnvelope(**envelope_dict)
                 log_total_timer()
-                return ChatResponse(
+                return chat_response(
                     reply=pending_repair.get("reply", "I kept the current schedule unchanged."),
                     full_schedule=full_envelope,
                     schedule_data=full_envelope,
@@ -760,12 +990,12 @@ async def chat_with_llm(request: ChatRequest):
 
         router_started = time.perf_counter()
         route = scheduling_engine.route_chat_request(request.message, current_envelope)
-        jlog("TIMER", f"router_seconds={elapsed_seconds(router_started)}")
+        jlog("TIMER", f"router_seconds={record_phase('Router', router_started):.2f}")
 
         if route.get("route") == "general_chat":
             reply_meta = scheduling_engine.compose_general_chat_reply(request.message)
             log_total_timer()
-            return ChatResponse(
+            return chat_response(
                 reply=reply_meta["reply"],
                 transcription=request.message,
                 reply_status=reply_meta.get("reply_status"),
@@ -779,9 +1009,9 @@ async def chat_with_llm(request: ChatRequest):
                 allow_clash=bool(request.allow_clash),
                 accurate_travel_time=bool(request.accurate_travel_time),
             )
-            jlog("TIMER", f"advisory_llm_seconds={elapsed_seconds(advice_started)}")
+            jlog("TIMER", f"advisory_llm_seconds={record_phase('Advisory reply', advice_started):.2f}")
             log_total_timer()
-            return ChatResponse(
+            return chat_response(
                 reply=reply_meta["reply"],
                 schedule_data=request.current_schedule,
                 transcription=request.message,
@@ -792,26 +1022,31 @@ async def chat_with_llm(request: ChatRequest):
             jlog("TRAVEL_REQUEST", "source=chat route=validate_existing_schedule accurate_travel_time=true")
             if not current_envelope:
                 log_total_timer()
-                return ChatResponse(
+                return chat_response(
                     reply="I need a current schedule before I can calculate accurate travel time.",
                     transcription=request.message,
                     reply_status="clarification_needed",
                     reply_reason="missing_current_schedule",
                 )
 
-            saved_locations = database.get_user_locations(request.user_id)
             travel_envelope = _merge_user_preferences_into_envelope(deepcopy(current_envelope), request.user_id) or deepcopy(current_envelope)
             travel_envelope["accurate_travel_time"] = True
+            travel_envelope["travel_intent"] = True
             travel_envelope.setdefault("preferences", {})
             travel_envelope["preferences"]["accurate_travel_time"] = True
+            travel_envelope["preferences"]["travel_intent"] = True
             schedule_id = travel_envelope.get("scheduleId") or travel_envelope.get("schedule_id") or "(draft)"
             jlog(
                 "TRAVEL_VALIDATION",
                 f"schedule_id={schedule_id} date={travel_envelope.get('date')}",
                 "START",
             )
-            validated = scheduling_engine._apply_accurate_travel_if_requested(travel_envelope, saved_locations)
-            validated = _mark_unsaved_draft(_preserve_calendar_state(validated, current_envelope))
+            validated = _run_travel_aware_scheduler_for_validation(
+                travel_envelope,
+                request.user_id,
+                source="chat_travel_validation",
+            )
+            validated = _preserve_calendar_state(validated, current_envelope)
             pending_requests = validated.get("location_resolution_requests") or []
             if pending_requests:
                 missing = [
@@ -832,7 +1067,7 @@ async def chat_with_llm(request: ChatRequest):
             full_envelope = ScheduleEnvelope(**envelope_dict)
             reply_meta = travel_validation_reply_meta(envelope_dict)
             log_total_timer()
-            return ChatResponse(
+            return chat_response(
                 reply=reply_meta["reply"],
                 full_schedule=full_envelope,
                 schedule_data=full_envelope,
@@ -875,7 +1110,7 @@ async def chat_with_llm(request: ChatRequest):
                 parse_kwargs["disable_deterministic_fallback"] = True
                 parse_kwargs["fallback_reason"] = "complex_or_travel_intent"
             parsed = scheduling_engine.parse_text_request(**parse_kwargs)
-        jlog("TIMER", f"module_a_total_seconds={elapsed_seconds(module_a_started)}")
+        jlog("TIMER", f"module_a_total_seconds={record_phase('Parser', module_a_started):.2f}")
         parsed.setdefault("preferences", {})
         persisted_preferences = database.get_user_preferences(request.user_id) if request.user_id else {}
         for key in ("day_start_time", "day_end_time", "use_day_boundary_preferences", "default_start_location", "default_buffer_minutes"):
@@ -911,7 +1146,7 @@ async def chat_with_llm(request: ChatRequest):
         if intent == "no_operation":
             log_total_token_usage(parsed)
             log_total_timer()
-            return ChatResponse(
+            return chat_response(
                 reply=reply,
                 transcription=parsed.get("transcription"),
                 reply_status="clarification_needed",
@@ -931,7 +1166,7 @@ async def chat_with_llm(request: ChatRequest):
             reply_status = "error" if failure_type in parser_failure_types else "chat"
             log_total_token_usage(parsed)
             log_total_timer()
-            return ChatResponse(
+            return chat_response(
                 reply=reply,
                 transcription=parsed.get("transcription"),
                 reply_status=reply_status,
@@ -974,7 +1209,7 @@ async def chat_with_llm(request: ChatRequest):
                 patch_result["envelope"] = _mark_unsaved_draft(
                     cleanDirtySchedule(_preserve_calendar_state(patch_result["envelope"], current_envelope))
                 )
-                jlog("TIMER", f"apply_operations_seconds={elapsed_seconds(apply_started)}")
+                jlog("TIMER", f"apply_operations_seconds={record_phase('Apply changes', apply_started):.2f}")
                 
                 module_8_started = time.perf_counter()
                 reply_meta = scheduling_engine.compose_result_reply(
@@ -983,12 +1218,12 @@ async def chat_with_llm(request: ChatRequest):
                     result=patch_result,
                     allow_clash=bool(request.allow_clash),
                 )
-                jlog("TIMER", f"module_8_total_seconds={elapsed_seconds(module_8_started)}")
+                jlog("TIMER", f"module_8_total_seconds={record_phase('Reply generation', module_8_started):.2f}")
                 final_reply = reply_meta["reply"]
                 log_total_token_usage(parsed, reply_meta)
                 log_total_timer()
 
-                return ChatResponse(
+                return chat_response(
                     reply=final_reply,
                     patch=SchedulePatchResponse(
                         scheduleId=patch_result["envelope"].get("scheduleId") or "temp-id",
@@ -1015,7 +1250,7 @@ async def chat_with_llm(request: ChatRequest):
             latest_request=request.message,
             saved_locations=saved_locations,
         )
-        jlog("TIMER", f"schedule_build_seconds={elapsed_seconds(schedule_build_started)}")
+        jlog("TIMER", f"schedule_build_seconds={record_phase('Schedule build', schedule_build_started):.2f}")
         
         schedule_dict = result.get("schedule_data")
         if schedule_dict:
@@ -1029,12 +1264,12 @@ async def chat_with_llm(request: ChatRequest):
                 result=result,
                 allow_clash=bool(request.allow_clash),
             )
-            jlog("TIMER", f"module_8_total_seconds={elapsed_seconds(module_8_started)}")
+            jlog("TIMER", f"module_8_total_seconds={record_phase('Reply generation', module_8_started):.2f}")
             log_total_token_usage(parsed, reply_meta)
             full_envelope_dict = database._parse_schedule_payload(schedule_dict, request.user_id, schedule_dict.get("date"))
             full_envelope = ScheduleEnvelope(**full_envelope_dict)
             log_total_timer()
-            return ChatResponse(
+            return chat_response(
                 reply=reply_meta["reply"],
                 full_schedule=full_envelope,
                 schedule_data=full_envelope,
@@ -1047,7 +1282,7 @@ async def chat_with_llm(request: ChatRequest):
         
         log_total_token_usage(parsed)
         log_total_timer()
-        return ChatResponse(
+        return chat_response(
             reply=result.get("reply", reply), 
             schedule_data=None,
             transcription=result.get("transcription")
@@ -1057,7 +1292,7 @@ async def chat_with_llm(request: ChatRequest):
         import traceback
         traceback.print_exc() 
         log_total_timer()
-        return ChatResponse(reply=f"Sorry, I encountered an error: {str(e)}")
+        return chat_response(reply=f"Sorry, I encountered an error: {str(e)}")
 
 @app.post("/api/schedules/{scheduleId}/operations", response_model=SchedulePatchResponse)
 async def apply_operations_endpoint(scheduleId: str, request: SchedulePatchRequest):
@@ -1493,38 +1728,33 @@ async def resolve_location(request: LocationResolveRequest):
 
 @app.post("/api/travel/complete", response_model=ScheduleEnvelope)
 async def complete_travel_validation(request: TravelCompleteRequest):
+    endpoint_started = time.perf_counter()
     envelope = _merge_user_preferences_into_envelope(request.schedule.model_dump(), request.user_id) or request.schedule.model_dump()
     envelope = cleanDirtySchedule(envelope)
     envelope["accurate_travel_time"] = True
+    envelope["travel_intent"] = True
     envelope.setdefault("preferences", {})
     envelope["preferences"]["accurate_travel_time"] = True
+    envelope["preferences"]["travel_intent"] = True
     schedule_id = envelope.get("scheduleId") or envelope.get("schedule_id") or "(draft)"
     jlog(
         "TRAVEL_REQUEST",
-        f"source={request.source or 'manual'} route=validate_existing_schedule accurate_travel_time=true",
+        f"source={request.source or 'manual'} route=run_scheduler_with_travel accurate_travel_time=true",
     )
     jlog(
         "TRAVEL_SERVICE",
         f"Starting accurate travel validation schedule_id={schedule_id} date={envelope.get('date')}",
         "COMPLETE",
     )
-    saved_locations = database.get_user_locations(request.user_id)
-    validated = scheduling_engine._apply_accurate_travel_if_requested(envelope, saved_locations)
-    validated = _mark_unsaved_draft(_preserve_calendar_state(validated, envelope))
-    travel_status = validated.get("travel_validation_status")
-    if travel_status in {"validated", "repaired_validated"} and not (validated.get("location_resolution_requests") or []):
-        validated["needs_reschedule"] = False
-        validated["reschedule_reason"] = None
-        validated["needs_travel_validation"] = False
-        validated["last_rescheduled_at"] = scheduling_engine._now_iso()
-    elif travel_status == "pending_locations":
-        validated["needs_travel_validation"] = True
-        validated["needs_reschedule"] = bool(envelope.get("needs_reschedule"))
-        validated["reschedule_reason"] = envelope.get("reschedule_reason")
-    else:
-        validated["needs_reschedule"] = bool(envelope.get("needs_reschedule"))
-        validated["reschedule_reason"] = envelope.get("reschedule_reason")
-        validated["needs_travel_validation"] = bool(validated.get("needs_travel_validation", envelope.get("needs_travel_validation")))
+    try:
+        validated = _run_travel_aware_scheduler_for_validation(
+            envelope,
+            request.user_id,
+            source=f"travel_complete_{request.source or 'manual'}",
+        )
+    except Exception as exc:
+        jlog("TRAVEL_SERVICE", str(exc), "ERROR")
+        raise HTTPException(status_code=500, detail=str(exc))
     jlog(
         "TRAVEL_SERVICE",
         f"travel_validation_status={validated.get('travel_validation_status')}",
@@ -1535,22 +1765,32 @@ async def complete_travel_validation(request: TravelCompleteRequest):
         f"Updated transition blocks={validated.get('updated_transition_count', 0)}",
         "COMPLETE",
     )
+    validated = _attach_performance_summary(validated, "complete_travel_validation", endpoint_started)
     return ScheduleEnvelope(**validated)
 
 @app.post("/api/schedules/replan", response_model=ScheduleEnvelope)
 async def run_scheduler_endpoint(request: RunSchedulerRequest):
+    endpoint_started = time.perf_counter()
+    performance_phases: List[Dict[str, Any]] = []
     envelope = _merge_user_preferences_into_envelope(request.schedule.model_dump(), request.user_id) or request.schedule.model_dump()
     envelope = cleanDirtySchedule(envelope)
+    envelope = _restore_retryable_items_for_allow_clash(envelope)
     saved_locations = database.get_user_locations(request.user_id)
     try:
+        scheduler_started = time.perf_counter()
         updated = scheduling_engine.run_manual_scheduler(
             envelope=envelope,
             saved_locations=saved_locations,
             base_version=request.schedule_version,
             source=request.source or "manual_button",
         )
+        performance_phases.append({
+            "name": "Manual scheduler",
+            "seconds": round(max(0.0, time.perf_counter() - scheduler_started), 2),
+        })
         updated = _mark_unsaved_draft(_preserve_calendar_state(updated, envelope))
         validate_state_invariants(updated, context="replan")
+        updated = _attach_performance_summary(updated, "run_scheduler", endpoint_started, performance_phases)
         return ScheduleEnvelope(**updated)
     except VersionMismatchError as exc:
         raise HTTPException(status_code=409, detail=str(exc))

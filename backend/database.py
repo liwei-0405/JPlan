@@ -814,6 +814,126 @@ def save_geocode_cache(
         jlog("DB", f"Geocode cache write skipped: {e}", "CACHE")
         return False
 
+def _route_time_bucket_key(time_bucket: Optional[str] = None) -> str:
+    return str(time_bucket or "default").strip() or "default"
+
+def _route_cache_query(
+    from_lat: float,
+    from_lng: float,
+    to_lat: float,
+    to_lng: float,
+    transport_mode: str,
+    time_bucket: Optional[str] = None,
+    provider: str = "ors",
+):
+    return (
+        supabase.table('route_cache')
+        .select('*')
+        .eq('from_lat', round(float(from_lat), 5))
+        .eq('from_lng', round(float(from_lng), 5))
+        .eq('to_lat', round(float(to_lat), 5))
+        .eq('to_lng', round(float(to_lng), 5))
+        .eq('transport_mode', transport_mode)
+        .eq('time_bucket_key', _route_time_bucket_key(time_bucket))
+        .eq('provider', provider)
+        .limit(1)
+    )
+
+def get_route_cache(
+    from_lat: float,
+    from_lng: float,
+    to_lat: float,
+    to_lng: float,
+    transport_mode: str = "driving-car",
+    time_bucket: Optional[str] = None,
+    provider: str = "ors",
+) -> Optional[int]:
+    """Return a cached route duration in minutes when the optional route_cache table exists."""
+    if not supabase:
+        return None
+    try:
+        response = _route_cache_query(
+            from_lat,
+            from_lng,
+            to_lat,
+            to_lng,
+            transport_mode,
+            time_bucket,
+            provider,
+        ).execute()
+        row = (response.data or [None])[0]
+        if not row:
+            return None
+
+        expires_at = _parse_timestamptz(row.get('expires_at'))
+        if expires_at and expires_at < datetime.now(timezone.utc):
+            return None
+
+        try:
+            supabase.table('route_cache').update({
+                'hit_count': int(row.get('hit_count') or 0) + 1,
+                'updated_at': datetime.now(timezone.utc).isoformat(),
+            }).eq('id', row.get('id')).execute()
+        except Exception as update_error:
+            jlog("DB", f"Route cache hit_count update skipped: {update_error}", "CACHE")
+
+        duration = row.get('duration_minutes')
+        return int(duration) if duration is not None else None
+    except Exception as e:
+        jlog("DB", f"Route cache read skipped: {e}", "CACHE")
+        return None
+
+def save_route_cache(
+    from_lat: float,
+    from_lng: float,
+    to_lat: float,
+    to_lng: float,
+    duration_minutes: int,
+    transport_mode: str = "driving-car",
+    time_bucket: Optional[str] = None,
+    provider: str = "ors",
+    ttl_days: Optional[int] = 30,
+) -> bool:
+    """Persist a route duration when the optional route_cache table exists."""
+    if not supabase:
+        return False
+    now = datetime.now(timezone.utc)
+    expires_at = None
+    if ttl_days is not None and ttl_days >= 0:
+        expires_at = (now + timedelta(days=ttl_days)).isoformat()
+
+    payload = {
+        'from_lat': round(float(from_lat), 5),
+        'from_lng': round(float(from_lng), 5),
+        'to_lat': round(float(to_lat), 5),
+        'to_lng': round(float(to_lng), 5),
+        'transport_mode': transport_mode,
+        'time_bucket_key': _route_time_bucket_key(time_bucket),
+        'provider': provider,
+        'duration_minutes': max(1, int(duration_minutes)),
+        'expires_at': expires_at,
+        'updated_at': now.isoformat(),
+    }
+    try:
+        existing = _route_cache_query(
+            from_lat,
+            from_lng,
+            to_lat,
+            to_lng,
+            transport_mode,
+            time_bucket,
+            provider,
+        ).execute()
+        row = (existing.data or [None])[0]
+        if row:
+            supabase.table('route_cache').update(payload).eq('id', row.get('id')).execute()
+        else:
+            supabase.table('route_cache').insert(payload).execute()
+        return True
+    except Exception as e:
+        jlog("DB", f"Route cache write skipped: {e}", "CACHE")
+        return False
+
 def delete_plan(date: str, user_id: str) -> bool:
     """Delete a plan for a specific date and user."""
     if not supabase: raise Exception("Supabase client not initialized.")

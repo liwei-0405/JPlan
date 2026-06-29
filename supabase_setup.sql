@@ -154,6 +154,38 @@ CREATE INDEX IF NOT EXISTS idx_geocode_cache_provider_query
 CREATE INDEX IF NOT EXISTS idx_geocode_cache_expires_at
   ON public.geocode_cache(expires_at);
 
+-- Shared route cache for ORS point-to-point durations.
+-- Routes are directional because driving time may differ by direction.
+CREATE TABLE IF NOT EXISTS public.route_cache (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  from_lat DOUBLE PRECISION NOT NULL,
+  from_lng DOUBLE PRECISION NOT NULL,
+  to_lat DOUBLE PRECISION NOT NULL,
+  to_lng DOUBLE PRECISION NOT NULL,
+  transport_mode TEXT NOT NULL DEFAULT 'driving-car',
+  time_bucket_key TEXT NOT NULL DEFAULT 'default',
+  provider TEXT NOT NULL DEFAULT 'ors',
+  duration_minutes INTEGER NOT NULL CHECK (duration_minutes >= 1),
+  hit_count INTEGER NOT NULL DEFAULT 0,
+  expires_at TIMESTAMP WITH TIME ZONE,
+  created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT timezone('utc'::text, now()),
+  updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT timezone('utc'::text, now())
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_route_cache_unique
+  ON public.route_cache (
+    from_lat,
+    from_lng,
+    to_lat,
+    to_lng,
+    transport_mode,
+    time_bucket_key,
+    provider
+  );
+
+CREATE INDEX IF NOT EXISTS idx_route_cache_expires_at
+  ON public.route_cache(expires_at);
+
 -- Timestamp triggers
 DROP TRIGGER IF EXISTS update_profiles_updated_at ON public.profiles;
 CREATE TRIGGER update_profiles_updated_at
@@ -188,6 +220,12 @@ CREATE TRIGGER update_user_recent_locations_updated_at
 DROP TRIGGER IF EXISTS update_geocode_cache_updated_at ON public.geocode_cache;
 CREATE TRIGGER update_geocode_cache_updated_at
   BEFORE UPDATE ON public.geocode_cache
+  FOR EACH ROW
+  EXECUTE FUNCTION public.update_updated_at_column();
+
+DROP TRIGGER IF EXISTS update_route_cache_updated_at ON public.route_cache;
+CREATE TRIGGER update_route_cache_updated_at
+  BEFORE UPDATE ON public.route_cache
   FOR EACH ROW
   EXECUTE FUNCTION public.update_updated_at_column();
 
@@ -230,6 +268,7 @@ ALTER TABLE public.user_locations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.user_preferences ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.user_recent_locations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.geocode_cache ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.route_cache ENABLE ROW LEVEL SECURITY;
 
 -- Profiles policies
 DROP POLICY IF EXISTS "Users can read their own profile" ON public.profiles;
@@ -293,6 +332,14 @@ CREATE POLICY "Users can manage their own recent locations"
 DROP POLICY IF EXISTS "Service role can manage geocode cache" ON public.geocode_cache;
 CREATE POLICY "Service role can manage geocode cache"
   ON public.geocode_cache
+  FOR ALL
+  USING ((auth.jwt() ->> 'role') = 'service_role')
+  WITH CHECK ((auth.jwt() ->> 'role') = 'service_role');
+
+-- Route cache is backend-managed through the service role.
+DROP POLICY IF EXISTS "Service role can manage route cache" ON public.route_cache;
+CREATE POLICY "Service role can manage route cache"
+  ON public.route_cache
   FOR ALL
   USING ((auth.jwt() ->> 'role') = 'service_role')
   WITH CHECK ((auth.jwt() ->> 'role') = 'service_role');

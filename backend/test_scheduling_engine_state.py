@@ -950,6 +950,78 @@ def test_empty_edit_operations_uses_fallback_fixed_time_update():
     assert parse_clock(parsed["operations"][0]["fixed_start"]) == parse_clock("12:00 PM")
 
 
+def test_module_a_single_relation_move_is_not_rejected_as_failed_multi_activity():
+    class SingleRelationMoveClient:
+        class models:
+            @staticmethod
+            def generate_content(*args, **kwargs):
+                return ParserJsonResponse(json.dumps({
+                    "intent": "edit",
+                    "reply": "I moved Pharmacy stop after Doctor appointment.",
+                    "transcription": "move pharmacy stop after doctor appointment instantly",
+                    "date": "2026-07-07",
+                    "operations": [{
+                        "op": "update",
+                        "activity_id": "act-pharmacy",
+                        "title": "Pharmacy stop",
+                        "timing_mode": "relative",
+                        "duration_minutes": 15,
+                        "anchor_relation": {
+                            "kind": "after",
+                            "target_title": "Doctor appointment",
+                            "target_activity_id": "act-doctor",
+                        },
+                        "preserve_existing_fields": True,
+                    }],
+                    "activities": [],
+                    "preferences": {},
+                }))
+
+    engine = SchedulingEngine(SingleRelationMoveClient())
+    current_schedule = {
+        "date": "2026-07-07",
+        "activities": [
+            {"id": "act-pharmacy", "title": "Pharmacy stop", "startTime": "08:05 AM", "endTime": "08:20 AM"},
+            {"id": "act-doctor", "title": "Doctor appointment", "startTime": "09:00 AM", "endTime": "10:00 AM"},
+        ],
+    }
+
+    parsed = engine.parse_text_request(
+        "move pharmacy stop after doctor appointment instantly",
+        current_schedule=current_schedule,
+        disable_deterministic_fallback=True,
+        fallback_reason="complex_or_travel_intent",
+    )
+
+    assert parsed["intent"] == "edit"
+    assert parsed.get("_failure_type") != "expected_multi_activity_got_one"
+    assert parsed["operations"][0]["title"] == "Pharmacy stop"
+    assert parsed["operations"][0]["anchor_relation"]["target_title"] == "Doctor appointment"
+
+
+def test_deterministic_relation_move_handles_move_after_wording():
+    engine = SchedulingEngine(Always503ParserClient())
+    current_schedule = {
+        "date": "2026-07-07",
+        "activities": [
+            {"id": "act-pharmacy", "title": "Pharmacy stop", "startTime": "08:05 AM", "endTime": "08:20 AM"},
+            {"id": "act-doctor", "title": "Doctor appointment", "startTime": "09:00 AM", "endTime": "10:00 AM"},
+        ],
+    }
+
+    parsed = engine.parse_text_request(
+        "move pharmacy stop after doctor appointment instantly",
+        current_schedule=current_schedule,
+    )
+
+    assert parsed["_reply_source"] == "deterministic_fallback"
+    assert parsed["operations"][0]["op"] == "update"
+    assert parsed["operations"][0]["title"] == "Pharmacy stop"
+    assert parsed["operations"][0]["timing_mode"] == TimingMode.RELATIVE
+    assert parsed["operations"][0]["anchor_relation"]["kind"] == "after"
+    assert parsed["operations"][0]["anchor_relation"]["target_title"] == "Doctor appointment"
+
+
 def test_pronoun_fixed_time_update_resolves_last_target_from_history():
     engine = SchedulingEngine(Always503ParserClient())
     current_schedule = {
@@ -6706,6 +6778,258 @@ def test_fixed_route_partial_status_requires_renderable_repaired_chronology(monk
     assert updated["schedule_blocks"] == current_blocks
 
 
+def test_allow_clash_route_conflict_returns_renderable_preview(monkeypatch):
+    engine = SchedulingEngine(DummyClient(), travel_service=FakeTravelService(route_minutes=30))
+    current_blocks = [
+        {
+            "id": "focus",
+            "block_type": "activity",
+            "type": "activity",
+            "title": "Focused deep work",
+            "start": "07:00 PM",
+            "end": "10:00 PM",
+            "startTime": "07:00 PM",
+            "endTime": "10:00 PM",
+        },
+    ]
+    repaired_blocks = [
+        {
+            "id": "focus",
+            "block_type": "activity",
+            "type": "activity",
+            "title": "Focused deep work",
+            "start": "07:00 AM",
+            "end": "10:00 AM",
+            "startTime": "07:00 AM",
+            "endTime": "10:00 AM",
+        },
+        {
+            "id": "workshop",
+            "block_type": "activity",
+            "type": "activity",
+            "title": "Workshop",
+            "start": "09:00 AM",
+            "end": "11:30 AM",
+            "startTime": "09:00 AM",
+            "endTime": "11:30 AM",
+        },
+    ]
+    start_route_conflict = {
+        "reason_code": "start_route_blocker",
+        "from_activity": "Focused deep work",
+        "to_activity": "Workshop",
+        "reason": "Focused deep work ends after the leave-by time for route-based travel to Workshop.",
+    }
+    envelope = {
+        "date": "2026-07-07",
+        "status": "ok",
+        "schedule_status": "ok",
+        "allow_clash": True,
+        "accurate_travel_time": True,
+        "preferences": {"allow_clash": True, "accurate_travel_time": True},
+        "activities": current_blocks,
+        "schedule_blocks": current_blocks,
+        "unscheduled_activities": [],
+        "explanations": [],
+    }
+
+    monkeypatch.setattr(engine, "_location_resolution_requests", lambda *args, **kwargs: [])
+    monkeypatch.setattr(engine, "_validate_routes_with_service", lambda *args, **kwargs: {
+        "travel_validation_status": "route_conflict",
+        "schedule_blocks": current_blocks,
+        "route_conflicts": [start_route_conflict],
+        "updated_transition_count": 0,
+    })
+    monkeypatch.setattr(engine, "_attempt_route_repair", lambda *args, **kwargs: {
+        "route_repair_attempted": True,
+        "pending_repair_suggestions": [],
+        "unfit_activities": [],
+        "blocked_activities": [],
+        "travel_validation_status": "partial_feasible_with_fixed_route_conflicts",
+        "route_repair_actions": [{"title": "Focused deep work", "from": "07:00 PM", "to": "07:00 AM"}],
+        "route_efficiency": {},
+        "repaired_envelope": {"activities": repaired_blocks, "schedule_blocks": repaired_blocks, "unscheduled_activities": []},
+        "repaired_validation": {
+            "schedule_blocks": repaired_blocks,
+            "route_conflicts": [start_route_conflict],
+            "updated_transition_count": 0,
+        },
+    })
+
+    updated = engine._apply_accurate_travel_if_requested(envelope, [])
+
+    assert updated["travel_validation_status"] == "partial_feasible_with_fixed_route_conflicts"
+    assert updated["preview_status"] == "partial_feasible_with_fixed_route_conflicts"
+    assert updated["schedule_blocks"] == current_blocks
+    assert updated["preview_schedule"]["schedule_blocks"] == repaired_blocks
+    assert _activity_by_title(updated["preview_schedule"], "Focused deep work")["startTime"] == "07:00 AM"
+
+
+def test_allow_clash_route_repair_rescues_flex_conflicts_before_preserving_clash():
+    engine = SchedulingEngine(DummyClient(), travel_service=FakeTravelService(route_minutes=0))
+    engine._current_route_context = {
+        "enabled": True,
+        "pairs": {},
+        "start_routes": {"id:grocery": {"duration_minutes": 6}},
+    }
+    preferences = {
+        "allow_clash": True,
+        "route_aware_repair": True,
+        "day_start": "07:00 AM",
+        "day_end": "10:00 PM",
+        "min_travel_buffer_minutes": 0,
+    }
+    planned = {"day_start": "07:00 AM", "day_end": "10:00 PM"}
+    planned_activities = [
+        {
+            "id": "doc",
+            "stable_activity_id": "doc",
+            "title": "Document preparation",
+            "scheduled_start": 420,
+            "scheduled_end": 465,
+            "duration_minutes": 45,
+            "timing_mode": TimingMode.RELATIVE,
+            "can_move_for_repair": False,
+            "repair_protection": "derived",
+            "travel_required": False,
+            "location_status": "not_required",
+        },
+        {
+            "id": "grocery",
+            "stable_activity_id": "grocery",
+            "title": "Grocery shopping",
+            "scheduled_start": 420,
+            "scheduled_end": 465,
+            "duration_minutes": 45,
+            "timing_mode": TimingMode.UNSPECIFIED,
+            "can_move_for_repair": True,
+            "repair_protection": "flexible",
+            "is_conflict": True,
+            "conflict_with": ["doc"],
+            "travel_required": True,
+        },
+        {
+            "id": "gym",
+            "stable_activity_id": "gym",
+            "title": "Gym workout",
+            "scheduled_start": 420,
+            "scheduled_end": 510,
+            "duration_minutes": 90,
+            "timing_mode": TimingMode.UNSPECIFIED,
+            "can_move_for_repair": True,
+            "repair_protection": "flexible",
+            "is_conflict": True,
+            "conflict_with": ["doc", "grocery"],
+            "travel_required": False,
+        },
+        {
+            "id": "workshop",
+            "stable_activity_id": "workshop",
+            "title": "Morning workshop",
+            "scheduled_start": 540,
+            "scheduled_end": 690,
+            "duration_minutes": 150,
+            "timing_mode": TimingMode.FIXED,
+            "fixed_start": 540,
+            "fixed_end": 690,
+            "is_user_fixed": True,
+            "can_move_for_repair": False,
+        },
+    ]
+
+    rescued = engine._rescue_auto_movable_route_repair_conflicts(
+        planned_activities,
+        planned,
+        preferences,
+    )
+
+    document = next(item for item in rescued if item["title"] == "Document preparation")
+    grocery = next(item for item in rescued if item["title"] == "Grocery shopping")
+    gym = next(item for item in rescued if item["title"] == "Gym workout")
+
+    assert not grocery.get("is_conflict")
+    assert not gym.get("is_conflict")
+    assert not (grocery["scheduled_start"] < document["scheduled_end"] and grocery["scheduled_end"] > document["scheduled_start"])
+    assert not (gym["scheduled_start"] < document["scheduled_end"] and gym["scheduled_end"] > document["scheduled_start"])
+    assert grocery["scheduled_start"] >= document["scheduled_end"] + 6
+
+
+def test_final_route_validation_accepts_tight_transition_when_route_fits_gap():
+    engine = SchedulingEngine(DummyClient(), travel_service=FakeTravelService(route_minutes=4))
+    dinner = {
+        "id": "dinner",
+        "stable_activity_id": "dinner",
+        "title": "Dinner with family",
+        "startTime": "06:00 PM",
+        "endTime": "07:00 PM",
+        "scheduled_start": 1080,
+        "scheduled_end": 1140,
+        "duration_minutes": 60,
+        "timing_mode": TimingMode.FIXED,
+        "fixed_start": 1080,
+        "fixed_end": 1140,
+        "is_user_fixed": True,
+        "can_move_for_repair": False,
+        "location": "home",
+        "travel_required": True,
+    }
+    gym = {
+        "id": "gym",
+        "stable_activity_id": "gym",
+        "title": "Gym workout",
+        "startTime": "07:05 PM",
+        "endTime": "08:35 PM",
+        "scheduled_start": 1145,
+        "scheduled_end": 1235,
+        "duration_minutes": 90,
+        "timing_mode": TimingMode.FIXED,
+        "fixed_start": 1145,
+        "fixed_end": 1235,
+        "is_user_fixed": True,
+        "can_move_for_repair": False,
+        "location": "gym",
+        "travel_required": True,
+    }
+    transition = {
+        "id": "travel-dinner-gym",
+        "block_type": "transition",
+        "type": "travel",
+        "title": "Travel to gym (Tight)",
+        "start": "07:00 PM",
+        "end": "07:05 PM",
+        "duration_minutes": 5,
+        "route_duration_minutes": 4,
+        "is_tight": True,
+    }
+    original = {
+        "date": "2026-07-07",
+        "preferences": _accurate_preferences(),
+        "activities": [dinner, gym],
+        "schedule_blocks": [
+            {"block_type": "activity", "type": "activity", "start": "06:00 PM", "end": "07:00 PM", **dinner},
+            transition,
+            {"block_type": "activity", "type": "activity", "start": "07:05 PM", "end": "08:35 PM", **gym},
+        ],
+    }
+    route_context = {
+        "enabled": True,
+        "pairs": {"id:dinner->id:gym": {"duration_minutes": 4}},
+        "start_routes": {},
+    }
+
+    validation = engine._final_validate_route_aware_repair(
+        original=original,
+        repaired=deepcopy(original),
+        route_context=route_context,
+    )
+
+    assert not any(
+        conflict.get("from_activity") == "Dinner with family"
+        and conflict.get("to_activity") == "Gym workout"
+        for conflict in validation["route_conflicts"]
+    )
+
+
 def test_relative_derived_materialized_block_stays_recalculable():
     engine = SchedulingEngine(DummyClient(), travel_service=FakeTravelService())
 
@@ -7617,6 +7941,9 @@ def test_chat_accurate_travel_request_validates_current_schedule_without_module_
             ]
             return updated
 
+        def run_manual_scheduler(self, envelope, saved_locations=None, base_version=None, source="manual_button"):
+            return self._apply_accurate_travel_if_requested(envelope, saved_locations or [])
+
     fake_engine = TravelOnlyEngine()
     monkeypatch.setattr(backend_main, "scheduling_engine", fake_engine)
     monkeypatch.setattr(backend_main.database, "get_user_locations", lambda user_id: [])
@@ -7670,6 +7997,9 @@ def test_travel_complete_toggle_runs_readiness_without_creating_plan_or_geocodin
             ]
             return updated
 
+        def run_manual_scheduler(self, envelope, saved_locations=None, base_version=None, source="manual_button"):
+            return self._apply_accurate_travel_if_requested(envelope, saved_locations or [])
+
     fake_engine = ToggleTravelEngine()
     monkeypatch.setattr(backend_main, "scheduling_engine", fake_engine)
     monkeypatch.setattr(backend_main.database, "get_user_locations", lambda user_id: [])
@@ -7711,6 +8041,14 @@ def test_travel_complete_clears_validation_only_dirty_state(monkeypatch):
             updated["schedule_status"] = "ok"
             updated["travel_validation_status"] = "repaired_validated"
             updated["activities"] = envelope["activities"]
+            return updated
+
+        def run_manual_scheduler(self, envelope, saved_locations=None, base_version=None, source="manual_button"):
+            updated = self._apply_accurate_travel_if_requested(envelope, saved_locations or [])
+            updated["needs_reschedule"] = False
+            updated["reschedule_reason"] = None
+            updated["needs_travel_validation"] = False
+            updated["last_rescheduled_at"] = self._now_iso()
             return updated
 
     monkeypatch.setattr(backend_main, "scheduling_engine", ValidatingEngine())
@@ -7762,6 +8100,14 @@ def test_travel_complete_clears_dirty_flags_after_successful_validation(monkeypa
             updated["schedule_status"] = "ok"
             updated["travel_validation_status"] = "repaired_validated"
             updated["activities"] = envelope["activities"]
+            return updated
+
+        def run_manual_scheduler(self, envelope, saved_locations=None, base_version=None, source="manual_button"):
+            updated = self._apply_accurate_travel_if_requested(envelope, saved_locations or [])
+            updated["needs_reschedule"] = False
+            updated["reschedule_reason"] = None
+            updated["needs_travel_validation"] = False
+            updated["last_rescheduled_at"] = self._now_iso()
             return updated
 
     monkeypatch.setattr(backend_main, "scheduling_engine", ValidatingEngine())
@@ -7858,6 +8204,46 @@ def test_module_0_router_classifies_latency_paths():
     assert can_move_lunch_route["use_module_a_llm"] is False
     assert engine.route_chat_request("should I move lunch to 12pm", envelope)["route"] == "planning_advice"
     assert engine.route_chat_request("do you think my schedule is too packed", envelope)["route"] == "planning_advice"
+    assert engine.route_chat_request("can I fit lunch?", envelope)["route"] == "planning_advice"
+    retry_envelope = {
+        **envelope,
+        "unfit_activities": [
+            {
+                "id": "focused-work",
+                "stable_activity_id": "focused-work",
+                "title": "Focused deep work",
+                "duration_minutes": 120,
+                "type": "activity",
+            }
+        ],
+    }
+    refit_focused_work_route = engine.route_chat_request("try to fit the focused deep work", retry_envelope)
+    refit_unfit_route = engine.route_chat_request(
+        "help me to fit in the activities that could not fit, cause now i already allowed clash",
+        retry_envelope,
+    )
+    assert refit_focused_work_route["route"] == "simple_schedule_command"
+    assert refit_focused_work_route["use_deterministic_parser"] is True
+    assert refit_focused_work_route["reason"] == "matched_refit_unfit_request"
+    assert refit_unfit_route["route"] == "simple_schedule_command"
+    assert refit_unfit_route["use_deterministic_parser"] is True
+    assert refit_unfit_route["reason"] == "matched_refit_unfit_request"
+    refit_parsed = engine.parse_deterministic_fast_path(
+        "help me to fit in the activities that could not fit, cause now i already allowed clash",
+        retry_envelope,
+    )
+    assert refit_parsed["operations"][0]["op"] == "optimize_schedule"
+    long_generation_route = engine.route_chat_request(
+        "Plan my day for next Tuesday. I have a fixed morning workshop at MMU Cyberjaya from 9:00 AM to 11:30 AM, and I also have a critical board meeting in KLCC from 11:30 AM to 1:30 PM. Right after that, I need to attend a dental checkup at Sunway Medical Centre from 1:30 PM to 3:00 PM. I still need to fit in 3 hours of focused deep work, a 1.5-hour gym workout, 45 minutes of grocery shopping at DPulze, a 30-minute pharmacy stop right after the dental checkup, 1 hour of family dinner at home, and I must spend 45 minutes preparing documents before the MMU workshop. Please make it realistic with accurate travel time.",
+        {"activities": [], "schedule_blocks": []},
+    )
+    assert long_generation_route["route"] == "complex_schedule_command"
+    assert long_generation_route["use_module_a_llm"] is True
+    long_generation_fast_path = engine.parse_deterministic_fast_path(
+        "Plan my day for next Tuesday. I have a fixed morning workshop at MMU Cyberjaya from 9:00 AM to 11:30 AM, and I also have a critical board meeting in KLCC from 11:30 AM to 1:30 PM. Right after that, I need to attend a dental checkup at Sunway Medical Centre from 1:30 PM to 3:00 PM. I still need to fit in 3 hours of focused deep work, a 1.5-hour gym workout, 45 minutes of grocery shopping at DPulze, a 30-minute pharmacy stop right after the dental checkup, 1 hour of family dinner at home, and I must spend 45 minutes preparing documents before the MMU workshop. Please make it realistic with accurate travel time.",
+        {"activities": [], "schedule_blocks": []},
+    )
+    assert long_generation_fast_path is None
     assert engine.route_chat_request("Generate a busy workday for me with meeting, lunch, gym and grocery", envelope)["route"] == "complex_schedule_command"
     empty_accurate_envelope = {"activities": [], "schedule_blocks": [], "accurate_travel_time": True, "preferences": {"accurate_travel_time": True}}
     generation_with_travel = engine.route_chat_request(
@@ -7876,6 +8262,112 @@ def test_module_0_router_classifies_latency_paths():
     assert new_timed_commitment["use_deterministic_parser"] is False
     assert new_timed_commitment["reason"] == "temporal_schedule_context_use_llm"
     assert engine.route_chat_request("hello", envelope)["route"] == "general_chat"
+
+
+def test_allow_clash_replan_restores_retryable_unfit_items():
+    import main as backend_main
+
+    envelope = {
+        "date": "2026-07-07",
+        "version": 1,
+        "allow_clash": True,
+        "preferences": {"allow_clash": True},
+        "activities": [
+            {
+                "id": "fixed-meeting",
+                "stable_activity_id": "fixed-meeting",
+                "type": "activity",
+                "title": "Fixed meeting",
+                "duration_minutes": 60,
+                "timing_mode": "fixed",
+                "fixed_start": 9 * 60,
+            }
+        ],
+        "unfit_activities": [
+            {
+                "id": "deep-work",
+                "stable_activity_id": "deep-work",
+                "type": "activity",
+                "title": "Focused deep work",
+                "duration_minutes": 120,
+                "timing_mode": "flexible",
+                "scheduled_start": parse_clock("07:00 PM"),
+                "scheduled_end": parse_clock("09:00 PM"),
+                "startTime": "07:00 PM",
+                "endTime": "09:00 PM",
+                "fixed_start": parse_clock("07:00 PM"),
+                "fixed_end": parse_clock("09:00 PM"),
+                "reason": "Could not fit after route-aware repair.",
+                "reason_code": "not_enough_time_after_travel",
+            },
+            {
+                "id": "other-generated-id",
+                "type": "activity",
+                "title": "Focused deep work",
+                "duration_minutes": 60,
+                "timing_mode": "flexible",
+                "reason": "Duplicate stale unfit record.",
+            }
+        ],
+        "unscheduled_activities": [],
+        "optional_skipped": [],
+    }
+
+    restored = backend_main._restore_retryable_items_for_allow_clash(envelope)
+
+    assert [item["title"] for item in restored["activities"]] == ["Fixed meeting", "Focused deep work"]
+    assert restored["activities"][1]["duration_minutes"] == 120
+    assert restored["activities"][1]["status"] == "active"
+    assert restored["activities"][1]["block_type"] == "activity"
+    assert "reason_code" not in restored["activities"][1]
+    assert "scheduled_start" not in restored["activities"][1]
+    assert "startTime" not in restored["activities"][1]
+    assert "fixed_start" not in restored["activities"][1]
+    assert restored["unfit_activities"] == []
+
+
+def test_route_repair_unfit_metadata_preserves_activity_payload():
+    engine = SchedulingEngine(DummyClient())
+    activity = {
+        "id": "focused-work",
+        "stable_activity_id": "focused-work",
+        "title": "Focused deep work",
+        "duration_minutes": 180,
+        "timing_mode": "flexible",
+        "anchor_relation": {"kind": "after", "target_title": "Morning workshop"},
+        "location": "library",
+        "location_label": "library",
+        "resolved_location": {"latitude": 2.9, "longitude": 101.6, "display_name": "Library"},
+        "scheduled_start": parse_clock("07:00 PM"),
+        "scheduled_end": parse_clock("10:00 PM"),
+        "startTime": "07:00 PM",
+        "endTime": "10:00 PM",
+        "fixed_start": parse_clock("07:00 PM"),
+        "fixed_end": parse_clock("10:00 PM"),
+        "status": "unscheduled",
+    }
+
+    unfit_item = engine._route_repair_activity_metadata(
+        activity,
+        reason="Could not fit after route-aware repair.",
+        reason_code="not_enough_time_after_travel",
+        blocking_constraint={"reason_code": "not_enough_time_after_travel"},
+        suggested_resolution=["Schedule another day."],
+    )
+
+    assert unfit_item["stable_activity_id"] == "focused-work"
+    assert unfit_item["id"] == "focused-work"
+    assert unfit_item["activity_id"] == "focused-work"
+    assert unfit_item["duration_minutes"] == 180
+    assert unfit_item["anchor_relation"]["target_title"] == "Morning workshop"
+    assert unfit_item["resolved_location"]["display_name"] == "Library"
+    assert "scheduled_start" not in unfit_item
+    assert "startTime" not in unfit_item
+    assert "fixed_start" not in unfit_item
+
+    stale = {**unfit_item, "duration_minutes": 60, "reason": "Stale fallback"}
+    merged = engine._merged_route_repair_item(unfit_item, stale)
+    assert merged["duration_minutes"] == 180
 
 
 def _tuesday_travel_prompt():

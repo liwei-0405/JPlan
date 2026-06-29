@@ -314,6 +314,8 @@ class ModuleAParserMixin:
         clean = clean_title(latest_request or "")
         if not clean:
             return False
+        if self._request_is_single_edit_command(latest_request):
+            return False
         preferences = (current_schedule or {}).get("preferences") or {}
         if bool((current_schedule or {}).get("travel_intent") or preferences.get("travel_intent")):
             return True
@@ -347,6 +349,7 @@ class ModuleAParserMixin:
             return False
         atomic_patterns = (
             r"^(?:move|shift|change|update)\s+.+\s+to\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?$",
+            r"^(?:move|shift|change|update)\s+.+\s+(?:right\s+after|right\s+before|after|before)\s+.+$",
             r"^(?:remove|delete|cancel)\s+.+$",
             r"^set\s+.+\s+priority\s+(?:low|medium|high)$",
             r"^(?:put|place|arrange|rearrange)\s+.+\s+(?:right\s+after|right\s+before|after|before)\s+.+$",
@@ -362,6 +365,8 @@ class ModuleAParserMixin:
     ) -> Optional[str]:
         if not self._request_is_complex_or_travel_intent(latest_request, None):
             return None
+        if self._request_is_single_edit_command(latest_request):
+            return None
         operations = [
             item for item in list(parsed.get("operations") or []) + list(parsed.get("activities") or [])
             if isinstance(item, dict) and clean_title(item.get("op") or "add") not in {"remove", "shift_plan_date"}
@@ -375,6 +380,14 @@ class ModuleAParserMixin:
             if self._operation_title_looks_like_giant_prompt(title, latest_request):
                 return "giant_title_or_complex_fallback"
         return None
+
+    def _request_is_single_edit_command(self, latest_request: str) -> bool:
+        clean = clean_title(latest_request or "")
+        if not clean:
+            return False
+        if re.match(r"^(?:move|shift|change|update|put|place|arrange|rearrange|set)\b", clean):
+            return True
+        return bool(re.search(r"\b(?:move|shift|change|update)\s+.+\s+(?:after|before|to)\b", clean))
 
     def _expected_multi_activity_count(self, latest_request: str) -> int:
         clean = clean_title(latest_request or "")
@@ -876,7 +889,7 @@ class ModuleAParserMixin:
             }
 
         if parsed is None:
-            parsed = self._fallback_parse_optimize_request(request, schedule_date)
+            parsed = self._fallback_parse_optimize_request(request, schedule_date, current_schedule)
 
         if parsed is None:
             parsed = self._fallback_parse_arrange_relation(request, schedule_date, current_schedule)
@@ -928,10 +941,12 @@ class ModuleAParserMixin:
         self._last_fast_path_fallback_reason = None
         pre_skip_reason = self._fast_path_natural_edit_skip_reason(latest_request)
         if pre_skip_reason:
-            self._last_fast_path_fallback_reason = pre_skip_reason
-            jlog("FAST_PATH", f"reason={pre_skip_reason}", "SKIP_TO_MODULE_A")
-            jlog("TIMER", f"module_a_fast_path_seconds={time.perf_counter() - started:.2f}", None)
-            return None
+            schedule_date = (current_schedule or {}).get("date") or self._local_today_iso()
+            if not self._fallback_parse_optimize_request(latest_request, schedule_date, current_schedule):
+                self._last_fast_path_fallback_reason = pre_skip_reason
+                jlog("FAST_PATH", f"reason={pre_skip_reason}", "SKIP_TO_MODULE_A")
+                jlog("TIMER", f"module_a_fast_path_seconds={time.perf_counter() - started:.2f}", None)
+                return None
         parsed = self._deterministic_fallback_parse(
             latest_request=latest_request,
             current_schedule=current_schedule,
@@ -951,13 +966,22 @@ class ModuleAParserMixin:
             jlog("MODULE_A", "deterministic_fast_path matched simple pattern", "FAST_PATH")
         return parsed
 
-    def _fallback_parse_optimize_request(self, request: str, schedule_date: str) -> Optional[Dict[str, Any]]:
+    def _fallback_parse_optimize_request(
+        self,
+        request: str,
+        schedule_date: str,
+        current_schedule: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
         text = clean_title(request)
-        if not re.search(r"\b(?:optimi[sz]e|regenerate|rebuild)\b.*\b(?:schedule|plan|day)\b|\bmake\s+(?:the\s+)?(?:schedule|plan|day)\s+better\b", text):
+        refit_unfit_request = self._is_refit_unfit_request(text, current_schedule)
+        if not (
+            re.search(r"\b(?:optimi[sz]e|regenerate|rebuild)\b.*\b(?:schedule|plan|day)\b|\bmake\s+(?:the\s+)?(?:schedule|plan|day)\s+better\b", text)
+            or refit_unfit_request
+        ):
             return None
         return {
             "intent": "edit",
-            "reply": "I understood this as optimizing the current schedule.",
+            "reply": "I understood this as trying to fit the current schedule items." if refit_unfit_request else "I understood this as optimizing the current schedule.",
             "transcription": request,
             "date": schedule_date,
             "operations": [{
@@ -1199,7 +1223,7 @@ class ModuleAParserMixin:
         current_schedule: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         pattern = re.compile(
-            r"\b(?:arrange|rearrange|put|place|make|set)\s+(?:the\s+|my\s+)?(?P<title>.+?)\s+"
+            r"\b(?:arrange|rearrange|put|place|make|set|move|shift|change|update)\s+(?:the\s+|my\s+)?(?P<title>.+?)\s+"
             r"(?P<kind>after|before|right\s+after|right\s+before)\s+(?:the\s+|my\s+)?(?P<anchor>.+?)(?:\.|$)",
             re.IGNORECASE,
         )
@@ -1227,7 +1251,10 @@ class ModuleAParserMixin:
         raw_anchor = self._clean_fallback_activity_title(match.group("anchor"))
         if not raw_title or not raw_anchor:
             return None
+        explicit_move = bool(re.match(r"^(?:move|shift|change|update)\b", clean_title(request)))
         title, target_exists = self._resolve_fast_path_title(raw_title, current_schedule)
+        if explicit_move and not target_exists:
+            return None
         if not target_exists:
             title = self._clean_fast_path_new_activity_title(title_without_duration)
         if before_title and title and before_title != title:
@@ -1603,7 +1630,7 @@ class ModuleAParserMixin:
         return None
 
     def _clean_fallback_activity_title(self, value: str) -> str:
-        text = re.sub(r"\b(right|quick|my|the|a|an)\b", " ", value or "", flags=re.IGNORECASE)
+        text = re.sub(r"\b(right|quick|my|the|a|an|instantly|immediately|now|please)\b", " ", value or "", flags=re.IGNORECASE)
         text = re.sub(r"\s+", " ", text).strip(" .")
         return text.title() if text else ""
 

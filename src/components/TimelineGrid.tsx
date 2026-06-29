@@ -23,6 +23,12 @@ type RouteWarningGroup = {
   conflictKeys: Set<string>;
 };
 
+type ActivitySupportBundle = {
+  activity: ActivityBlock;
+  before: ActivityBlock[];
+  after: ActivityBlock[];
+};
+
 type TimelineGridProps = {
   activities: ActivityBlock[];
   /** If true, clicking an activity fires onActivityClick */
@@ -147,7 +153,18 @@ function CollisionGroupRow({
   compact: boolean;
   editableBuffers: boolean;
 }) {
-  const isCollision = group.activities.length > 1 || group.activities.some((activity) => activity.isConflict);
+  const visibleGroupBlocks = group.activities.filter((activity) => getTimelineBlockKind(activity) !== "free_time");
+  const activityBlocks = visibleGroupBlocks
+    .filter((activity) => getTimelineBlockKind(activity) === "activity")
+    .sort((a, b) => timeToMinutes(a.startTime || a.start || "00:00") - timeToMinutes(b.startTime || b.start || "00:00"));
+  const supportBlocks = visibleGroupBlocks
+    .filter((activity) => getTimelineBlockKind(activity) !== "activity")
+    .sort((a, b) => timeToMinutes(a.startTime || a.start || "00:00") - timeToMinutes(b.startTime || b.start || "00:00"));
+  const supportBundles = useMemo(
+    () => buildSupportBundles(activityBlocks, supportBlocks),
+    [activityBlocks, supportBlocks],
+  );
+  const isCollision = group.activities.length > 1 || (supportBlocks.length > 0 && group.activities.some((activity) => activity.isConflict));
 
   if (!isCollision) {
     const act = group.activities[0];
@@ -169,7 +186,7 @@ function CollisionGroupRow({
     return (
       <ActivityCard
         activity={act}
-        isClashing={Boolean(act.isConflict)}
+        isClashing={false}
         interactive={interactive}
         onActivityClick={onActivityClick}
         showEditIcon={showEditIcon}
@@ -180,7 +197,7 @@ function CollisionGroupRow({
   }
 
   const groupDuration = group.groupEnd - group.groupStart;
-  const mainActivityCount = group.activities.filter((act) => getTimelineBlockKind(act) === "activity").length;
+  const mainActivityCount = activityBlocks.length;
   const containerHeight = Math.max(
     MIN_BLOCK_HEIGHT,
     groupDuration * PIXELS_PER_MINUTE,
@@ -213,107 +230,297 @@ function CollisionGroupRow({
         </span>
       </div>
 
-      {shouldAlignActivityClashCards ? (
-        <div
-          className="grid gap-3 overflow-x-auto pb-2 -mx-2 px-2 no-scrollbar"
-          style={{
-            gridTemplateColumns: `repeat(${group.activities.length}, minmax(190px, 1fr))`,
-          }}
-        >
-          {group.activities.map((act) => {
-            const blockKind = getTimelineBlockKind(act);
-
-            if (blockKind === "free_time") {
-              return null;
-            }
-            if (blockKind !== "activity") {
-              return (
-                <SupportTimelineBlock
-                  key={act.id || act.title}
-                  activity={act}
-                  kind={blockKind}
-                  interactive={editableBuffers && blockKind === "buffer" && interactive}
-                  onClick={onActivityClick}
-                />
-              );
-            }
-
-            return (
-              <ActivityCard
-                key={act.id || act.title}
-                activity={act}
+      {activityBlocks.length > 0 ? (
+        <>
+          <div
+            className="grid gap-3 overflow-x-auto pb-2 -mx-2 px-2 no-scrollbar"
+            style={{
+              gridTemplateColumns: shouldAlignActivityClashCards
+                ? `repeat(${activityBlocks.length}, minmax(190px, 1fr))`
+                : `repeat(${activityBlocks.length}, minmax(${MIN_CELL_WIDTH}px, 1fr))`,
+              minHeight: shouldAlignActivityClashCards ? undefined : `${containerHeight}px`,
+            }}
+          >
+            {supportBundles.bundles.map((bundle) => (
+              <ActivityBundleCard
+                key={bundle.activity.id || bundle.activity.title}
+                bundle={bundle}
                 isClashing={true}
                 interactive={interactive}
                 onActivityClick={onActivityClick}
                 showEditIcon={showEditIcon}
                 compact={compact}
-                heightPx={undefined}
+                editableBuffers={editableBuffers}
               />
-            );
-          })}
-        </div>
+            ))}
+          </div>
+          {supportBundles.unassigned.length > 0 && (
+            <SupportStack
+              blocks={supportBundles.unassigned}
+              interactive={interactive}
+              editableBuffers={editableBuffers}
+              onActivityClick={onActivityClick}
+            />
+          )}
+        </>
       ) : (
-        <div
-          className="overflow-x-auto pb-2 -mx-2 px-2 no-scrollbar"
-          style={{
-            display: "grid",
-            gridTemplateColumns: `repeat(${group.activities.length}, minmax(${MIN_CELL_WIDTH}px, 1fr))`,
-            gap: "12px",
-            minHeight: `${containerHeight}px`,
-          }}
-        >
-          {group.activities.map((act) => {
-            const blockKind = getTimelineBlockKind(act);
-            const dur = getDurationMinutes(act);
-            const blockHeight = Math.max(
-              MIN_BLOCK_HEIGHT,
-              (dur / groupDuration) * containerHeight
-            );
-
-            const stStr = act.startTime || act.start || "00:00";
-            const actStart = timeToMinutes(stStr);
-            let normalizedStart = actStart - group.groupStart;
-            if (normalizedStart < 0) normalizedStart += 24 * 60;
-            const topOffset = (normalizedStart / groupDuration) * containerHeight;
-
-            if (blockKind === "free_time") {
-              return null;
-            }
-            if (blockKind !== "activity") {
-              return (
-                <div key={act.id || act.title} style={{ position: "relative", height: `${containerHeight}px` }}>
-                  <div style={{ position: "absolute", top: `${topOffset}px`, width: "100%" }}>
-                    <SupportTimelineBlock
-                      activity={act}
-                      kind={blockKind}
-                      interactive={editableBuffers && blockKind === "buffer" && interactive}
-                      onClick={onActivityClick}
-                    />
-                  </div>
-                </div>
-              );
-            }
-
-            return (
-              <div key={act.id || act.title} style={{ position: "relative", height: `${containerHeight}px` }}>
-                <div style={{ position: "absolute", top: `${topOffset}px`, width: "100%", height: `${blockHeight}px` }}>
-                  <ActivityCard
-                    activity={act}
-                    isClashing={true}
-                    interactive={interactive}
-                    onActivityClick={onActivityClick}
-                    showEditIcon={showEditIcon}
-                    compact={compact}
-                    heightPx={blockHeight}
-                  />
-                </div>
-              </div>
-            );
-          })}
-        </div>
+        <SupportStack
+          blocks={supportBlocks}
+          interactive={interactive}
+          editableBuffers={editableBuffers}
+          onActivityClick={onActivityClick}
+        />
       )}
     </div>
   );
+}
+
+function ActivityBundleCard({
+  bundle,
+  isClashing,
+  interactive,
+  onActivityClick,
+  showEditIcon,
+  compact,
+  editableBuffers,
+}: {
+  bundle: ActivitySupportBundle;
+  isClashing: boolean;
+  interactive: boolean;
+  onActivityClick?: (activity: ActivityBlock) => void;
+  showEditIcon: boolean;
+  compact: boolean;
+  editableBuffers: boolean;
+}) {
+  return (
+    <div className="min-w-0 space-y-1.5 rounded-2xl border border-slate-200 bg-slate-50/65 p-2">
+      {bundle.before.map((support) => {
+        const kind = getTimelineBlockKind(support);
+        if (kind === "activity" || kind === "free_time") return null;
+        return (
+          <SupportTimelineBlock
+            key={support.id || `${support.title}-${support.startTime || support.start}`}
+            activity={support}
+            kind={kind}
+            compact
+            interactive={editableBuffers && kind === "buffer" && interactive}
+            onClick={onActivityClick}
+          />
+        );
+      })}
+      <ActivityCard
+        activity={bundle.activity}
+        isClashing={isClashing}
+        interactive={interactive}
+        onActivityClick={onActivityClick}
+        showEditIcon={showEditIcon}
+        compact={compact}
+        heightPx={undefined}
+      />
+      {bundle.after.map((support) => {
+        const kind = getTimelineBlockKind(support);
+        if (kind === "activity" || kind === "free_time") return null;
+        return (
+          <SupportTimelineBlock
+            key={support.id || `${support.title}-${support.startTime || support.start}`}
+            activity={support}
+            kind={kind}
+            compact
+            interactive={editableBuffers && kind === "buffer" && interactive}
+            onClick={onActivityClick}
+          />
+        );
+      })}
+    </div>
+  );
+}
+
+function SupportStack({
+  blocks,
+  interactive,
+  editableBuffers,
+  onActivityClick,
+}: {
+  blocks: ActivityBlock[];
+  interactive: boolean;
+  editableBuffers: boolean;
+  onActivityClick?: (activity: ActivityBlock) => void;
+}) {
+  if (!blocks.length) return null;
+
+  return (
+    <div className="mt-2 space-y-1.5 rounded-xl border border-slate-200 bg-slate-50/70 p-2">
+      {blocks.map((act) => {
+        const blockKind = getTimelineBlockKind(act);
+        if (blockKind === "activity" || blockKind === "free_time") return null;
+        return (
+          <SupportTimelineBlock
+            key={act.id || `${act.title}-${act.startTime || act.start}`}
+            activity={act}
+            kind={blockKind}
+            compact
+            interactive={editableBuffers && blockKind === "buffer" && interactive}
+            onClick={onActivityClick}
+          />
+        );
+      })}
+    </div>
+  );
+}
+
+function buildSupportBundles(
+  activities: ActivityBlock[],
+  supports: ActivityBlock[],
+): { bundles: ActivitySupportBundle[]; unassigned: ActivityBlock[] } {
+  const bundles = activities.map((activity) => ({
+    activity,
+    before: [] as ActivityBlock[],
+    after: [] as ActivityBlock[],
+  }));
+  const unassigned: ActivityBlock[] = [];
+  const attachWindowMinutes = 45;
+
+  for (const support of supports) {
+    const supportBounds = blockBounds(support);
+    const relatedTarget = relatedSupportTarget(support, bundles);
+    if (relatedTarget) {
+      bundles[relatedTarget.index][relatedTarget.side].push(support);
+      continue;
+    }
+
+    let best:
+      | { index: number; side: "before" | "after"; score: number }
+      | null = null;
+    let bestOverlap:
+      | { index: number; side: "before" | "after"; score: number }
+      | null = null;
+
+    bundles.forEach((bundle, index) => {
+      const activityBounds = blockBounds(bundle.activity);
+      if (!activityBounds || !supportBounds) return;
+
+      const gapBefore = activityBounds.start - supportBounds.end;
+      const gapAfter = supportBounds.start - activityBounds.end;
+      const overlap = Math.min(activityBounds.end, supportBounds.end) - Math.max(activityBounds.start, supportBounds.start);
+
+      if (gapBefore >= 0 && gapBefore <= attachWindowMinutes) {
+        const candidate = { index, side: "before" as const, score: gapBefore };
+        if (!best || candidate.score < best.score) best = candidate;
+      }
+      if (gapAfter >= 0 && gapAfter <= attachWindowMinutes) {
+        const candidate = { index, side: "after" as const, score: gapAfter };
+        if (!best || candidate.score < best.score) best = candidate;
+      }
+      if (overlap > 0) {
+        const supportMidpoint = supportBounds.start + (supportBounds.end - supportBounds.start) / 2;
+        const activityMidpoint = activityBounds.start + (activityBounds.end - activityBounds.start) / 2;
+        const side = supportMidpoint <= activityMidpoint ? "before" : "after";
+        const candidate = { index, side, score: overlap };
+        if (!bestOverlap || candidate.score > bestOverlap.score) bestOverlap = candidate;
+      }
+    });
+
+    best = best || bestOverlap;
+    if (!best) {
+      unassigned.push(support);
+      continue;
+    }
+    bundles[best.index][best.side].push(support);
+  }
+
+  const sortSupports = (items: ActivityBlock[]) => items.sort(
+    (a, b) => timeToMinutes(a.startTime || a.start || "00:00") - timeToMinutes(b.startTime || b.start || "00:00"),
+  );
+  for (const bundle of bundles) {
+    bundle.before = sortSupports(bundle.before);
+    bundle.after = sortSupports(bundle.after);
+  }
+
+  return { bundles, unassigned: sortSupports(unassigned) };
+}
+
+function relatedSupportTarget(
+  support: ActivityBlock,
+  bundles: ActivitySupportBundle[],
+): { index: number; side: "before" | "after" } | null {
+  const supportBounds = blockBounds(support);
+  const directCandidates = supportRelationCandidates(support);
+  for (const candidate of directCandidates) {
+    const index = bundles.findIndex((bundle) => activityMatchesRelation(bundle.activity, candidate.key));
+    if (index < 0) continue;
+    return {
+      index,
+      side: candidate.side || sideRelativeToActivity(supportBounds, blockBounds(bundles[index].activity)),
+    };
+  }
+
+  const relatedIds = Array.isArray((support as ActivityBlock & { related_activity_ids?: unknown[] }).related_activity_ids)
+    ? (support as ActivityBlock & { related_activity_ids?: unknown[] }).related_activity_ids || []
+    : [];
+  let best:
+    | { index: number; side: "before" | "after"; score: number }
+    | null = null;
+  for (const relatedId of relatedIds) {
+    const index = bundles.findIndex((bundle) => activityMatchesRelation(bundle.activity, String(relatedId)));
+    if (index < 0) continue;
+    const activityBounds = blockBounds(bundles[index].activity);
+    if (!supportBounds || !activityBounds) continue;
+    const gapBefore = Math.abs(activityBounds.start - supportBounds.end);
+    const gapAfter = Math.abs(supportBounds.start - activityBounds.end);
+    const side = gapBefore <= gapAfter ? "before" : "after";
+    const score = Math.min(gapBefore, gapAfter);
+    if (!best || score < best.score) best = { index, side, score };
+  }
+  return best ? { index: best.index, side: best.side } : null;
+}
+
+function supportRelationCandidates(support: ActivityBlock): Array<{ key: string; side?: "before" | "after" }> {
+  const raw = support as ActivityBlock & {
+    related_activity_id?: string;
+    activity_id?: string;
+    from_activity?: string;
+    from_title?: string;
+    from?: string;
+    to_activity?: string;
+    to_title?: string;
+    to?: string;
+  };
+  return [
+    { key: raw.related_activity_id || raw.activity_id || "" },
+    { key: raw.from_activity || raw.from_title || raw.from || "", side: "after" as const },
+    { key: raw.to_activity || raw.to_title || raw.to || "", side: "before" as const },
+  ].filter((candidate) => normalizedBlockText(candidate.key));
+}
+
+function activityMatchesRelation(activity: ActivityBlock, key: string): boolean {
+  const normalizedKey = normalizedBlockText(key);
+  if (!normalizedKey) return false;
+  return [
+    activity.id,
+    activity.stable_activity_id,
+    (activity as ActivityBlock & { activity_id?: string }).activity_id,
+    activity.title,
+  ].some((value) => normalizedBlockText(value) === normalizedKey);
+}
+
+function sideRelativeToActivity(
+  supportBounds: { start: number; end: number } | null,
+  activityBounds: { start: number; end: number } | null,
+): "before" | "after" {
+  if (!supportBounds || !activityBounds) return "after";
+  const gapBefore = Math.abs(activityBounds.start - supportBounds.end);
+  const gapAfter = Math.abs(supportBounds.start - activityBounds.end);
+  return gapBefore <= gapAfter ? "before" : "after";
+}
+
+function blockBounds(block: ActivityBlock): { start: number; end: number } | null {
+  const rawStart = block.startTime || block.start;
+  const rawEnd = block.endTime || block.end;
+  if (!rawStart || !rawEnd) return null;
+  const start = timeToMinutes(rawStart);
+  let end = timeToMinutes(rawEnd);
+  if (end <= start && rawEnd !== "00:00") end += 24 * 60;
+  return { start, end };
 }
 
 function RouteWarningGroupRow({
@@ -786,11 +993,13 @@ function shouldPreferSupportBlock(candidate: ActivityBlock, existing: ActivityBl
 function SupportTimelineBlock({
   activity,
   kind,
+  compact = false,
   interactive = false,
   onClick,
 }: {
   activity: ActivityBlock;
   kind: Exclude<TimelineBlockKind, "activity" | "free_time">;
+  compact?: boolean;
   interactive?: boolean;
   onClick?: (activity: ActivityBlock) => void;
 }) {
@@ -849,14 +1058,14 @@ function SupportTimelineBlock({
         }
       } : undefined}
       style={{
-        borderRadius: "10px",
+        borderRadius: compact ? "8px" : "10px",
         border: "1px solid",
         ...bgStyle,
-        padding: "8px 12px",
+        padding: compact ? "6px 9px" : "8px 12px",
         display: "flex",
         alignItems: "center",
         justifyContent: "space-between",
-        gap: "12px",
+        gap: compact ? "8px" : "12px",
         boxShadow: "0 1px 3px rgba(0,0,0,0.05)",
         cursor: interactive ? "pointer" : "default",
       }}
@@ -865,7 +1074,7 @@ function SupportTimelineBlock({
         <Icon size={13} style={{ flexShrink: 0, color: accentColor }} />
         <span
           style={{
-            fontSize: "12.5px",
+            fontSize: compact ? "11.5px" : "12.5px",
             fontWeight: 500,
             color: kind === "route_conflict" ? "#b91c1c" : "#374151",
             overflow: "hidden",
@@ -879,7 +1088,7 @@ function SupportTimelineBlock({
       </div>
       <span
         style={{
-          fontSize: "11.5px",
+          fontSize: compact ? "11px" : "11.5px",
           color: "#6b7280",
           whiteSpace: "nowrap",
           flexShrink: 0,

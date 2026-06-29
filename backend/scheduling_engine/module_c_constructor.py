@@ -1554,6 +1554,18 @@ class ModuleCConstructorMixin:
                 item.get("earliest_start") or day_start,
                 day_start
             )
+            if item_requires_travel and previous_real_item is None:
+                start_entry = self._route_context_start_entry(item)
+                if start_entry:
+                    start_route_minutes = int(start_entry.get("duration_minutes") or 0)
+                    previous_blocker_end = max(
+                        [day_start] + [
+                            int(entry.get("scheduled_end") or day_start)
+                            for entry in timeline[:index]
+                            if entry.get("scheduled_end") is not None
+                        ]
+                    )
+                    candidate_start = max(candidate_start, previous_blocker_end + start_route_minutes)
             preferred_start = item.get("preferred_start")
             if (
                 preferred_start is not None

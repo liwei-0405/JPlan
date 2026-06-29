@@ -34,6 +34,7 @@ export type ChatResponse = {
     full_schedule?: DailySchedule;
     schedule_data?: DailySchedule;
     transcription?: string;
+    performance_summary?: Record<string, unknown>;
 };
 
 /**

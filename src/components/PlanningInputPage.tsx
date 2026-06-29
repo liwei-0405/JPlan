@@ -68,7 +68,7 @@ import {
 } from "../utils/scheduleDisplayUtils";
 import { formatDurationMinutes } from "../utils/durationUtils";
 
-const CHAT_INPUT_MAX_LENGTH = 500;
+const CHAT_INPUT_MAX_LENGTH = 1000;
 
 function compactSpeechParts(parts: string[]): string {
   return parts.reduce((current, rawPart) => {
@@ -191,8 +191,17 @@ function hasRouteRepairPreview(schedule?: DailySchedule | null): boolean {
   return Boolean(schedule?.preview_id && schedule.preview_schedule);
 }
 
+function previewCanCommitLocally(status: string): boolean {
+  return status === "partial_feasible_with_unfit"
+    || status === "partial_feasible_with_fixed_route_conflicts"
+    || status === "repaired_validated";
+}
+
 function routePreviewStatus(schedule?: DailySchedule | null): string {
-  return String(schedule?.preview_status || schedule?.preview_schedule?.travel_validation_status || "");
+  const nestedStatus = String(schedule?.preview_schedule?.travel_validation_status || "");
+  const outerStatus = String(schedule?.preview_status || "");
+  if (previewCanCommitLocally(nestedStatus)) return nestedStatus;
+  return outerStatus || nestedStatus;
 }
 
 function clearRouteRepairPreview<T extends DailySchedule>(schedule: T): T {
@@ -264,12 +273,6 @@ function displayScheduleForTimeline(schedule: DailySchedule): DailySchedule {
     blocked_activities: preview.blocked_activities || schedule.blocked_activities || [],
     unscheduled_activities: preview.unscheduled_activities || schedule.unscheduled_activities || [],
   };
-}
-
-function previewCanCommitLocally(status: string): boolean {
-  return status === "partial_feasible_with_unfit"
-    || status === "partial_feasible_with_fixed_route_conflicts"
-    || status === "repaired_validated";
 }
 
 function isFixedOrProtectedActivityBlock(block: Partial<ActivityBlock>): boolean {
@@ -1114,6 +1117,37 @@ export function PlanningInputPage({
       || previewSchedule?.needs_travel_validation
     )
   );
+  const hasUnfitItemsToRetry = Boolean(
+    (previewSchedule?.unfit_activities || []).length
+    || (previewSchedule?.unscheduled_activities || []).length
+    || (previewSchedule?.optional_skipped || []).length
+    || (activeDisplaySchedule?.unfit_activities || []).length
+    || (activeDisplaySchedule?.unscheduled_activities || []).length
+    || (activeDisplaySchedule?.optional_skipped || []).length
+  );
+
+  const handleAllowClashToggle = (nextAllowClash: boolean) => {
+    setAllowClash(nextAllowClash);
+    if (!nextAllowClash || !previewSchedule || !hasSchedulableItems || !hasUnfitItemsToRetry) return;
+    setPreviewSchedule(prev => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        allow_clash: true,
+        planning_mode: "clash_allowed",
+        preferences: {
+          ...(prev.preferences || {}),
+          allow_clash: true,
+          planning_mode: "clash_allowed",
+        },
+        needs_reschedule: true,
+        reschedule_reason: "allow_clash_changed",
+        draft_dirty: true,
+        has_unsaved_draft: true,
+        active_view: "jplan",
+      };
+    });
+  };
   const showRunSchedulerButton = showDirtyRerunState;
   const repairSuggestionHasChange = (suggestion: RepairSuggestion) => {
     if (suggestion.would_change === false) return false;
@@ -1598,7 +1632,7 @@ export function PlanningInputPage({
       return;
     }
     setIsProcessing(true);
-    setProgressSteps(["Checking travel and buffer time...", "Preparing explanation..."]);
+    setProgressSteps(["Running scheduler with accurate travel time...", "Checking travel and buffer time...", "Preparing explanation..."]);
     setActiveProgressIndex(0);
     try {
       const scheduleWithPrefs = withPlanningPreferences(previewSchedule);
@@ -1683,6 +1717,26 @@ export function PlanningInputPage({
       || timingMode === "fixed";
   };
 
+  const shouldPreserveCommittedTime = (candidate: Partial<ActivityBlock>, committed: Partial<ActivityBlock>) => {
+    const candidateTimingMode = String(candidate.timing_mode || "").toLowerCase();
+    const candidateProtection = String(candidate.repair_protection || "").toLowerCase();
+    const committedTimingMode = String(committed.timing_mode || "").toLowerCase();
+    const committedProtection = String(committed.repair_protection || "").toLowerCase();
+    const candidateIsUserLocked = Boolean(
+      candidate.is_user_fixed
+      || candidate.user_fixed_start != null
+      || (candidateTimingMode === "fixed" && candidate.fixed_start != null)
+      || ["fixed", "protected_social"].includes(candidateProtection)
+    );
+    const committedIsUserLocked = Boolean(
+      committed.is_user_fixed
+      || committed.user_fixed_start != null
+      || (committedTimingMode === "fixed" && committed.fixed_start != null)
+      || ["fixed", "protected_social"].includes(committedProtection)
+    );
+    return candidateIsUserLocked && committedIsUserLocked;
+  };
+
   const blockIdentity = (block: Partial<ActivityBlock>) => (
     String(block.stable_activity_id || block.id || block.title || "").trim().toLowerCase()
   );
@@ -1695,7 +1749,7 @@ export function PlanningInputPage({
     );
     return (candidate || []).map(block => {
       const committedBlock = committedByKey.get(blockIdentity(block));
-      if (!committedBlock) return block;
+      if (!committedBlock || !shouldPreserveCommittedTime(block, committedBlock)) return block;
       return {
         ...block,
         start: committedBlock.start || committedBlock.startTime,
@@ -2505,7 +2559,7 @@ export function PlanningInputPage({
                           label="Allow clash"
                           checked={allowClash}
                           disabled={isScheduleBusy}
-                          onCheckedChange={setAllowClash}
+                          onCheckedChange={handleAllowClashToggle}
                           tooltip={allowClash
                             ? "Keeps user-requested overlaps and marks them clearly instead of blocking the draft."
                             : "Only feasible schedules will be committed unless you allow clashes."}

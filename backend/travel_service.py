@@ -200,6 +200,7 @@ class TravelService:
             "route_api_calls": 0,
             "route_cache_hits": 0,
             "route_cache_misses": 0,
+            "route_persistent_cache_hits": 0,
             "route_fetch_seconds": 0.0,
             "geocode_seconds": 0.0,
         }
@@ -211,6 +212,7 @@ class TravelService:
             _env_float("NOMINATIM_MIN_INTERVAL_SECONDS", DEFAULT_NOMINATIM_MIN_INTERVAL_SECONDS),
         )
         self.geocode_cache_ttl_days = _env_int("GEOCODE_CACHE_TTL_DAYS", 30)
+        self.route_cache_ttl_days = _env_int("ROUTE_CACHE_TTL_DAYS", 30)
         self.nominatim_user_agent = (
             os.getenv("JPLAN_NOMINATIM_USER_AGENT")
             or "JPlan-FYP/1.0 (location search; contact: local-development)"
@@ -224,6 +226,7 @@ class TravelService:
             "route_api_calls": 0,
             "route_cache_hits": 0,
             "route_cache_misses": 0,
+            "route_persistent_cache_hits": 0,
             "route_fetch_seconds": 0.0,
             "geocode_seconds": 0.0,
         }
@@ -609,6 +612,22 @@ class TravelService:
         if key in self.route_cache:
             self.route_stats["route_cache_hits"] = int(self.route_stats.get("route_cache_hits") or 0) + 1
             return self.route_cache[key]
+
+        persisted_minutes = database.get_route_cache(
+            key[0],
+            key[1],
+            key[2],
+            key[3],
+            transport_mode=transport_mode,
+            time_bucket=time_bucket,
+        )
+        if persisted_minutes is not None:
+            minutes = max(1, int(persisted_minutes))
+            self.route_cache[key] = minutes
+            self.route_stats["route_cache_hits"] = int(self.route_stats.get("route_cache_hits") or 0) + 1
+            self.route_stats["route_persistent_cache_hits"] = int(self.route_stats.get("route_persistent_cache_hits") or 0) + 1
+            return minutes
+
         self.route_stats["route_cache_misses"] = int(self.route_stats.get("route_cache_misses") or 0) + 1
 
         body = {
@@ -645,6 +664,16 @@ class TravelService:
             raise TravelServiceError("ORS response did not include a route duration")
         minutes = max(1, int(round(float(duration_seconds) / 60.0)))
         self.route_cache[key] = minutes
+        database.save_route_cache(
+            key[0],
+            key[1],
+            key[2],
+            key[3],
+            minutes,
+            transport_mode=transport_mode,
+            time_bucket=time_bucket,
+            ttl_days=self.route_cache_ttl_days,
+        )
         return minutes
 
 

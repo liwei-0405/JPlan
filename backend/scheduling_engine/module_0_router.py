@@ -29,7 +29,7 @@ class AdvisoryLLMExecutorSaturatedError(RuntimeError):
 class Module0RouterMixin:
     _ROUTER_ACTIVITY_PATTERN = (
         r"\b(?:lunch|dinner|breakfast|coffee(?:\s+break)?|meeting|seminar|class|gym|workout|"
-        r"shopping|grocery|groceries|fyp|study|project|plan|schedule)\b"
+        r"shopping|grocery|groceries|fyp|study|project|work|deep\s+work|focused\s+work|plan|schedule)\b"
     )
     _ROUTER_ACTION_PATTERN = (
         r"\b(?:move|update|change|shift|add|schedule|remove|delete|cancel|arrange|rearrange|put|place|set|fit|"
@@ -53,6 +53,35 @@ class Module0RouterMixin:
         has_clock_time = bool(re.search(r"\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b", clean or ""))
         has_duration = bool(re.search(r"\b\d+(?:\.\d+)?\s*(?:hours?|hrs?|minutes?|mins?)\b", clean or ""))
         return has_clock_time or has_duration
+
+    def _has_retryable_unfit_items(self, current_schedule: Optional[Dict[str, Any]] = None) -> bool:
+        if not current_schedule:
+            return False
+        return bool(
+            (current_schedule.get("unfit_activities") or [])
+            or (current_schedule.get("unscheduled_activities") or [])
+            or (current_schedule.get("optional_skipped") or [])
+        )
+
+    def _is_refit_unfit_request(
+        self,
+        clean: str,
+        current_schedule: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        if not self._has_retryable_unfit_items(current_schedule):
+            return False
+        explicit_retry_language = bool(re.search(
+            r"\b(?:try\s+to|help\s+me\s+(?:to\s+)?|please\s+)?(?:re)?fit(?:\s+in)?\b.*"
+            r"\b(?:unfit|unscheduled|could\s+not\s+fit|cannot\s+fit|can\s+not\s+fit|"
+            r"couldn\s*t\s+fit|activities?|items?)\b",
+            clean,
+        ))
+        focused_retry_language = bool(re.search(
+            r"\b(?:try\s+to|help\s+me\s+(?:to\s+)?|please\s+)?(?:re)?fit(?:\s+in)?\b.*"
+            r"\b(?:focused\s+(?:deep\s+)?work|deep\s+work)\b",
+            clean,
+        ))
+        return explicit_retry_language or focused_retry_language
 
     def _natural_edit_wording_skip_reason(self, clean: str, text: str) -> Optional[str]:
         has_relation = bool(re.search(r"\b(?:after|before|right\s+after|right\s+before|earlier|later)\b", clean))
@@ -131,14 +160,15 @@ class Module0RouterMixin:
             })
             return self._log_route_decision(route)
 
-        if re.search(r"\b(?:optimi[sz]e|regenerate|rebuild)\b.*\b(?:schedule|plan|day)\b|\bmake\s+(?:the\s+)?(?:schedule|plan|day)\s+better\b", clean):
+        refit_unfit_request = self._is_refit_unfit_request(clean, current_schedule)
+        if re.search(r"\b(?:optimi[sz]e|regenerate|rebuild)\b.*\b(?:schedule|plan|day)\b|\bmake\s+(?:the\s+)?(?:schedule|plan|day)\s+better\b", clean) or refit_unfit_request:
             route.update({
                 "route": "simple_schedule_command",
                 "confidence": 0.92,
                 "should_mutate_schedule": True,
                 "use_deterministic_parser": True,
                 "use_module_a_llm": False,
-                "reason": "matched_optimize_request",
+                "reason": "matched_refit_unfit_request" if refit_unfit_request else "matched_optimize_request",
             })
             return self._log_route_decision(route)
 

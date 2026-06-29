@@ -195,6 +195,7 @@ export type DailySchedule = {
   last_rescheduled_at?: string | null;
   unmet_items?: Array<Record<string, unknown>>;
   validation_issues?: string[];
+  performance_summary?: Record<string, unknown> | null;
   unscheduled_activities?: Array<{
     title: string;
     reason: string;
