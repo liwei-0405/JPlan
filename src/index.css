@@ -2699,10 +2699,28 @@ html {
   }
 
   .calendar-legend-list {
-    flex-wrap: nowrap;
-    overflow-x: auto;
-    padding-bottom: .1rem;
-    scrollbar-width: thin;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: .5rem;
+    overflow: visible;
+    padding-bottom: 0;
+    scrollbar-width: auto;
+  }
+
+  .calendar-legend-item {
+    display: flex;
+    width: 100%;
+    min-width: 0;
+    align-items: center;
+    gap: .45rem;
+    white-space: normal;
+    line-height: 1.15;
+  }
+
+  .calendar-legend-item > span:last-child {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .jplan-calendar-card {

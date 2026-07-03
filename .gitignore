@@ -52,6 +52,7 @@ final combined method.txt
 logs/
 
 # Local scratch files
+tmp/
 tmp_*.py
 tmp_*.json
 *.tmp
