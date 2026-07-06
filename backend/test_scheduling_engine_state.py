@@ -6954,6 +6954,72 @@ def test_allow_clash_route_repair_rescues_flex_conflicts_before_preserving_clash
     assert grocery["scheduled_start"] >= document["scheduled_end"] + 6
 
 
+def test_route_aware_insert_ignores_existing_allowed_clash_for_unrelated_flex():
+    engine = SchedulingEngine(DummyClient(), travel_service=FakeTravelService(route_minutes=0))
+    engine._current_route_context = {
+        "enabled": True,
+        "pairs": {},
+        "start_routes": {},
+    }
+    existing_timeline = [
+        {
+            "id": "lunch",
+            "stable_activity_id": "lunch",
+            "title": "Lunch",
+            "scheduled_start": 720,
+            "scheduled_end": 780,
+            "duration_minutes": 60,
+            "timing_mode": TimingMode.FIXED,
+            "fixed_start": 720,
+            "fixed_end": 780,
+            "is_user_fixed": True,
+            "is_conflict": True,
+            "conflict_with": ["team-lunch"],
+            "travel_required": False,
+        },
+        {
+            "id": "team-lunch",
+            "stable_activity_id": "team-lunch",
+            "title": "team lunch",
+            "scheduled_start": 720,
+            "scheduled_end": 780,
+            "duration_minutes": 60,
+            "timing_mode": TimingMode.FIXED,
+            "fixed_start": 720,
+            "fixed_end": 780,
+            "is_user_fixed": True,
+            "is_conflict": True,
+            "conflict_with": ["lunch"],
+            "travel_required": False,
+        },
+    ]
+    study = {
+        "id": "study",
+        "stable_activity_id": "study",
+        "title": "Study",
+        "duration_minutes": 120,
+        "timing_mode": TimingMode.UNSPECIFIED,
+        "can_move_for_repair": True,
+        "repair_protection": "flexible",
+        "travel_required": False,
+        "is_mandatory": True,
+    }
+
+    inserted, reason = engine._insert_best_position(
+        study,
+        existing_timeline,
+        parse_clock("07:00 AM"),
+        parse_clock("10:00 PM"),
+        0,
+    )
+
+    assert inserted is not None, reason
+    placed = next(item for item in inserted if item["title"] == "Study")
+    assert placed["scheduled_start"] == parse_clock("07:00 AM")
+    assert placed["scheduled_end"] == parse_clock("09:00 AM")
+    assert not placed.get("is_conflict")
+
+
 def test_final_route_validation_accepts_tight_transition_when_route_fits_gap():
     engine = SchedulingEngine(DummyClient(), travel_service=FakeTravelService(route_minutes=4))
     dinner = {

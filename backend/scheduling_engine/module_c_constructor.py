@@ -169,6 +169,21 @@ class ModuleCConstructorMixin:
                 })
         return violations
 
+    def _route_violation_signature(self, violation: Dict[str, Any]) -> Tuple[Any, ...]:
+        reason = clean_title(violation.get("reason") or "")
+        if reason == "overlap":
+            endpoints = sorted([
+                clean_title(violation.get("from") or ""),
+                clean_title(violation.get("to") or ""),
+            ])
+            return (reason, endpoints[0], endpoints[1])
+        return (
+            reason,
+            clean_title(violation.get("from") or ""),
+            clean_title(violation.get("to") or violation.get("title") or ""),
+            int(violation.get("leave_by") or violation.get("blocker_end") or violation.get("required_travel") or 0),
+        )
+
     def _activity_requires_travel(self, activity: Optional[Dict[str, Any]]) -> bool:
         if not activity:
             return False
@@ -1532,6 +1547,17 @@ class ModuleCConstructorMixin:
         failure_reason = "No feasible slot was available."
         
         duration = int(item.get("duration_minutes") or 60)
+        validation_start = validation_day_start if validation_day_start is not None else day_start
+        validation_end = validation_day_end if validation_day_end is not None else day_end
+        baseline_route_violation_keys = {
+            self._route_violation_signature(violation)
+            for violation in self._route_aware_timeline_violations(
+                timeline,
+                validation_start,
+                validation_end,
+                min_travel,
+            )
+        }
 
         for index in range(len(timeline) + 1):
             previous_item = timeline[index - 1] if index > 0 else None
@@ -1647,10 +1673,14 @@ class ModuleCConstructorMixin:
             candidate_timeline = sorted(timeline + [candidate], key=lambda x: x["scheduled_start"])
             route_violations = self._route_aware_timeline_violations(
                 candidate_timeline,
-                validation_day_start if validation_day_start is not None else day_start,
-                validation_day_end if validation_day_end is not None else day_end,
+                validation_start,
+                validation_end,
                 min_travel,
             )
+            route_violations = [
+                violation for violation in route_violations
+                if self._route_violation_signature(violation) not in baseline_route_violation_keys
+            ]
             if route_violations:
                 first_violation = route_violations[0]
                 reason = first_violation.get("reason") or "route_infeasible"
