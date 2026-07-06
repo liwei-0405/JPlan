@@ -24,6 +24,94 @@ function materializeActivities(schedule: DailySchedule): ActivityBlock[] {
   }));
 }
 
+function blockIdentity(block: ActivityBlock): string {
+  return String(
+    block.original_google_event_id
+    || block.google_event_id
+    || block.calendar_event_id
+    || block.block_id
+    || block.stable_activity_id
+    || block.activity_id
+    || block.id
+    || ""
+  );
+}
+
+function blockFallbackIdentity(block: ActivityBlock): string {
+  return [
+    normalizedTitle(block.title),
+    String(block.startTime || block.start || ""),
+    String(block.endTime || block.end || ""),
+  ].join("|");
+}
+
+function isSupportBlock(block: ActivityBlock): boolean {
+  const blockType = String(block.block_type || block.type || "").toLowerCase();
+  const title = normalizedTitle(block.title);
+  return (
+    ["travel", "buffer", "free", "free_time", "route_conflict", "start_route"].includes(blockType)
+    || title.startsWith("travel to")
+    || title.includes(" buffer")
+    || title === "buffer"
+  );
+}
+
+function mergeMissingActivities(baseBlocks: ActivityBlock[], schedule: DailySchedule): ActivityBlock[] {
+  const missingActivities = getMissingActivities(baseBlocks, schedule);
+
+  if (!missingActivities.length) return baseBlocks;
+  return [...baseBlocks, ...missingActivities].sort((a, b) => {
+    const timeA = timeToMinutes(a.startTime || a.start);
+    const timeB = timeToMinutes(b.startTime || b.start);
+    if (timeA !== timeB) return timeA - timeB;
+    return timeToMinutes(a.endTime || a.end) - timeToMinutes(b.endTime || b.end);
+  });
+}
+
+function getMissingActivities(baseBlocks: ActivityBlock[], schedule: DailySchedule): ActivityBlock[] {
+  const existingIds = new Set(baseBlocks.map(blockIdentity).filter(Boolean));
+  const existingFallbacks = new Set(baseBlocks.map(blockFallbackIdentity));
+  return materializeActivities(schedule).filter((activity) => {
+    if (isSupportBlock(activity)) return false;
+    const id = blockIdentity(activity);
+    if (id && existingIds.has(id)) return false;
+    return !existingFallbacks.has(blockFallbackIdentity(activity));
+  });
+}
+
+function shouldMergeMissingActivities(schedule: DailySchedule, baseBlocks: ActivityBlock[]): boolean {
+  if (schedule.has_unsaved_draft || schedule.draft_dirty || schedule.needs_reschedule) {
+    return true;
+  }
+  const existingIds = new Set(baseBlocks.map(blockIdentity).filter(Boolean));
+  const existingFallbacks = new Set(baseBlocks.map(blockFallbackIdentity));
+  return materializeActivities(schedule).some((activity) => {
+    if (activity.source !== "imported_google_calendar" || isSupportBlock(activity)) return false;
+    const id = blockIdentity(activity);
+    return !(id && existingIds.has(id)) && !existingFallbacks.has(blockFallbackIdentity(activity));
+  });
+}
+
+export function hasMissingActivitiesForView(
+  schedule: DailySchedule | null | undefined,
+  activeView: ScheduleViewMode | string | undefined = "jplan",
+  options: BlocksForViewOptions = {},
+): boolean {
+  if (!schedule || activeView === "google_calendar") return false;
+
+  let baseBlocks: ActivityBlock[];
+  if ((options.preferDraft || hasDraftTimeline(schedule)) && schedule.schedule_blocks?.length) {
+    baseBlocks = schedule.schedule_blocks.map(normalizeBlock);
+  } else if (schedule.committed_schedule_blocks?.length) {
+    baseBlocks = schedule.committed_schedule_blocks.map(normalizeBlock);
+  } else if (schedule.schedule_blocks?.length) {
+    baseBlocks = schedule.schedule_blocks.map(normalizeBlock);
+  } else {
+    baseBlocks = materializeActivities(schedule);
+  }
+  return shouldMergeMissingActivities(schedule, baseBlocks) && getMissingActivities(baseBlocks, schedule).length > 0;
+}
+
 function hasDraftTimeline(schedule: DailySchedule): boolean {
   return Boolean(
     (schedule.has_unsaved_draft || schedule.draft_dirty)
@@ -162,10 +250,19 @@ export function getBlocksForView(
   let blocks: ActivityBlock[];
   if ((options.preferDraft || hasDraftTimeline(schedule)) && schedule.schedule_blocks?.length) {
     blocks = schedule.schedule_blocks.map(normalizeBlock);
+    if (shouldMergeMissingActivities(schedule, blocks)) {
+      blocks = mergeMissingActivities(blocks, schedule);
+    }
   } else if (schedule.committed_schedule_blocks?.length) {
     blocks = schedule.committed_schedule_blocks.map(normalizeBlock);
+    if (shouldMergeMissingActivities(schedule, blocks)) {
+      blocks = mergeMissingActivities(blocks, schedule);
+    }
   } else if (schedule.schedule_blocks?.length) {
     blocks = schedule.schedule_blocks.map(normalizeBlock);
+    if (shouldMergeMissingActivities(schedule, blocks)) {
+      blocks = mergeMissingActivities(blocks, schedule);
+    }
   } else {
     blocks = materializeActivities(schedule);
   }

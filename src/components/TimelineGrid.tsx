@@ -73,7 +73,21 @@ export function TimelineGrid({
     [scheduledActivities, routeConflictRows],
   );
   const collisionActivities = useMemo(
-    () => scheduledActivities.filter((activity) => !routeWarningMeta.activityKeys.has(activityIdentity(activity))),
+    () => {
+      const routeWarningFiltered = scheduledActivities.filter((activity) => !routeWarningMeta.activityKeys.has(activityIdentity(activity)));
+      return routeWarningFiltered.filter((activity) => {
+        const kind = getTimelineBlockKind(activity);
+        return kind === "activity" || !isBoundarySupportChainBlock(activity, scheduledActivities);
+      });
+    },
+    [scheduledActivities, routeWarningMeta],
+  );
+  const boundarySupportRows = useMemo(
+    () => scheduledActivities.filter((activity) => (
+      !routeWarningMeta.activityKeys.has(activityIdentity(activity))
+      && getTimelineBlockKind(activity) !== "activity"
+      && isBoundarySupportChainBlock(activity, scheduledActivities)
+    )),
     [scheduledActivities, routeWarningMeta],
   );
   const standaloneRouteConflictRows = useMemo(
@@ -99,8 +113,13 @@ export function TimelineGrid({
         start: timeToMinutes(activity.startTime || activity.start || "00:00"),
         activity,
       })),
+      ...boundarySupportRows.map((activity) => ({
+        kind: "support" as const,
+        start: timeToMinutes(activity.startTime || activity.start || "00:00"),
+        activity,
+      })),
     ].sort((a, b) => a.start - b.start),
-    [groups, routeWarningMeta.groups, startRouteRows, standaloneRouteConflictRows],
+    [groups, routeWarningMeta.groups, startRouteRows, standaloneRouteConflictRows, boundarySupportRows],
   );
 
   if (visibleActivities.length === 0) return null;
@@ -117,8 +136,12 @@ export function TimelineGrid({
             showEditIcon={showEditIcon}
             compact={compact}
           />
-        ) : row.kind === "start_route" || row.kind === "route_conflict" ? (
-          <SupportTimelineBlock key={row.activity.id || `${row.kind}-${index}`} activity={row.activity} kind={row.kind} />
+        ) : row.kind === "start_route" || row.kind === "route_conflict" || row.kind === "support" ? (
+          <SupportTimelineBlock
+            key={row.activity.id || `${row.kind}-${index}`}
+            activity={row.activity}
+            kind={row.kind === "support" ? supportRenderKind(row.activity) : row.kind}
+          />
         ) : (
           <CollisionGroupRow
             key={index}
@@ -902,6 +925,58 @@ function getTimelineBlockKind(activity: ActivityBlock): TimelineBlockKind {
   return "activity";
 }
 
+function supportRenderKind(activity: ActivityBlock): Exclude<TimelineBlockKind, "activity" | "free_time"> {
+  const kind = getTimelineBlockKind(activity);
+  if (kind === "activity" || kind === "free_time") return "buffer";
+  return kind;
+}
+
+function isBoundarySupportChainBlock(block: ActivityBlock, timeline: ActivityBlock[]): boolean {
+  const kind = getTimelineBlockKind(block);
+  if (kind === "activity" || kind === "free_time" || kind === "start_route" || kind === "route_conflict") {
+    return false;
+  }
+
+  const supports = timeline.filter((item) => {
+    const itemKind = getTimelineBlockKind(item);
+    return itemKind !== "activity" && itemKind !== "free_time" && itemKind !== "start_route" && itemKind !== "route_conflict";
+  });
+  const activities = timeline.filter((item) => getTimelineBlockKind(item) === "activity");
+  const supportKeysConnectedToActivity = new Set<string>();
+
+  const supportKey = (item: ActivityBlock) => activityIdentity(item) || `${item.title}-${item.startTime || item.start}-${item.endTime || item.end}`;
+  const boundsTouch = (left: ActivityBlock, right: ActivityBlock): boolean => {
+    const leftBounds = blockBounds(left);
+    const rightBounds = blockBounds(right);
+    if (!leftBounds || !rightBounds) return false;
+    return Math.abs(leftBounds.end - rightBounds.start) <= 1 || Math.abs(leftBounds.start - rightBounds.end) <= 1;
+  };
+
+  for (const support of supports) {
+    if (activities.some((activity) => boundsTouch(support, activity))) {
+      supportKeysConnectedToActivity.add(supportKey(support));
+    }
+  }
+
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const support of supports) {
+      const key = supportKey(support);
+      if (supportKeysConnectedToActivity.has(key)) continue;
+      const touchesConnectedSupport = supports.some((other) => (
+        supportKeysConnectedToActivity.has(supportKey(other)) && boundsTouch(support, other)
+      ));
+      if (touchesConnectedSupport) {
+        supportKeysConnectedToActivity.add(key);
+        changed = true;
+      }
+    }
+  }
+
+  return supportKeysConnectedToActivity.has(supportKey(block));
+}
+
 function dedupeSupportBlocks(activities: ActivityBlock[]): ActivityBlock[] {
   const result: ActivityBlock[] = [];
   const supportIndexByKey = new Map<string, number>();
@@ -938,13 +1013,15 @@ function getSupportDedupeKey(activity: ActivityBlock, kind: TimelineBlockKind): 
   }
   if (kind === "travel") {
     const destination = normalizedTravelDestination(activity);
-    const end = normalizedBlockText(activity.endTime || activity.end);
-    if (!destination || !end) return null;
-    return `travel:${destination}:${end}`;
+    const start = canonicalTimeKey(activity.startTime || activity.start);
+    const end = canonicalTimeKey(activity.endTime || activity.end);
+    const duration = getDurationMinutes(activity);
+    if (!destination || !start || !end) return null;
+    return `travel:${destination}:${start}:${end}:${duration}`;
   }
   if (kind === "buffer") {
-    const start = normalizedBlockText(activity.startTime || activity.start);
-    const end = normalizedBlockText(activity.endTime || activity.end);
+    const start = canonicalTimeKey(activity.startTime || activity.start);
+    const end = canonicalTimeKey(activity.endTime || activity.end);
     if (!start || !end) return null;
     return `buffer:${start}:${end}`;
   }
@@ -966,9 +1043,15 @@ function isDisplayOnlyRouteConflictBlock(activity: ActivityBlock): boolean {
 
 function normalizedTravelDestination(activity: ActivityBlock): string {
   return normalizedBlockText(
-    activity.location ||
-    activity.title.replace(/^travel to\s+/i, ""),
+    activity.title.replace(/^travel to\s+/i, "").replace(/\s+\(tight\)$/i, "")
+    || activity.location,
   );
+}
+
+function canonicalTimeKey(value: unknown): string {
+  const text = normalizedBlockText(value);
+  if (!text) return "";
+  return String(timeToMinutes(text));
 }
 
 function shouldPreferSupportBlock(candidate: ActivityBlock, existing: ActivityBlock): boolean {

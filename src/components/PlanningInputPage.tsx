@@ -63,6 +63,7 @@ import {
 } from "../utils/planningPreferences";
 import {
   getBlocksForView,
+  hasMissingActivitiesForView,
   hasGoogleCalendarLayer,
   type ScheduleViewMode,
 } from "../utils/scheduleDisplayUtils";
@@ -259,11 +260,33 @@ function sanitizeTravelStateForMode<T extends DailySchedule>(schedule: T, accura
 function displayScheduleForTimeline(schedule: DailySchedule): DailySchedule {
   if (!hasRouteRepairPreview(schedule)) return schedule;
   const preview = schedule.preview_schedule || {};
+  const mergeByIdentity = (primary: ActivityBlock[], fallback: ActivityBlock[]): ActivityBlock[] => {
+    const identity = (item: ActivityBlock) => String(
+      item.original_google_event_id
+      || item.google_event_id
+      || item.calendar_event_id
+      || item.block_id
+      || item.stable_activity_id
+      || item.id
+      || `${String(item.title || "").trim().toLowerCase()}|${item.startTime || item.start || ""}|${item.endTime || item.end || ""}`
+    );
+    const seen = new Set(primary.map(identity).filter(Boolean));
+    const merged = [...primary];
+    for (const item of fallback) {
+      const key = identity(item);
+      if (key && seen.has(key)) continue;
+      merged.push(item);
+      if (key) seen.add(key);
+    }
+    return merged;
+  };
+  const previewActivities = (preview.activities as ActivityBlock[] | undefined) || [];
+  const baseActivities = schedule.activities || [];
   return {
     ...schedule,
     ...preview,
     date: schedule.date,
-    activities: (preview.activities as ActivityBlock[] | undefined) || schedule.activities || [],
+    activities: previewActivities.length ? mergeByIdentity(previewActivities, baseActivities) : baseActivities,
     schedule_blocks: (preview.schedule_blocks as ActivityBlock[] | undefined) || schedule.schedule_blocks || [],
     start_route_summary: preview.start_route_summary || schedule.start_route_summary,
     route_repair_actions: preview.route_repair_actions || schedule.route_repair_actions || [],
@@ -347,6 +370,19 @@ export function PlanningInputPage({
       loadData();
     }
   }, [isoDateStr, user, initialSchedule]);
+
+  const lastInitialScheduleJson = useRef<string>("");
+  useEffect(() => {
+    if (!initialSchedule || initialSchedule.date !== isoDateStr) return;
+    const nextJson = JSON.stringify(initialSchedule);
+    if (nextJson === lastInitialScheduleJson.current) return;
+    lastInitialScheduleJson.current = nextJson;
+    const nextSchedule = withPlanningPreferences(initialSchedule);
+    setPreviewSchedule(nextSchedule);
+    setAllowClash(Boolean(nextSchedule.allow_clash));
+    setAccurateTravelTime(isAccurateTravelEnabled(nextSchedule));
+    setCalendarView((current) => nextSchedule.active_view === "google_calendar" ? "google_calendar" : current);
+  }, [initialSchedule, isoDateStr, planningPreferences]);
 
   useEffect(() => {
     if (!user?.id) return;
@@ -927,10 +963,10 @@ export function PlanningInputPage({
     }
 
     // 3. If there is no conflict, execute the update and sort
-    const existingIndex = baseDraft.activities.findIndex(a => a.id === updatedEvent.id);
+    const existingIndex = baseDraft.activities.findIndex(a => sameActivityEntity(a, updatedEvent));
     const updatedActivities = (
       existingIndex >= 0
-        ? baseDraft.activities.map(a => a.id === updatedEvent.id ? normalizedEvent : a)
+        ? baseDraft.activities.map(a => sameActivityEntity(a, updatedEvent) ? mergeActivityIdentity(a, normalizedEvent) : a)
         : [...baseDraft.activities, normalizedEvent]
     ).sort(compareActivityTimeForManual);
     const updatedScheduleBlocks = syncActivityBlocks(baseDraft.schedule_blocks, updatedActivities);
@@ -1081,8 +1117,9 @@ export function PlanningInputPage({
   };
 
   const hasPendingRoutePreview = hasRouteRepairPreview(previewSchedule);
+  const hasMissingImportedTimelineItems = hasMissingActivitiesForView(previewSchedule, "jplan", { preferDraft: true });
   const activeDisplaySchedule = previewSchedule ? displayScheduleForTimeline(previewSchedule) : null;
-  const isDirtySchedule = Boolean(previewSchedule?.needs_reschedule);
+  const isDirtySchedule = Boolean(previewSchedule?.needs_reschedule || hasMissingImportedTimelineItems);
   const hasSchedulableItems = Boolean(
     (previewSchedule?.activities || []).some(isSchedulableEventBlock)
     || (previewSchedule?.schedule_blocks || []).some(isSchedulableEventBlock)
@@ -3191,28 +3228,29 @@ function syncActivityBlocks(
 ): ActivityBlock[] | undefined {
   if (!existingBlocks) return activities;
 
-  const activityMap = new Map(activities.map((activity) => [activity.id, activity]));
   const usedIds = new Set<string>();
 
   const syncedBlocks = existingBlocks.map((block) => {
-    const replacement = activityMap.get(block.id);
+    const replacement = activities.find((activity) => sameActivityEntity(activity, block));
     const blockType = block.block_type || block.type;
 
     if (!replacement || (blockType && blockType !== "activity")) {
       return block;
     }
 
-    usedIds.add(replacement.id);
+    usedIds.add(activityEntityKey(replacement));
     return {
       ...block,
       ...replacement,
+      id: block.id || replacement.id,
+      block_id: block.block_id || replacement.block_id,
       start: replacement.startTime,
       end: replacement.endTime,
     };
   });
 
   for (const activity of activities) {
-    if (!usedIds.has(activity.id)) {
+    if (!usedIds.has(activityEntityKey(activity))) {
       syncedBlocks.push({
         ...activity,
         start: activity.startTime,
@@ -3226,6 +3264,54 @@ function syncActivityBlocks(
     const startB = timeToMinutes(b.startTime || b.start || "");
     return startA - startB;
   });
+}
+
+function activityEntityKey(item: Partial<ActivityBlock>): string {
+  return String(
+    item.stable_activity_id
+    || item.activity_id
+    || item.related_activity_id
+    || item.id
+    || `${String(item.title || "").trim().toLowerCase()}|${item.startTime || item.start || ""}|${item.endTime || item.end || ""}`
+  );
+}
+
+function activityIdentityCandidates(item: Partial<ActivityBlock>): Set<string> {
+  return new Set([
+    item.id,
+    item.stable_activity_id,
+    item.activity_id,
+    item.related_activity_id,
+    item.block_id,
+  ].map(value => String(value || "").trim()).filter(Boolean));
+}
+
+function sameActivityEntity(left: Partial<ActivityBlock>, right: Partial<ActivityBlock>): boolean {
+  const leftIds = activityIdentityCandidates(left);
+  const rightIds = activityIdentityCandidates(right);
+  for (const id of leftIds) {
+    if (rightIds.has(id)) return true;
+  }
+  const leftTitle = String(left.title || "").trim().toLowerCase();
+  const rightTitle = String(right.title || "").trim().toLowerCase();
+  if (!leftTitle || leftTitle !== rightTitle) return false;
+  const leftStart = String(left.startTime || left.start || "");
+  const rightStart = String(right.startTime || right.start || "");
+  const leftEnd = String(left.endTime || left.end || "");
+  const rightEnd = String(right.endTime || right.end || "");
+  return Boolean((leftStart && leftStart === rightStart) || (leftEnd && leftEnd === rightEnd));
+}
+
+function mergeActivityIdentity(original: ActivityBlock, updated: ActivityBlock): ActivityBlock {
+  return {
+    ...original,
+    ...updated,
+    id: original.id || updated.id,
+    stable_activity_id: original.stable_activity_id || updated.stable_activity_id,
+    activity_id: original.activity_id || updated.activity_id,
+    block_id: updated.block_id || original.block_id,
+    related_activity_id: updated.related_activity_id || original.related_activity_id,
+  };
 }
 
 function removeDeletedActivityBlock(

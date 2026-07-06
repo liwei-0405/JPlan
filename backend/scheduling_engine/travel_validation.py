@@ -5882,22 +5882,33 @@ class TravelValidationMixin:
     ) -> List[Dict[str, Any]]:
         right_start = parse_clock(right.get("start") or right.get("startTime") or "") or 0
         route_start = right_start - route_minutes
+        prep_minutes = self._prep_buffer_minutes_for_replacement(
+            blocks=blocks,
+            replacement_start=replacement_start,
+            right_index=right_index,
+            left=left,
+            right=right,
+        )
+        prep_start = route_start - prep_minutes if prep_minutes >= 5 else route_start
         first_replaced = blocks[replacement_start] if replacement_start < len(blocks) else left
         idle_start = parse_clock(first_replaced.get("start") or first_replaced.get("startTime") or "") if first_replaced else None
         if idle_start is None:
             idle_start = parse_clock(left.get("end") or left.get("endTime") or "") or route_start
+        if prep_start < idle_start:
+            prep_minutes = 0
+            prep_start = route_start
 
         replacement: List[Dict[str, Any]] = []
-        if route_start > idle_start:
+        if prep_start > idle_start:
             idle = {
                 "block_type": "idle",
                 "type": "idle",
                 "title": "Free Time",
                 "start": format_clock(idle_start),
-                "end": format_clock(route_start),
+                "end": format_clock(prep_start),
                 "startTime": format_clock(idle_start),
-                "endTime": format_clock(route_start),
-                "duration_minutes": route_start - idle_start,
+                "endTime": format_clock(prep_start),
+                "duration_minutes": prep_start - idle_start,
                 "reason": "Slack created after route-based travel validation",
             }
             replacement.append(idle)
@@ -5905,9 +5916,35 @@ class TravelValidationMixin:
                 f"[TRAVEL][TIMING] Added idle/free block: {idle['start']}-{idle['end']}"
             )
 
-        transition = deepcopy(transition_template) if transition_template else {}
         source_activity_id = left.get("stable_activity_id") or left.get("id")
         destination_activity_id = right.get("stable_activity_id") or right.get("id")
+        support_links = {
+            "source_activity_id": source_activity_id,
+            "destination_activity_id": destination_activity_id,
+            "related_activity_ids": [
+                activity_id
+                for activity_id in (source_activity_id, destination_activity_id)
+                if activity_id
+            ],
+        }
+        if prep_minutes >= 5:
+            buffer_block = {
+                "block_type": "buffer",
+                "type": "buffer",
+                "id": f"buffer-{source_activity_id}-{destination_activity_id}" if source_activity_id and destination_activity_id else None,
+                "title": "Prep / Buffer",
+                "start": format_clock(prep_start),
+                "end": format_clock(route_start),
+                "startTime": format_clock(prep_start),
+                "endTime": format_clock(route_start),
+                "duration_minutes": prep_minutes,
+                "duration": self._duration_label(prep_minutes),
+                "reason": "Prep buffer preserved during route-based travel validation",
+                **support_links,
+            }
+            replacement.append(buffer_block)
+
+        transition = deepcopy(transition_template) if transition_template else {}
         transition.update({
             "block_type": "transition",
             "type": "travel",
@@ -5926,13 +5963,7 @@ class TravelValidationMixin:
             "route_duration_minutes": route_minutes,
             "from_coordinate": {"latitude": left_coord[0], "longitude": left_coord[1]},
             "to_coordinate": {"latitude": right_coord[0], "longitude": right_coord[1]},
-            "source_activity_id": source_activity_id,
-            "destination_activity_id": destination_activity_id,
-            "related_activity_ids": [
-                activity_id
-                for activity_id in (source_activity_id, destination_activity_id)
-                if activity_id
-            ],
+            **support_links,
             "reason": "Route-based travel duration validated after draft construction",
         })
         transition.pop("is_tight", None)
@@ -5950,6 +5981,49 @@ class TravelValidationMixin:
             "FINAL",
         )
         return replacement
+
+    def _support_duration_minutes(self, block: Dict[str, Any]) -> int:
+        raw = block.get("duration_minutes") or block.get("minutes")
+        try:
+            if raw is not None:
+                return max(0, int(float(raw)))
+        except (TypeError, ValueError):
+            pass
+
+        duration_label = str(block.get("duration") or "").strip().lower()
+        match = re.search(r"(\d+)", duration_label)
+        if match:
+            return max(0, int(match.group(1)))
+
+        start, end = self._block_time_bounds(block)
+        if start is not None and end is not None:
+            return max(0, end - start)
+        return 0
+
+    def _prep_buffer_minutes_for_replacement(
+        self,
+        blocks: List[Dict[str, Any]],
+        replacement_start: int,
+        right_index: int,
+        left: Dict[str, Any],
+        right: Dict[str, Any],
+    ) -> int:
+        segment = blocks[replacement_start:right_index] if replacement_start < right_index else []
+        for block in segment:
+            block_type = clean_title(block.get("block_type") or block.get("type") or "")
+            title = clean_title(block.get("title") or "")
+            if block_type in {"buffer", "prep", "prep_buffer"} or "buffer" in title:
+                minutes = self._support_duration_minutes(block)
+                if minutes > 0:
+                    return minutes
+
+        candidates: List[int] = []
+        for item in (left, right):
+            try:
+                candidates.append(int(item.get("prep_buffer", DEFAULT_PREP_BUFFER) or 0))
+            except (TypeError, ValueError):
+                continue
+        return max(candidates or [0])
 
     def _support_segment_start_before(
         self,

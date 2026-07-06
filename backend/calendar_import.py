@@ -267,6 +267,75 @@ def _canonical_activity_from_external(event: Dict[str, Any]) -> Dict[str, Any]:
     return {key: value for key, value in activity.items() if value is not None}
 
 
+def _schedule_block_from_activity(activity: Dict[str, Any]) -> Dict[str, Any]:
+    block_id = (
+        activity.get("block_id")
+        or activity.get("stable_activity_id")
+        or activity.get("id")
+        or f"block-{uuid4().hex[:12]}"
+    )
+    start_time = activity.get("startTime") or activity.get("start")
+    end_time = activity.get("endTime") or activity.get("end")
+    block = {
+        **activity,
+        "id": block_id,
+        "block_id": block_id,
+        "activity_id": activity.get("stable_activity_id") or activity.get("id") or block_id,
+        "related_activity_id": activity.get("stable_activity_id") or activity.get("id") or block_id,
+        "type": "activity",
+        "block_type": "activity",
+        "startTime": start_time,
+        "endTime": end_time,
+        "start": start_time,
+        "end": end_time,
+    }
+    return {key: value for key, value in block.items() if value is not None}
+
+
+def _sync_imported_activities_to_draft_blocks(schedule: Dict[str, Any], imported_activities: List[Dict[str, Any]]) -> None:
+    if not imported_activities:
+        return
+
+    base_blocks = _list(schedule.get("schedule_blocks")) or _list(schedule.get("committed_schedule_blocks"))
+    if not base_blocks:
+        base_blocks = [
+            _schedule_block_from_activity(activity)
+            for activity in _list(schedule.get("activities"))
+            if is_canonical_activity(activity)
+        ]
+
+    existing_keys = {
+        _block_identity(block, str(index))
+        for index, block in enumerate(base_blocks)
+        if isinstance(block, dict)
+    }
+    draft_blocks = list(base_blocks)
+    for activity in imported_activities:
+        block = _schedule_block_from_activity(activity)
+        key = _block_identity(block, str(len(draft_blocks)))
+        if key in existing_keys:
+            continue
+        draft_blocks.append(block)
+        existing_keys.add(key)
+
+    schedule["schedule_blocks"] = sorted(
+        draft_blocks,
+        key=lambda block: (
+            parse_clock_minutes(block.get("startTime") or block.get("start")) is None,
+            parse_clock_minutes(block.get("startTime") or block.get("start")) or 0,
+        ),
+    )
+    schedule["has_unsaved_draft"] = True
+    schedule["draft_dirty"] = True
+    schedule["needs_reschedule"] = True
+    schedule["reschedule_reason"] = "calendar_import_selected"
+    schedule["preview_id"] = None
+    schedule["preview_status"] = None
+    schedule["preview_reason"] = None
+    schedule["preview_base_version"] = None
+    schedule["preview_schedule"] = None
+
+
 def google_event_to_external_event(event: Dict[str, Any], *, maybe_support_block: bool = False) -> Dict[str, Any]:
     start_time, end_time, event_date = google_event_times(event)
     google_id = _event_id(event)
@@ -682,6 +751,7 @@ def import_selected_calendar_events(schedule: Dict[str, Any], selected_event_ids
     }
 
     appended = 0
+    appended_activities: List[Dict[str, Any]] = []
     for event in external:
         event_id = str(_event_key(event))
         if selected and event_id not in selected:
@@ -690,11 +760,14 @@ def import_selected_calendar_events(schedule: Dict[str, Any], selected_event_ids
             continue
         if event_id and event_id in existing_google_ids:
             continue
-        imported["activities"].append(_canonical_activity_from_external(event))
+        activity = _canonical_activity_from_external(event)
+        imported["activities"].append(activity)
+        appended_activities.append(activity)
         if event_id:
             existing_google_ids.add(event_id)
         appended += 1
 
+    _sync_imported_activities_to_draft_blocks(imported, appended_activities)
     imported["active_view"] = "jplan"
     jlog("IMPORT", f"imported={appended} selected={len(selected)}", "SELECTED")
     validate_state_invariants(imported, context="import")

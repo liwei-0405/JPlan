@@ -28,6 +28,7 @@ export type Page =
 export type ActivityBlock = {
   id: string;
   stable_activity_id?: string;
+  activity_id?: string;
   type?: "activity" | "travel" | "buffer" | "transition" | "idle" | "start_route" | "route_conflict";
   block_type?: "activity" | "transition" | "travel" | "buffer" | "idle" | "start_route" | "route_conflict" | "prep_buffer" | "free_time";
   block_id?: string;
@@ -478,7 +479,7 @@ export default function App() {
                   onModify={() => {
                     setPlanningSchedule(currentSchedule);
                     setPlanningDate(new Date(currentSchedule.date));
-                    navigate("/planning");
+                    navigate(`/planning/${currentSchedule.date}`);
                   }}
                   onViewExplanation={() => {
                     navigate("/explanation");
@@ -492,6 +493,7 @@ export default function App() {
                   onViewPreferences={() => navigate("/preferences")}
                   onUpdateSchedule={(updatedSchedule) => {
                     setCurrentSchedule(updatedSchedule);
+                    setPlanningSchedule(updatedSchedule);
                     setScheduleHistory(prev => {
                       const index = prev.findIndex(item => item.date === updatedSchedule.date);
                       if (index < 0) return [...prev, updatedSchedule];

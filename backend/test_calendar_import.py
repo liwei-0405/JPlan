@@ -233,6 +233,21 @@ def test_import_selected_appends_and_dedupes_by_original_google_event_id():
                 "original_google_event_id": "external-1",
             }
         ],
+        "committed_schedule_blocks": [
+            {
+                "id": "work",
+                "block_id": "work",
+                "title": "Focused work",
+                "type": "activity",
+                "block_type": "activity",
+                "startTime": "01:00 PM",
+                "endTime": "02:00 PM",
+            }
+        ],
+        "schedule_blocks": [],
+        "preview_id": "old-preview",
+        "preview_status": "partial_feasible_with_unfit",
+        "preview_schedule": {"schedule_blocks": []},
         "external_calendar_events": [
             {
                 "id": "gcal-external-1",
@@ -255,6 +270,16 @@ def test_import_selected_appends_and_dedupes_by_original_google_event_id():
 
     assert [item["title"] for item in imported["activities"]] == ["Dentist", "Dinner"]
     assert all(item.get("source") != "google_calendar" for item in imported["activities"])
+    assert [block["title"] for block in imported["committed_schedule_blocks"]] == ["Focused work"]
+    assert [block["title"] for block in imported["schedule_blocks"]] == ["Focused work", "Dinner"]
+    assert imported["active_view"] == "jplan"
+    assert imported["has_unsaved_draft"] is True
+    assert imported["draft_dirty"] is True
+    assert imported["needs_reschedule"] is True
+    assert imported["reschedule_reason"] == "calendar_import_selected"
+    assert imported["preview_id"] is None
+    assert imported["preview_status"] is None
+    assert imported["preview_schedule"] is None
 
 
 def test_dirty_legacy_schedule_moves_google_and_support_out_of_activities():
